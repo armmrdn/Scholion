@@ -1,0 +1,59 @@
+name: Build macOS
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build-macos:
+    runs-on: macos-14
+    strategy:
+      matrix:
+        arch: [x86_64, arm64]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies
+      run: |
+        brew install cmake pkg-config
+        brew install glfw3 curl
+
+    - name: Configure build (macOS)
+      run: |
+        cd scholion
+        mkdir -p build
+        cd build
+        cmake .. \
+          -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_OSX_ARCHITECTURES=${{ matrix.arch }} \
+          -DSCHOLION_WITH_MUPDF=ON
+
+    - name: Build
+      run: |
+        cd scholion/build
+        make -j$(sysctl -n hw.ncpu)
+
+    - name: Create DMG
+      run: |
+        cd scholion/build
+        mkdir -p dist
+        cp -r Scholion.app dist/
+        hdiutil create -volname "Scholion" -srcfolder dist -ov -format UDZO Scholion.dmg
+
+    - name: Upload DMG artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: Scholion-${{ matrix.arch }}.dmg
+        path: scholion/build/Scholion.dmg
+        retention-days: 30
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: scholion/build/Scholion.dmg
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

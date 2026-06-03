@@ -1,0 +1,49 @@
+Windows MuPDF Static Libraries
+===============================
+
+This directory must contain the Windows static library files before the
+SCHOLION_WITH_MUPDF build option can be enabled:
+
+    mupdf.lib
+    mupdf-third.lib
+
+These are the Windows equivalents of the macOS libmupdf.a / libmupdf-third.a
+files in ../scholion/third_party/mupdf/lib/.
+
+The MuPDF header files are shared from:
+    ../scholion/third_party/mupdf/include/
+
+HOW TO OBTAIN THE WINDOWS LIBRARIES
+-------------------------------------
+
+Option A — Build MuPDF from source on Windows (recommended; version matches headers)
+  1. Download MuPDF source from https://mupdf.com/downloads/
+     Use the SAME version as the bundled macOS headers (check the version in
+     ../scholion/third_party/mupdf/include/mupdf/fitz.h or the lib filenames).
+  2. Open a Visual Studio Developer Command Prompt (x64).
+  3. cd into the MuPDF source directory.
+  4. Run:  nmake HAVE_X11=no HAVE_GLUT=no libs
+     This builds libmupdf.lib and libmupdf-third.lib in the build/ directory.
+  5. Copy them here and rename:
+       libmupdf.lib      → mupdf.lib
+       libmupdf-third.lib → mupdf-third.lib
+
+  For MSYS2/MinGW, replace nmake with:
+     make HAVE_X11=no HAVE_GLUT=no libs
+  Output will be .a files; rename to .lib (MinGW accepts both extensions).
+
+Option B — Use MuPDF prebuilt Windows release
+  Download a Windows binary release from https://mupdf.com/downloads/ — look for
+  a "windows" or "win64" variant. Extract the static libs and copy here.
+  Verify the version matches the bundled headers before linking.
+
+Option C — Swap to PDFium (avoids AGPL; harder to build)
+  See CLAUDE.md section on PDFium migration — recommended only if distributing
+  a closed-source binary.
+
+VERIFYING THE BUILD
+--------------------
+After placing the libs, configure the Windows build with:
+  cmake .. -DCMAKE_BUILD_TYPE=Release -DSCHOLION_WITH_MUPDF=ON
+If CMake reports FATAL_ERROR about missing mupdf.lib, the file is missing or
+misnamed in this directory.

@@ -1,0 +1,33 @@
+# Build artifacts
+build/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+*.o
+*.a
+*.lib
+*.exe
+*.app/
+Scholion.app/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Dependencies (will be installed via package managers)
+third_party/mupdf/lib/*.lib
+third_party/glad/src/
+third_party/glad/include/
+
+# Temporary files
+*.tmp
+*.log
+*.tar.gz

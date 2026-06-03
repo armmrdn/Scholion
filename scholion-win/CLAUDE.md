@@ -1,0 +1,142 @@
+# Scholion — Windows Port
+
+## Overview
+
+Windows build of Scholion. The entire application logic lives in the shared
+source tree at `../scholion/src/` and `../scholion/include/`. This directory
+contains only Windows-specific files: the CMakeLists.txt, platform source stub,
+resources, and Windows-only third-party libraries.
+
+**Platform strategy:**
+- `../scholion/`       — macOS build (canonical source, contains all shared `.cpp/.h`)
+- `../scholion-win/`   — Windows build (this directory)
+- `../scholion-linux/` — Linux build (future)
+
+All source-level bug fixes and features land in `../scholion/src/`. Platform
+conditionals (`#ifdef __APPLE__` / `#ifdef _WIN32` / `#else`) inside those files
+make them compile correctly on all three platforms without any changes to this
+directory.
+
+---
+
+## Directory Layout
+
+```
+scholion-win/
+  CMakeLists.txt           — Windows build system
+  src/
+    platform_win.cpp       — Windows-specific init (currently a stub)
+  resources/
+    scholion.rc            — Windows resource file (icon + version info)
+    AppIcon.ico            — App icon (MISSING: see README_icon.md)
+    README_icon.md         — How to generate AppIcon.ico from macOS assets
+  third_party/
+    mupdf/lib/             — Windows .lib files (MISSING: see instructions there)
+    glad/                  — OpenGL 3.3 loader (MISSING: see SETUP_GLAD.md)
+  build/                   — CMake build output (created by cmake/make)
+```
+
+---
+
+## Prerequisites (one-time Windows setup)
+
+### 1. Build tools
+Install one of:
+- **Visual Studio 2022 Community** with "Desktop development with C++" workload
+- **MSYS2/MinGW-w64**: download from https://www.msys2.org/ — then:
+  ```
+  pacman -S mingw-w64-x86_64-toolchain mingw-w64-x86_64-cmake
+  ```
+
+### 2. CMake 3.20+
+Either bundled with Visual Studio, or download from https://cmake.org/download/
+
+### 3. GLFW
+- **vcpkg**: `vcpkg install glfw3:x64-windows`
+- **MSYS2**: `pacman -S mingw-w64-x86_64-glfw`
+- Or download prebuilt from https://www.glfw.org/download.html
+
+### 4. libcurl
+- **vcpkg**: `vcpkg install curl:x64-windows`
+- **MSYS2**: `pacman -S mingw-w64-x86_64-curl`
+
+### 5. GLAD (OpenGL loader)
+See `third_party/glad/SETUP_GLAD.md` — generate from https://glad.dav1d.de/
+(OpenGL 3.3, Core profile, with loader).
+
+### 6. MuPDF Windows static libs
+See `third_party/mupdf/lib/PLACE_WINDOWS_LIBS_HERE.txt`.
+Build from source or use a prebuilt release matching the bundled headers.
+
+### 7. App icon
+See `resources/README_icon.md`. Convert the macOS `AppIcon.icns` to `AppIcon.ico`
+and place it in `resources/`.
+
+---
+
+## Build Instructions
+
+### With MSYS2/MinGW (recommended for first port attempt — closer to Clang)
+```bash
+# From MSYS2 MinGW 64-bit shell
+cd /path/to/Scholion/scholion-win
+mkdir build && cd build
+cmake .. -G "MinGW Makefiles" \
+         -DCMAKE_BUILD_TYPE=Release \
+         -DSCHOLION_WITH_MUPDF=ON
+mingw32-make -j$(nproc)
+```
+
+### With Visual Studio 2022
+```bash
+# From Developer Command Prompt (x64)
+cd C:\path\to\Scholion\scholion-win
+mkdir build && cd build
+cmake .. -G "Visual Studio 17 2022" -A x64 \
+         -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake \
+         -DSCHOLION_WITH_MUPDF=ON
+cmake --build . --config Release
+```
+
+The output is `build/Release/Scholion.exe` (MSVC) or `build/Scholion.exe` (MinGW).
+
+---
+
+## Sync Policy
+
+When modifying the application:
+1. **Bug fixes / new features** → edit `../scholion/src/*.cpp` or `../scholion/include/*.h`.
+   The Windows build picks them up automatically (it compiles from that path).
+2. **New source file** → add it to BOTH `../scholion/CMakeLists.txt` (macOS) AND
+   `scholion-win/CMakeLists.txt` (Windows).
+3. **Windows-specific code** → use `#ifdef _WIN32` in the shared source file, or
+   add to `src/platform_win.cpp` if it's large enough to warrant separation.
+4. **macOS-specific code** → use `#ifdef __APPLE__`.
+5. **Future Linux code** → use `#else` (the fall-through after Apple/Windows guards).
+
+---
+
+## Known Gaps / TODO
+
+- [x] **AppIcon.ico** — generated from macOS ICNS (16/32/48/64/128/256 px, all in one file)
+- [x] **GLAD** — generated for OpenGL 3.3 Core; source in `third_party/glad/`
+- [x] **DPI awareness** — `Scholion.manifest` with `PerMonitorV2`; embedded via `scholion.rc`
+- [ ] **MuPDF Windows libs** — build or download `.lib` files (see `third_party/mupdf/lib/`)
+- [ ] **File association** — register `.scholion` in HKEY_CLASSES_ROOT via installer
+      (argv[1] path already handled; association just makes double-click work in Explorer)
+- [ ] **Distribution** — create NSIS or WiX installer, or a simple ZIP of
+      `Scholion.exe` + required DLLs (glfw3.dll, libcurl.dll, etc.)
+
+---
+
+## Restore Points
+
+Windows port snapshots are tarballs of `scholion-win/` in `~/Dropbox/Scholion/`.
+- `scholion-win-phase1.tar.gz` — Phase 1 complete (2026-05-28)
+- **Current state** (2026-05-31): Settings pane bug fix synced from macOS.
+  CMakeLists.txt referencing shared `../scholion/src/`; GLAD 3.3 Core generated in
+  `third_party/glad/`; AppIcon.ico converted from macOS ICNS (16/32/48/64/128/256 px);
+  DPI-awareness manifest (`Scholion.manifest`); Windows resource file (`scholion.rc`);
+  `setup_windows.ps1` one-script MSYS2 + dependency bootstrap; `src/platform_win.cpp` stub.
+  Shared source in `../scholion/src/` carries all `#ifdef _WIN32` guards.
+  **Next step:** Fresh complete rebuild on Windows machine with MuPDF `.lib` files.

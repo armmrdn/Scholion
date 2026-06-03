@@ -1,0 +1,43 @@
+// scholion.rc — Windows resource file.
+// Embeds the application icon and version metadata into the .exe.
+//
+// BEFORE BUILDING: replace AppIcon.ico with the real icon.
+// See README_icon.md in this directory for conversion instructions.
+
+#include <windows.h>
+
+// Application icon (shown in Explorer, taskbar, window title bar)
+IDI_ICON1 ICON "AppIcon.ico"
+
+// DPI-awareness and compatibility manifest
+1 RT_MANIFEST "Scholion.manifest"
+
+// Version information block (visible in Explorer → Properties → Details tab)
+VS_VERSION_INFO VERSIONINFO
+FILEVERSION    0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK  0x3fL
+FILEFLAGS      0x0L
+FILEOS         VOS__WINDOWS32
+FILETYPE       VFT_APP
+FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"   // English (US), Unicode code page
+        BEGIN
+            VALUE "CompanyName",      "Scholion"
+            VALUE "FileDescription",  "Scholion — Infinite Canvas PDF Workspace"
+            VALUE "FileVersion",      "0.1.0.0"
+            VALUE "InternalName",     "Scholion"
+            VALUE "LegalCopyright",   ""
+            VALUE "OriginalFilename", "Scholion.exe"
+            VALUE "ProductName",      "Scholion"
+            VALUE "ProductVersion",   "0.1.0.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

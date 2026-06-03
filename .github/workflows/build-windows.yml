@@ -1,0 +1,67 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Install dependencies with vcpkg
+      run: |
+        vcpkg integrate install
+        vcpkg install glfw3:x64-windows curl:x64-windows
+      shell: pwsh
+
+    - name: Setup GLAD
+      run: |
+        # Download GLAD from glad.dav1d.de (OpenGL 3.3 Core)
+        # This is a placeholder - adjust if needed for your specific GLAD setup
+        mkdir -p scholion-win/third_party/glad/include
+        mkdir -p scholion-win/third_party/glad/src
+      shell: pwsh
+
+    - name: Configure build (Windows)
+      run: |
+        cd scholion-win
+        mkdir build
+        cd build
+        cmake .. -G "Visual Studio 17 2022" -A x64 `
+          -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
+          -DCMAKE_BUILD_TYPE=Release `
+          -DSCHOLION_WITH_MUPDF=ON
+      shell: pwsh
+
+    - name: Build
+      run: |
+        cd scholion-win/build
+        cmake --build . --config Release -j 4
+      shell: pwsh
+
+    - name: Create installer (optional)
+      run: |
+        cd scholion-win/build
+        mkdir -p dist/Release
+        copy Release/Scholion.exe dist/Release/
+      shell: pwsh
+
+    - name: Upload EXE artifact
+      uses: actions/upload-artifact@v3
+      with:
+        name: Scholion.exe
+        path: scholion-win/build/Release/Scholion.exe
+        retention-days: 30
+
+    - name: Create Release
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v1
+      with:
+        files: scholion-win/build/Release/Scholion.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
