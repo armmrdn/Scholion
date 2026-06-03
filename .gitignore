@@ -17,6 +17,8 @@ Scholion.app/
 *.swo
 *~
 .DS_Store
+.cache/
+clangd/
 
 # OS
 .DS_Store
