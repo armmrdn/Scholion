@@ -1993,7 +1993,10 @@ static std::string recents_file_path() {
         WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &appdata[0], len, nullptr, nullptr);
         CoTaskMemFree(wpath);
         std::string dir = appdata + "\\Scholion";
-        std::filesystem::create_directories(dir);
+        // Use error_code overload — prevents std::filesystem exceptions if the
+        // directory already exists (known MinGW / GCC behaviour on second run).
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
         return dir + "\\recents";
     }
     return "";
@@ -2044,7 +2047,8 @@ static std::string prefs_file_path() {
         WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &appdata[0], len, nullptr, nullptr);
         CoTaskMemFree(wpath);
         std::string dir = appdata + "\\Scholion";
-        std::filesystem::create_directories(dir);
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
         return dir + "\\prefs";
     }
     return "";
@@ -3568,7 +3572,7 @@ int main(int argc, char* argv[]) {
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::GetIO().IniFilename = nullptr;
-    load_prefs();
+    try { load_prefs(); } catch (...) {}   // guard against filesystem exceptions on second run
     apply_theme(g_settings.dark_mode);
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
@@ -3606,7 +3610,7 @@ int main(int argc, char* argv[]) {
   printf("  Cmd+A — select all pages\n");
   printf("  Right-click empty canvas — save project\n");
 
-    load_recents();
+    try { load_recents(); } catch (...) {}   // guard against filesystem exceptions on second run
     s_panel_w = g_settings.panel_w;
     g_rast_thread = std::thread(rast_worker);
 
