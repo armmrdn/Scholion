@@ -51,7 +51,10 @@ jobs:
         run: |
           curl -L -o mupdf-source.tar.gz \
             https://mupdf.com/downloads/archive/mupdf-1.24.11-source.tar.gz
-          tar xzf mupdf-source.tar.gz
+          # Windows can't create symlinks without Developer Mode; harfbuzz/README
+          # is a symlink we don't need — ignore the error and verify the Makefile.
+          tar xzf mupdf-source.tar.gz || true
+          [ -f mupdf-1.24.11-source/Makefile ] || { echo "Extraction failed"; exit 1; }
           cd mupdf-1.24.11-source
           make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs -j4
           mkdir -p ../mupdf-libs-windows
