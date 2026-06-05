@@ -8,7 +8,7 @@
 #endif
 
 uint32_t TextureCache::upload(Page& page, LodTier tier,
-                               const uint8_t* pixels, int width, int height) {
+                               const uint8_t* pixels, int width, int height, int stride) {
     GLuint tex = 0;
     glGenTextures(1, &tex);
     glBindTexture(GL_TEXTURE_2D, tex);
@@ -22,8 +22,13 @@ uint32_t TextureCache::upload(Page& page, LodTier tier,
 
     // MuPDF RGBA pixmap rows are top-to-bottom; OpenGL expects bottom-to-top.
     // Flipping is handled in the renderer UV coordinates (v: 1→0 top-to-bottom).
+    // GL_UNPACK_ROW_LENGTH lets OpenGL skip MuPDF's per-row alignment padding
+    // (stride > width*4 on Windows). Row length is in pixels, not bytes.
+    int row_len = (stride > 0 && stride != width * 4) ? stride / 4 : 0;
+    if (row_len) glPixelStorei(GL_UNPACK_ROW_LENGTH, row_len);
     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
                  GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    if (row_len) glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
     glGenerateMipmap(GL_TEXTURE_2D);
     glBindTexture(GL_TEXTURE_2D, 0);
 

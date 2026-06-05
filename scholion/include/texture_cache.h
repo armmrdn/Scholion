@@ -24,9 +24,9 @@ public:
 
     /// Upload a rasterized pixel buffer as a GL RGBA8 texture.
     /// Sets the appropriate tex_* handle on the page.
-    /// pixels: RGBA row-major, width * height * 4 bytes.
+    /// pixels: RGBA row-major. stride: bytes per row (0 = packed, i.e. width*4).
     uint32_t upload(Page& page, LodTier tier,
-                    const uint8_t* pixels, int width, int height);
+                    const uint8_t* pixels, int width, int height, int stride = 0);
 
     /// Free all GL textures for a page (e.g., document closed).
     void evict(Page& page);

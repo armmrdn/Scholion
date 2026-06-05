@@ -4,6 +4,7 @@
 
 #include <mupdf/fitz.h>
 #include <cstdio>
+#include <cstring>
 
 
 PdfLoader::PdfLoader() {
@@ -108,7 +109,8 @@ bool PdfLoader::rasterize_and_upload(Page& page, LodTier tier, TextureCache& cac
         cache.upload(page, tier,
                      fz_pixmap_samples(m_ctx, pix),
                      fz_pixmap_width(m_ctx,   pix),
-                     fz_pixmap_height(m_ctx,  pix));
+                     fz_pixmap_height(m_ctx,  pix),
+                     fz_pixmap_stride(m_ctx,  pix));
         ok = true;
     }
     fz_catch(m_ctx) {
@@ -149,10 +151,17 @@ PdfLoader::RasterBuffer PdfLoader::rasterize_to_buffer(int page_index, LodTier t
         fz_run_page(m_ctx, fz_pg, dev, fz_identity, nullptr);
         fz_close_device(m_ctx, dev);
         fz_drop_device(m_ctx, dev);
-        int w = fz_pixmap_width(m_ctx, pix);
-        int h = fz_pixmap_height(m_ctx, pix);
+        int w      = fz_pixmap_width(m_ctx, pix);
+        int h      = fz_pixmap_height(m_ctx, pix);
+        int stride = fz_pixmap_stride(m_ctx, pix);
         const uint8_t* s = fz_pixmap_samples(m_ctx, pix);
-        result.pixels.assign(s, s + (size_t)w * h * 4);
+        // Copy row-by-row to produce a packed (width*4) buffer — pixmap rows
+        // may have alignment padding (stride > w*4) on some platforms/builds.
+        size_t row_bytes = (size_t)w * 4;
+        result.pixels.resize(row_bytes * h);
+        for (int row = 0; row < h; ++row)
+            std::memcpy(result.pixels.data() + row * row_bytes,
+                        s + (size_t)row * stride, row_bytes);
         result.width  = w;
         result.height = h;
         result.ok     = true;
