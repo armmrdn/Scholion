@@ -43,6 +43,7 @@ jobs:
 
       - name: Install MuPDF libs
         run: |
+          mkdir -p scholion/third_party/mupdf/lib
           cp mupdf-libs-macos/libmupdf.a mupdf-libs-macos/libmupdf-third.a \
              scholion/third_party/mupdf/lib/
 
