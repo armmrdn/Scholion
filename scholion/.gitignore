@@ -10,10 +10,7 @@ cmake-build-*/
 *~
 .DS_Store
 
-# Third-party (fetched by setup.sh, don't commit)
-third_party/imgui/
-
-# Compiled
+# Compiled outputs — third-party source is committed, not these
 *.o
 *.a
 *.dylib

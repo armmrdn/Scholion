@@ -24,11 +24,6 @@ clangd/
 .DS_Store
 Thumbs.db
 
-# Dependencies (will be installed via package managers)
-third_party/mupdf/lib/*.lib
-third_party/glad/src/
-third_party/glad/include/
-
 # Temporary files
 *.tmp
 *.log

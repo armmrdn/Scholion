@@ -2,107 +2,115 @@ name: Build Windows
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
 
 jobs:
   build-windows:
     runs-on: windows-2022
 
     steps:
-    - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    - name: Install dependencies with vcpkg
-      run: |
-        vcpkg integrate install
-        vcpkg install glfw3:x64-windows curl:x64-windows
-      shell: pwsh
+      # ------------------------------------------------------------------
+      # MSYS2 / MinGW-w64 toolchain
+      # All compilation steps use  shell: msys2 {0}  below.
+      # JavaScript actions (cache, upload-artifact) are unaffected.
+      # ------------------------------------------------------------------
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          path-type: minimal
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-glfw
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-pkg-config
+            make
 
-    - name: Verify MuPDF libraries exist
-      run: |
-        if (!(Test-Path "scholion-win/third_party/mupdf/lib/mupdf.lib")) {
-          Write-Error "MuPDF library not found at scholion-win/third_party/mupdf/lib/mupdf.lib"
-          exit 1
-        }
-        if (!(Test-Path "scholion-win/third_party/mupdf/lib/mupdf-third.lib")) {
-          Write-Error "MuPDF-third library not found at scholion-win/third_party/mupdf/lib/mupdf-third.lib"
-          exit 1
-        }
-        Write-Host "✓ MuPDF libraries verified"
-      shell: pwsh
+      # ------------------------------------------------------------------
+      # MuPDF 1.24.11 — built from source, cached by version key.
+      # Cache hit: skip the ~6-minute source build on subsequent runs.
+      # ------------------------------------------------------------------
+      - name: Cache MuPDF
+        id: mupdf-cache
+        uses: actions/cache@v4
+        with:
+          path: mupdf-libs-windows
+          key: mupdf-1.24.11-windows-mingw64-v1
 
-    - name: Configure build with CMake
-      run: |
-        cd scholion-win
-        mkdir build
-        cd build
-        cmake .. -G "Visual Studio 17 2022" -A x64 `
-          -DCMAKE_TOOLCHAIN_FILE=C:/vcpkg/scripts/buildsystems/vcpkg.cmake `
-          -DCMAKE_BUILD_TYPE=Release `
-          -DSCHOLION_WITH_MUPDF=ON
-      shell: pwsh
+      - name: Build MuPDF from source
+        if: steps.mupdf-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          curl -L -o mupdf-source.tar.gz \
+            https://mupdf.com/downloads/archive/mupdf-1.24.11-source.tar.gz
+          tar xzf mupdf-source.tar.gz
+          cd mupdf-1.24.11-source
+          make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs -j4
+          mkdir -p ../mupdf-libs-windows
+          cp build/release/libmupdf.a build/release/libmupdf-third.a \
+             ../mupdf-libs-windows/
 
-    - name: Build Scholion.exe
-      run: |
-        cd scholion-win/build
-        cmake --build . --config Release -j 4
-      shell: pwsh
+      - name: Install MuPDF libs
+        shell: msys2 {0}
+        run: |
+          cp mupdf-libs-windows/libmupdf.a mupdf-libs-windows/libmupdf-third.a \
+             scholion-win/third_party/mupdf/lib/
 
-    - name: Copy runtime DLLs
-      run: |
-        $releaseDir = "scholion-win/build/Release"
-        $vcpkgInstalled = "C:/vcpkg/installed/x64-windows/bin"
+      # ------------------------------------------------------------------
+      # Build Scholion.exe
+      # ------------------------------------------------------------------
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          cmake -S scholion-win -B scholion-win/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSCHOLION_WITH_MUPDF=ON
 
-        # Create release directory if it doesn't exist
-        if (!(Test-Path $releaseDir)) {
-          mkdir -p $releaseDir
-        }
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build scholion-win/build
 
-        # Copy GLFW DLL
-        if (Test-Path "$vcpkgInstalled/glfw3.dll") {
-          Copy-Item "$vcpkgInstalled/glfw3.dll" "$releaseDir/" -Force
-          Write-Host "✓ Copied glfw3.dll"
-        }
+      # ------------------------------------------------------------------
+      # Bundle: exe + all MinGW DLLs it depends on
+      # ldd filters to /mingw64 paths; Windows system DLLs are excluded.
+      # The result is a self-contained folder — extract and run.
+      # ------------------------------------------------------------------
+      - name: Bundle release
+        shell: msys2 {0}
+        run: |
+          mkdir -p Scholion-Windows
+          cp scholion-win/build/Scholion.exe Scholion-Windows/
+          ldd scholion-win/build/Scholion.exe \
+            | grep '/mingw64' \
+            | awk '{print $3}' \
+            | xargs -I{} cp {} Scholion-Windows/
+          echo "--- Release contents ---"
+          ls -lh Scholion-Windows/
 
-        # Copy libcurl DLL and dependencies
-        if (Test-Path "$vcpkgInstalled/libcurl.dll") {
-          Copy-Item "$vcpkgInstalled/libcurl.dll" "$releaseDir/" -Force
-          Write-Host "✓ Copied libcurl.dll"
-        }
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scholion-Windows
+          path: Scholion-Windows/
+          retention-days: 30
 
-        # Copy OpenSSL DLLs (required by curl)
-        if (Test-Path "$vcpkgInstalled/libssl-3-x64.dll") {
-          Copy-Item "$vcpkgInstalled/libssl-3-x64.dll" "$releaseDir/" -Force
-          Write-Host "✓ Copied libssl-3-x64.dll"
-        }
-        if (Test-Path "$vcpkgInstalled/libcrypto-3-x64.dll") {
-          Copy-Item "$vcpkgInstalled/libcrypto-3-x64.dll" "$releaseDir/" -Force
-          Write-Host "✓ Copied libcrypto-3-x64.dll"
-        }
-
-        # Copy zlib (required by libcurl)
-        if (Test-Path "$vcpkgInstalled/zlib1.dll") {
-          Copy-Item "$vcpkgInstalled/zlib1.dll" "$releaseDir/" -Force
-          Write-Host "✓ Copied zlib1.dll"
-        }
-
-        Write-Host ""
-        Write-Host "Release directory contents:"
-        ls -la $releaseDir
-      shell: pwsh
-
-    - name: Upload Windows executable
-      uses: actions/upload-artifact@v4
-      with:
-        name: Scholion-Windows
-        path: scholion-win/build/Release/
-        retention-days: 30
-
-    - name: Create GitHub Release
-      if: startsWith(github.ref, 'refs/tags/')
-      uses: softprops/action-gh-release@v1
-      with:
-        files: scholion-win/build/Release/Scholion.exe
-      env:
-        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # ------------------------------------------------------------------
+      # Publish to GitHub Releases on version tags (e.g. v0.6.0)
+      # ------------------------------------------------------------------
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            Scholion-Windows/Scholion.exe
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

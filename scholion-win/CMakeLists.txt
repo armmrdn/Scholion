@@ -73,14 +73,23 @@ target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 option(SCHOLION_WITH_MUPDF "Link MuPDF for PDF rasterization" OFF)
 
 if(SCHOLION_WITH_MUPDF)
-    set(MUPDF_INC  "${SHARED_3P}/mupdf/include")
-    set(MUPDF_LIB  "${WIN_3P}/mupdf/lib/mupdf.lib")
-    set(MUPDF_THIRD "${WIN_3P}/mupdf/lib/mupdf-third.lib")
+    set(MUPDF_INC "${SHARED_3P}/mupdf/include")
+
+    # MSVC produces .lib; MinGW/GCC produces .a
+    if(MSVC)
+        set(MUPDF_LIB   "${WIN_3P}/mupdf/lib/mupdf.lib")
+        set(MUPDF_THIRD "${WIN_3P}/mupdf/lib/mupdf-third.lib")
+    else()
+        set(MUPDF_LIB   "${WIN_3P}/mupdf/lib/libmupdf.a")
+        set(MUPDF_THIRD "${WIN_3P}/mupdf/lib/libmupdf-third.a")
+    endif()
 
     if(NOT EXISTS "${MUPDF_LIB}")
         message(FATAL_ERROR
-            "Windows MuPDF lib not found at ${MUPDF_LIB}.\n"
-            "See ${WIN_3P}/mupdf/lib/PLACE_WINDOWS_LIBS_HERE.txt for instructions.")
+            "MuPDF lib not found at ${MUPDF_LIB}.\n"
+            "CI: built automatically by build-windows.yml.\n"
+            "Local: copy libmupdf.a / libmupdf-third.a (MinGW) or "
+            "mupdf.lib / mupdf-third.lib (MSVC) into ${WIN_3P}/mupdf/lib/")
     endif()
 endif()
 
@@ -143,6 +152,18 @@ if(MSVC)
     target_compile_options(Scholion PRIVATE /W3 /wd4996 /utf-8)
     set_target_properties(Scholion PROPERTIES
         VS_DEBUGGER_WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+endif()
+
+# MinGW: statically link the C/C++ and pthreads runtime so the .exe
+# doesn't depend on libgcc, libstdc++, or libwinpthread DLLs.
+if(MINGW)
+    target_link_options(Scholion PRIVATE
+        -static-libgcc
+        -static-libstdc++
+        -Wl,-Bstatic,--whole-archive
+        -lwinpthread
+        -Wl,--no-whole-archive
+    )
 endif()
 
 message(STATUS "Scholion Windows build configured")
