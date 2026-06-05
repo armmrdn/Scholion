@@ -1,138 +1,96 @@
-# Scholion — Session Summary (macOS + Windows Setup Complete)
+# Scholion — Session Summary
 
-**Date:** 2026-06-03  
-**Focus:** Testing, cleanup, GitHub setup, and CI/CD preparation
+**Date:** 2026-06-04
+**Focus:** macOS UI polish, annotation improvements, settings
+
+---
+
+## Current State
+
+macOS app is fully functional and tested. Windows build system is wired up in `scholion-win/`; CI workflow (`build-windows.yml`) exists but the Windows `.exe` build has not been validated end-to-end yet — that is the next major milestone.
+
+---
 
 ## Completed This Session
 
-### 1. ✅ App Testing
-- Built macOS release version successfully
-- Verified app launches without errors
-- All previous features confirmed working (settings pane, search, annotations, etc.)
+### UI Polish
+- **Startup chooser**: Removed `…` from button labels
+- **File picker focus**: App activates to foreground before every `tinyfd` dialog call (`scholion_activate_app()`)
+- **ESC key**: Deactivates active annotation/text tool before clearing selection or closing panel
+- **Settings table**: Action and Key columns now equal width
+- **Canvas vignette**: Subtle dark gradient from all four edges; toggleable in Settings → Appearance
+- **Saved! toast**: Larger, with box background, repositioned
 
-### 2. ✅ Directory Cleanup
-- Removed all old phase-based tarballs (m26–m29)
-- Cleaned build artifacts from both `scholion/` and `scholion-win/`
-- Removed unnecessary recovery archives
-- Created single clean `scholion-source.tar.gz` (42 MB)
+### Annotation Tools
+- **Flag cursor icon**: Small flag glyph follows cursor when Note tool is active
+- **Flag removal**: Clicking an existing flag badge in the panel sidebar removes it (with Cmd+Z undo)
+- **Spacebar close**: Spacebar now closes the panel regardless of keyboard focus
 
-### 3. ✅ Git Repository Setup
-- Initialized git repo at `/Users/armmrdn/Dropbox/Scholion/`
-- Created comprehensive `.gitignore` (build artifacts, IDE caches, OS files)
-- Made 3 clean commits:
-  1. Initial commit: Full source + CI/CD workflows
-  2. Cleanup: Removed clangd cache from tracking
-  3. Setup: Added GitHub guide + finalized .gitignore
+### Settings Pane
+- Opens centered on every launch
+- **Canvas vignette** toggle added under Appearance (persisted to `~/.scholion_prefs`)
+- **Credits** updated: "@ARMMRDN (2026)" + scholion definition quote
 
-### 4. ✅ GitHub Actions CI/CD Workflows
-Created two production-ready workflows in `.github/workflows/`:
+### MuPDF
+- Headers updated to 1.24.11 to match the static libs (`libmupdf.a`, `libmupdf-third.a`)
 
-#### `build-macos.yml`
-- Triggers on push to `main` / `develop` and pull requests
-- Builds for both **x86_64** and **arm64** architectures
-- Creates DMG installers using `hdiutil`
-- Uploads artifacts to GitHub (30-day retention)
-- Auto-creates releases on tagged commits (v0.x.x)
+### Repository Cleanup
+- `GITHUB_SETUP.md` removed (no longer needed)
+- Stale duplicate source files removed from `scholion-win/src/` (only `platform_win.cpp` remains; shared sources are referenced from `../scholion/src/` by CMakeLists)
+- Fresh `scholion-source.tar.gz` snapshot rolled (38 MB, includes MuPDF libs)
 
-#### `build-windows.yml`
-- Triggers on push to `main` / `develop` and pull requests
-- Builds on Windows Server 2022 with Visual Studio 17
-- Uses vcpkg for dependency management
-- Compiles `Scholion.exe` Release build
-- Uploads EXE to GitHub artifacts
-- Auto-creates releases on tagged commits
+---
 
-### 5. ✅ Documentation
-- **README.md** — Project overview, build instructions (macOS/Windows/Linux), features, architecture links
-- **GITHUB_SETUP.md** — Step-by-step GitHub account setup + CI/CD troubleshooting
-- Updated `.gitignore` to exclude clangd, build artifacts, OS files
+## Pending
 
-## What's Ready to Go
+| Item | Notes |
+|------|-------|
+| Windows `.exe` CI build | `build-windows.yml` needs end-to-end test on GitHub Actions |
+| Per-page 90° rotation | Deferred — medium complexity, scoped and ready to implement |
+| Linux port | Not started |
 
-### For GitHub Integration (Next Step)
-1. Create new repo at https://github.com/yourusername/Scholion
-2. Run commands in `GITHUB_SETUP.md` Section 3:
-   ```bash
-   cd /Users/armmrdn/Dropbox/Scholion
-   git remote add origin https://github.com/yourusername/Scholion.git
-   git branch -M main
-   git push -u origin main
-   ```
-3. Workflows will trigger automatically on push
-4. Check **Actions** tab to watch builds complete
+---
 
-### Platform Status
-
-| Platform | Status | Next Step |
-|----------|--------|-----------|
-| **macOS** | ✅ Complete | GitHub Actions will auto-build DMGs |
-| **Windows** | ✅ Build system ready | Fresh build + testing on Windows machine |
-| **Linux** | 🚀 Ready for refactor | New session: implement Linux port |
-
-## Files & Structure
+## Repository Layout
 
 ```
 Scholion/
-├── .github/workflows/          # CI/CD automation
-│   ├── build-macos.yml         # macOS x86_64 + arm64 → DMG
-│   └── build-windows.yml       # Windows x64 → EXE
+├── .github/workflows/
+│   ├── build-windows.yml       # Windows CI (needs validation)
+│   └── build-mupdf-windows.yml # Manual workflow to rebuild MuPDF Windows libs
 ├── scholion/                   # macOS build + shared source
-│   ├── src/                    # Cross-platform C++17 code
-│   ├── include/                # Headers
-│   ├── CMakeLists.txt          # macOS build config
+│   ├── src/                    # Cross-platform C++17 (main.cpp, canvas, input, …)
+│   ├── include/                # Shared headers
+│   ├── third_party/            # ImGui, MuPDF 1.24.11, tinyfiledialogs, GLFW
+│   ├── CMakeLists.txt
 │   └── docs/
-│       ├── TODO.md             # Backlog (performance optimization)
-│       ├── ARCHITECTURE.md     # System design
-│       └── milestones.md       # Past milestones (M1–M29)
-├── scholion-win/               # Windows port
-│   ├── CMakeLists.txt          # Windows build config
-│   ├── src/platform_win.cpp    # Windows-specific stubs
+│       ├── ARCHITECTURE.md
+│       ├── TODO.md
+│       └── milestones.md
+├── scholion-win/               # Windows-specific build overlay
+│   ├── src/platform_win.cpp    # Windows platform stubs
+│   ├── CMakeLists.txt          # References ../scholion/src/ for shared code
 │   ├── resources/              # .rc, icon, manifest
-│   └── third_party/            # GLAD, MuPDF libs (placeholder)
-├── scholion-linux/             # 🚀 NEXT: Linux port (new session)
-├── README.md                   # Project overview
-├── GITHUB_SETUP.md             # GitHub account + CI/CD setup
+│   └── third_party/            # GLAD, MuPDF Windows .lib placeholders
+├── README.md
 ├── SESSION_SUMMARY.md          # This file
-└── .gitignore                  # Clean git config
-
-Restore point:
-└── scholion-source.tar.gz      # Full source snapshot (42 MB)
+└── .gitignore
 ```
-
-## Git Commits (ready to push)
-
-```
-11239e7 (HEAD) Add GitHub setup guide and finalize .gitignore
-d721d98 Remove clangd cache from version control
-d1a6df8 Initial Scholion project commit — full-featured PDF canvas workspace
-```
-
-## Next Session: Linux Refactoring
-
-When ready to refactor for Linux:
-
-1. Create `scholion-linux/` directory (mirroring `scholion-win/`)
-2. Copy Windows CMakeLists.txt as template
-3. Adjust for Linux toolchain (gcc/clang, apt packages, native paths)
-4. Add Linux-specific platform stubs to `scholion-linux/src/platform_linux.cpp`
-5. Add platform ifdefs (`#ifdef __linux__`) to shared source as needed
-6. Create GitHub Actions workflow `build-linux.yml`
-7. Test locally on Linux machine or VM
-8. Push updates — CI/CD handles the rest
 
 ---
 
-## Checklist for Linux Session Start
+## Build (macOS)
 
-When opening new session with this directory:
+```bash
+cd scholion/build
+make -j$(sysctl -n hw.ncpu)
+open Scholion.app
+```
 
-- [ ] Read `scholion/docs/ARCHITECTURE.md` for system overview
-- [ ] Read `scholion/docs/TODO.md` for known optimizations
-- [ ] Check `scholion-win/CLAUDE.md` for Windows-specific notes
-- [ ] Review `GITHUB_SETUP.md` for any GitHub workflow questions
-- [ ] Examine `scholion/src/main.cpp` platform conditionals to understand macOS/Windows splits
-- [ ] Plan Linux CMakeLists.txt (use Windows version as template)
-
----
-
-**Status: Ready for GitHub + Linux refactor. All macOS + Windows features complete and tested.**
+Full clean build:
+```bash
+cd scholion
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DSCHOLION_WITH_MUPDF=ON
+make -j$(sysctl -n hw.ncpu)
+```

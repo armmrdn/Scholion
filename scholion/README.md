@@ -13,16 +13,16 @@ brew install glfw
 # cmake: use the bundled binary if brew cmake requires a newer CLT
 ```
 
-**Build (with MuPDF PDF rendering):**
+**Build:**
 ```bash
-CMAKE=/tmp/cmake-3.29.3-macos-universal/CMake.app/Contents/bin/cmake
-$CMAKE -S . -B build -DCMAKE_BUILD_TYPE=Debug -DSCHOLION_WITH_MUPDF=ON
-$CMAKE --build build -j$(sysctl -n hw.ncpu)
+mkdir -p build && cd build
+cmake .. -DCMAKE_BUILD_TYPE=Release -DSCHOLION_WITH_MUPDF=ON
+make -j$(sysctl -n hw.ncpu)
 ```
 
 **Run:**
 ```bash
-./build/scholion [file.pdf ...]
+open build/Scholion.app
 ```
 
 ---
@@ -114,14 +114,18 @@ Click any page to open the panel viewer on the right side of the window.
 
 ### Annotation Tools (in panel header)
 
-| Tool | Behavior |
-|------|---------|
-| Pen | Freehand red stroke drawn on the active page |
-| Highlight | Drag to stamp a yellow highlight rectangle on the page |
-| Note | Stamp a sequentially-labeled flag (A, B, C … Z, 2A, 2B …) |
+| Tool | Shortcut | Behavior |
+|------|----------|---------|
+| Pen | P | Freehand stroke on the active page |
+| Highlight | H | Drag to stamp a yellow highlight rectangle |
+| Note / Flag | F | Stamp a sequentially-labeled flag (A, B … Z, 2A, 2B …) |
+| Eraser | — | Drag over strokes/highlights to erase them |
 
-Annotations are stored in page-normalized coordinates and move with the page.
-They appear in both the panel viewer and on the canvas.
+- While Note tool is active, a flag icon follows the cursor.
+- Clicking an existing flag badge in the panel removes it (Cmd+Z to undo).
+- Escape deactivates the active tool.
+
+Annotations are stored in page-normalized coordinates and appear in both the panel viewer and on the canvas.
 
 ---
 
@@ -220,7 +224,7 @@ InputHandler    — GLFW callbacks, hit-testing, single/multi-page drag, selecti
 Panel UI        — Dear ImGui sidebar, annotation tools, resize handle
 ```
 
-**Tech stack:** C++17 · GLFW 3.4 · OpenGL 3.3 core · MuPDF 1.24.4 (AGPL) · Dear ImGui · tinyfd
+**Tech stack:** C++17 · GLFW 3.4 · OpenGL 3.3 core · MuPDF 1.24.11 (AGPL) · Dear ImGui · tinyfd
 
 > MuPDF is AGPL licensed. For closed binary distribution, swap to pdfium.
 
@@ -243,3 +247,4 @@ Panel UI        — Dear ImGui sidebar, annotation tools, resize handle
 - [x] M13 — UX polish (remove document, zoom-to-fit, recent projects, window title, undo coverage)
 - [x] M14 — Text & search (copy page text, Cmd+F full-text search, single-doc fit, panel nav)
 - [x] M15 — Status overlay + Cmd+S save (F3 overlay, zoom %, Cmd+S, save-on-quit; text-box ESC/style)
+- [x] M16 — UI polish: ESC tool deactivation, vignette toggle, flag cursor icon, flag removal by click, spacebar panel close, settings credits

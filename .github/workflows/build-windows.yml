@@ -19,15 +19,20 @@ jobs:
         vcpkg install glfw3:x64-windows curl:x64-windows
       shell: pwsh
 
-    - name: Setup GLAD
+    - name: Verify MuPDF libraries exist
       run: |
-        # Download GLAD from glad.dav1d.de (OpenGL 3.3 Core)
-        # This is a placeholder - adjust if needed for your specific GLAD setup
-        mkdir -p scholion-win/third_party/glad/include
-        mkdir -p scholion-win/third_party/glad/src
+        if (!(Test-Path "scholion-win/third_party/mupdf/lib/mupdf.lib")) {
+          Write-Error "MuPDF library not found at scholion-win/third_party/mupdf/lib/mupdf.lib"
+          exit 1
+        }
+        if (!(Test-Path "scholion-win/third_party/mupdf/lib/mupdf-third.lib")) {
+          Write-Error "MuPDF-third library not found at scholion-win/third_party/mupdf/lib/mupdf-third.lib"
+          exit 1
+        }
+        Write-Host "✓ MuPDF libraries verified"
       shell: pwsh
 
-    - name: Configure build (Windows)
+    - name: Configure build with CMake
       run: |
         cd scholion-win
         mkdir build
@@ -38,27 +43,63 @@ jobs:
           -DSCHOLION_WITH_MUPDF=ON
       shell: pwsh
 
-    - name: Build
+    - name: Build Scholion.exe
       run: |
         cd scholion-win/build
         cmake --build . --config Release -j 4
       shell: pwsh
 
-    - name: Create installer (optional)
+    - name: Copy runtime DLLs
       run: |
-        cd scholion-win/build
-        mkdir -p dist/Release
-        copy Release/Scholion.exe dist/Release/
+        $releaseDir = "scholion-win/build/Release"
+        $vcpkgInstalled = "C:/vcpkg/installed/x64-windows/bin"
+
+        # Create release directory if it doesn't exist
+        if (!(Test-Path $releaseDir)) {
+          mkdir -p $releaseDir
+        }
+
+        # Copy GLFW DLL
+        if (Test-Path "$vcpkgInstalled/glfw3.dll") {
+          Copy-Item "$vcpkgInstalled/glfw3.dll" "$releaseDir/" -Force
+          Write-Host "✓ Copied glfw3.dll"
+        }
+
+        # Copy libcurl DLL and dependencies
+        if (Test-Path "$vcpkgInstalled/libcurl.dll") {
+          Copy-Item "$vcpkgInstalled/libcurl.dll" "$releaseDir/" -Force
+          Write-Host "✓ Copied libcurl.dll"
+        }
+
+        # Copy OpenSSL DLLs (required by curl)
+        if (Test-Path "$vcpkgInstalled/libssl-3-x64.dll") {
+          Copy-Item "$vcpkgInstalled/libssl-3-x64.dll" "$releaseDir/" -Force
+          Write-Host "✓ Copied libssl-3-x64.dll"
+        }
+        if (Test-Path "$vcpkgInstalled/libcrypto-3-x64.dll") {
+          Copy-Item "$vcpkgInstalled/libcrypto-3-x64.dll" "$releaseDir/" -Force
+          Write-Host "✓ Copied libcrypto-3-x64.dll"
+        }
+
+        # Copy zlib (required by libcurl)
+        if (Test-Path "$vcpkgInstalled/zlib1.dll") {
+          Copy-Item "$vcpkgInstalled/zlib1.dll" "$releaseDir/" -Force
+          Write-Host "✓ Copied zlib1.dll"
+        }
+
+        Write-Host ""
+        Write-Host "Release directory contents:"
+        ls -la $releaseDir
       shell: pwsh
 
-    - name: Upload EXE artifact
-      uses: actions/upload-artifact@v3
+    - name: Upload Windows executable
+      uses: actions/upload-artifact@v4
       with:
-        name: Scholion.exe
-        path: scholion-win/build/Release/Scholion.exe
+        name: Scholion-Windows
+        path: scholion-win/build/Release/
         retention-days: 30
 
-    - name: Create Release
+    - name: Create GitHub Release
       if: startsWith(github.ref, 'refs/tags/')
       uses: softprops/action-gh-release@v1
       with:

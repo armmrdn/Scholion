@@ -124,4 +124,9 @@ int scholion_pop_pending_open(char* buf, int buf_len) {
     return 1;
 }
 
+// Call before any tinyfd dialog so the dialog appears in front of the app.
+void scholion_activate_app(void) {
+    [NSApp activateIgnoringOtherApps:YES];
+}
+
 } // extern "C"

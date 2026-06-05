@@ -10,6 +10,7 @@
 extern "C" void scholion_register_early(void);
 extern "C" void scholion_register_file_handler(void);
 extern "C" int  scholion_pop_pending_open(char* buf, int buf_len);
+extern "C" void scholion_activate_app(void);
 #include <unistd.h>   // fork / execl
 #elif defined(_WIN32)
 // Windows: GLAD must be included before GLFW so it wins the GL symbol race.
@@ -197,6 +198,7 @@ struct AppSettings {
     GridMode grid_mode   = GridMode::Lines;
     bool     compat_mode = false;
     float    panel_w     = 360.0f;          // persisted sidebar width
+    bool     vignette_on = true;
 };
 static AppSettings g_settings;
 static bool g_settings_open = false;
@@ -270,6 +272,7 @@ struct UndoRecord {
         TextBoxCreate, TextBoxMove, TextBoxDelete,
         TextBoxEdit, TextBoxStyle,
         ErasedStroke, ErasedHighlight,
+        ErasedNote,
         DocumentRemove
     };
     Type type = Type::PenStroke;
@@ -293,6 +296,8 @@ struct UndoRecord {
     // Erased annotations (stored so they can be re-inserted)
     AnnotStroke    erased_stroke    = {};
     AnnotHighlight erased_highlight = {};
+    AnnotNote      erased_note      = {};
+    int            erased_note_at   = -1;  // index within page.annots.notes
 
     // Document removal (stores full document copy for undo)
     int                        removed_doc_idx = -1;
@@ -381,6 +386,12 @@ static void undo_last() {
         case UndoRecord::Type::ErasedHighlight:
             if (auto* p = safe_page())
                 p->annots.highlights.push_back(r.erased_highlight);
+            break;
+        case UndoRecord::Type::ErasedNote:
+            if (auto* p = safe_page()) {
+                int at = std::clamp(r.erased_note_at, 0, (int)p->annots.notes.size());
+                p->annots.notes.insert(p->annots.notes.begin() + at, r.erased_note);
+            }
             break;
         case UndoRecord::Type::DocumentRemove: {
             int idx = std::clamp(r.removed_doc_idx, 0, (int)g_documents.size());
@@ -966,6 +977,49 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
         if (key == GLFW_KEY_F && (super || ctrl)) { g_search_open = !g_search_open; return; }
         // Cmd+S: allowed mid text-box edit so you can save without closing the editor.
         if (key == GLFW_KEY_S && (super || ctrl)) { save_project_current(); return; }
+
+        // Tool keys always work regardless of panel focus.
+        bool cmd = super || ctrl;
+        if (!cmd) {
+            if (key == GLFW_KEY_P) {
+                bool was_pen = (g_annot_tool == AnnotTool::Pen);
+                g_annot_tool = was_pen ? AnnotTool::None : AnnotTool::Pen;
+                g_ann_drawing = false;
+                if (!was_pen && !g_input.panel_open()) {
+                    const Document* sel = g_input.selected_doc();
+                    if (sel) {
+                        for (int i = 0; i < (int)g_documents.size(); ++i)
+                            if (&g_documents[i] == sel) { g_input.open_panel(i, -1); break; }
+                    }
+                }
+                return;
+            }
+            if (key == GLFW_KEY_H) {
+                g_annot_tool = (g_annot_tool == AnnotTool::Highlight)
+                               ? AnnotTool::None : AnnotTool::Highlight;
+                g_ann_drawing = false;
+                return;
+            }
+            if (key == GLFW_KEY_F && !super && !ctrl) {
+                g_annot_tool = (g_annot_tool == AnnotTool::Note)
+                               ? AnnotTool::None : AnnotTool::Note;
+                g_ann_drawing = false;
+                return;
+            }
+            // ESC: deactivate active tool even when panel has keyboard focus.
+            if (key == GLFW_KEY_ESCAPE && !g_search_open) {
+                if (g_editing_box >= 0) {
+                    g_editing_box = -1;
+                    return;
+                }
+                if (g_text_tool) { g_text_tool = false; return; }
+                if (g_annot_tool != AnnotTool::None) {
+                    g_annot_tool = AnnotTool::None;
+                    g_ann_drawing = false;
+                    return;
+                }
+            }
+        }
     }
 
     if (ImGui::GetIO().WantCaptureKeyboard) return;
@@ -1193,6 +1247,11 @@ static void draw_cursor_tool_icon() {
         ImVec2 br = {m.x + 24.0f, m.y + 16.0f};
         dl->AddRectFilled(tl, br, IM_COL32(255, 215, 0, 180));
         dl->AddRect(tl, br, IM_COL32(200, 165, 0, 230), 0.0f, 0, 1.0f);
+    } else if (g_annot_tool == AnnotTool::Note) {
+        float fx = m.x + 14.0f, fy = m.y + 3.0f;
+        dl->AddLine({fx, fy}, {fx, fy + 13.0f}, IM_COL32(50, 110, 220, 240), 1.5f);
+        dl->AddTriangleFilled({fx, fy}, {fx + 9.0f, fy + 4.0f}, {fx, fy + 8.0f},
+                              IM_COL32(50, 110, 220, 210));
     } else if (g_annot_tool == AnnotTool::Eraser) {
         dl->AddCircle({m.x + 12.0f, m.y + 12.0f}, 10.0f, IM_COL32(220, 220, 220, 200), 16, 1.5f);
     } else if (g_text_tool) {
@@ -1719,6 +1778,9 @@ static void draw_context_menu() {
                 ImGui::TextDisabled("PDF not found:");
                 ImGui::TextDisabled("%s", doc->path.c_str());
                 if (ImGui::MenuItem("Relink PDF...")) {
+#ifdef __APPLE__
+                    scholion_activate_app();
+#endif
                     const char* pats[] = {"*.pdf", "*.PDF"};
                     const char* picked = tinyfd_openFileDialog(
                         "Locate the missing PDF", doc->path.c_str(), 2, pats, "PDF Documents", 0);
@@ -2000,6 +2062,7 @@ static void save_prefs() {
     fprintf(f, "dark_mode=%d\n",   g_settings.dark_mode   ? 1 : 0);
     fprintf(f, "grid_mode=%d\n",   (int)g_settings.grid_mode);
     fprintf(f, "compat_mode=%d\n", g_settings.compat_mode ? 1 : 0);
+    fprintf(f, "vignette_on=%d\n", g_settings.vignette_on ? 1 : 0);
     fprintf(f, "panel_w=%.1f\n",   g_settings.panel_w);
     fclose(f);
 }
@@ -2016,6 +2079,7 @@ static void load_prefs() {
         if      (!strcmp(key, "dark_mode"))   g_settings.dark_mode   = ival;
         else if (!strcmp(key, "grid_mode"))   g_settings.grid_mode   = (GridMode)ival;
         else if (!strcmp(key, "compat_mode")) g_settings.compat_mode = ival;
+        else if (!strcmp(key, "vignette_on")) g_settings.vignette_on = ival;
         else if (!strcmp(key, "panel_w"))     g_settings.panel_w     = fval;
     }
     fclose(f);
@@ -2150,6 +2214,9 @@ static bool save_to_path(const std::string& path) {
 }
 
 static void save_project() {
+#ifdef __APPLE__
+    scholion_activate_app();
+#endif
     const char* filter_patterns[] = {"*.scholion"};
     const char* picked = tinyfd_saveFileDialog(
         "Save Project", "project.scholion", 1, filter_patterns, "Scholion Project");
@@ -2473,6 +2540,9 @@ static void load_project_from_path(const std::string& path) {
 }
 
 static void load_project() {
+#ifdef __APPLE__
+    scholion_activate_app();
+#endif
     // No type filter: tinyfiledialogs passes the extension to AppleScript's
     // "choose file of type", which on macOS 12+ treats it as a UTI lookup.
     // Since "scholion" isn't a registered UTI, all .scholion files get greyed
@@ -2499,17 +2569,26 @@ static void draw_startup_chooser() {
         ImGui::Spacing();
         const ImVec2 bsz = {260.0f, 0.0f};
 
-        if (ImGui::Button("Open Project File…", bsz)) {
+        if (ImGui::Button("Open Project File", bsz)) {
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
+#ifdef __APPLE__
+            scholion_activate_app();
+#endif
             load_project();
         }
-        if (ImGui::Button("Add PDF File(s)…", bsz)) {
+        if (ImGui::Button("Add PDF File(s)", bsz)) {
+#ifdef __APPLE__
+            scholion_activate_app();
+#endif
             const char* pats[] = {"*.pdf", "*.PDF"};
             const char* r = tinyfd_openFileDialog("Select PDF files", nullptr, 2, pats, "PDF Documents", 1);
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
             if (r) load_pdfs_from_selection(r);
         }
-        if (ImGui::Button("Add Folder of PDFs…", bsz)) {
+        if (ImGui::Button("Add Folder of PDFs", bsz)) {
+#ifdef __APPLE__
+            scholion_activate_app();
+#endif
             const char* d = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
             if (d) load_pdfs_from_folder(d);
@@ -2557,6 +2636,10 @@ static void draw_settings_popup() {
         apply_theme(g_settings.dark_mode);
         save_prefs();
     }
+    bool prev_vignette = g_settings.vignette_on;
+    ImGui::Checkbox("Canvas vignette", &g_settings.vignette_on);
+    if (g_settings.vignette_on != prev_vignette)
+        save_prefs();
 
     // --- Canvas Grid ---
     ImGui::SeparatorText("Canvas Grid");
@@ -2588,8 +2671,8 @@ static void draw_settings_popup() {
     if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_BordersInnerV
                                      | ImGuiTableFlags_RowBg
                                      | ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Key",    ImGuiTableColumnFlags_WidthFixed, 140.0f);
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.5f);
+        ImGui::TableSetupColumn("Key",    ImGuiTableColumnFlags_WidthStretch, 0.5f);
         ImGui::TableHeadersRow();
 
         auto row = [](const char* action, const char* key) {
@@ -2630,9 +2713,11 @@ static void draw_settings_popup() {
     // Footer with attribution
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::PushFont(ImGui::GetIO().Fonts->Fonts[0]);  // Use default small font
-    ImGui::TextWrapped("Scholion, a basic PDF canvas utility designed and built by ARMMRDN (2026).");
-    ImGui::PopFont();
+    ImGui::TextUnformatted("Scholion is a canvas-style PDF review utility designed and built by @ARMMRDN (2026)");
+    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 700.0f);
+    ImGui::TextWrapped("\"a scholion is an explanatory comment typically written in the margin of a manuscript "
+                       "by its ancient authors or students, as a guide\"");
+    ImGui::PopTextWrapPos();
     ImGui::PopStyleColor();
 
     ImGui::End();
@@ -2731,12 +2816,18 @@ static void draw_canvas_context_menu() {
 
         // Document operations
         if (ImGui::MenuItem("Add PDF...")) {
+#ifdef __APPLE__
+            scholion_activate_app();
+#endif
             const char* patterns[] = {"*.pdf", "*.PDF"};
             const char* r = tinyfd_openFileDialog("Select PDF files", nullptr,
                                                   2, patterns, "PDF Documents", 1);
             if (r) load_pdfs_from_selection(r);
         }
         if (ImGui::MenuItem("Add folder...")) {
+#ifdef __APPLE__
+            scholion_activate_app();
+#endif
             const char* r = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
             if (r) load_pdfs_from_folder(r);
         }
@@ -2944,18 +3035,38 @@ static void draw_panel_ui() {
             }
         }
 
-        // Note badges — stacked from top-right corner, left to right
+        // Note badges — stacked from top-right corner, left to right.
+        // When the Note tool is active, clicking a badge removes that flag.
         {
             constexpr float NBW = 16.0f, NBH = 16.0f, NGAP = 2.0f;
             float nbx = img_pos.x + img_w;
-            for (const auto& note : page.annots.notes) {
+            int remove_idx = -1;
+            for (int ni = 0; ni < (int)page.annots.notes.size(); ++ni) {
                 nbx -= NBW + NGAP;
                 ImVec2 ntl = {nbx,        img_pos.y};
                 ImVec2 nbr = {nbx + NBW,  img_pos.y + NBH};
                 dl->AddRectFilled(ntl, nbr, IM_COL32(50, 110, 210, 230), 2.0f);
+                const auto& note = page.annots.notes[ni];
                 ImVec2 tsz = ImGui::CalcTextSize(note.label.c_str());
                 dl->AddText({ntl.x + (NBW - tsz.x) * 0.5f, ntl.y + (NBH - tsz.y) * 0.5f},
                             IM_COL32(255, 255, 255, 255), note.label.c_str());
+                if (g_annot_tool == AnnotTool::Note) {
+                    char bid[40];
+                    snprintf(bid, sizeof(bid), "##rmflag_%d_%d", page.page_index, ni);
+                    ImGui::SetCursorScreenPos(ntl);
+                    if (ImGui::InvisibleButton(bid, {NBW, NBH}))
+                        remove_idx = ni;
+                }
+            }
+            if (remove_idx >= 0) {
+                UndoRecord r;
+                r.type           = UndoRecord::Type::ErasedNote;
+                r.doc_idx        = doc_idx;
+                r.page_idx       = page.page_index;
+                r.erased_note    = page.annots.notes[remove_idx];
+                r.erased_note_at = remove_idx;
+                push_undo(r);
+                page.annots.notes.erase(page.annots.notes.begin() + remove_idx);
             }
         }
 
@@ -3353,10 +3464,16 @@ static void draw_toolbar_ui() {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8.0f, 6.0f});
 
         if (ImGui::MenuItem("Add from folder...")) {
+#ifdef __APPLE__
+            scholion_activate_app();
+#endif
             const char* path = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
             if (path) load_pdfs_from_folder(path);
         }
         if (ImGui::MenuItem("Add from file...")) {
+#ifdef __APPLE__
+            scholion_activate_app();
+#endif
             const char* patterns[] = {"*.pdf", "*.PDF"};
             const char* result = tinyfd_openFileDialog(
                 "Select PDF files", nullptr,
@@ -3657,6 +3774,20 @@ int main(int argc, char* argv[]) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        // Subtle vignette — dark gradient from all four edges toward center.
+        if (g_settings.vignette_on) {
+            ImDrawList* dl  = ImGui::GetBackgroundDrawList();
+            ImVec2 vp       = ImGui::GetMainViewport()->Size;
+            float  w        = vp.x * 0.22f;
+            float  h        = vp.y * 0.22f;
+            ImU32  dark     = IM_COL32(0, 0, 0, 90);
+            ImU32  clear    = IM_COL32(0, 0, 0, 0);
+            dl->AddRectFilledMultiColor({0,0}, {vp.x, h}, dark, dark, clear, clear);
+            dl->AddRectFilledMultiColor({0, vp.y-h}, {vp.x, vp.y}, clear, clear, dark, dark);
+            dl->AddRectFilledMultiColor({0,0}, {w, vp.y}, dark, clear, clear, dark);
+            dl->AddRectFilledMultiColor({vp.x-w, 0}, {vp.x, vp.y}, clear, dark, dark, clear);
+        }
+
         try {
 
         // Escape: confirm+close editing → then deactivate text tool → then deactivate annot tool
@@ -3699,9 +3830,10 @@ int main(int argc, char* argv[]) {
             zoom_to_fit();
         }
 
-        // Space tap (no drag) -> toggle panel for the selected document
-        if (g_input.consume_space_tap() && !g_text_tool && !g_search_open
-                && !ImGui::GetIO().WantCaptureKeyboard) {
+        // Space tap (no drag) -> toggle panel for the selected document.
+        // WantCaptureKeyboard is intentionally NOT checked here so spacebar
+        // closes the panel even when the sidebar has keyboard focus.
+        if (g_input.consume_space_tap() && !g_text_tool && !g_search_open) {
             if (g_input.panel_open()) {
                 g_input.close_panel();
             } else {
@@ -3768,21 +3900,28 @@ int main(int argc, char* argv[]) {
             float fade_duration_ms = (g_save_feedback_type == SaveFeedbackType::Manual) ? 2500.0f : 500.0f;
 
             if (g_save_feedback_type != SaveFeedbackType::None && elapsed_ms < fade_duration_ms) {
-                ImVec2 vp_size = ImGui::GetMainViewport()->Size;
                 float alpha = 1.0f - (float)elapsed_ms / fade_duration_ms;
                 const char* msg = (g_save_feedback_type == SaveFeedbackType::Manual) ? "Saved!" : "saved";
 
-                // Position on top-left, just under the toolbar (+ and T buttons)
-                ImGui::SetNextWindowPos({20.0f, 70.0f}, ImGuiCond_Always, {0.0f, 0.0f});
-                ImGui::SetNextWindowBgAlpha(0.0f);  // transparent background
+                // Position under the + and T toolbar buttons.
+                ImGui::SetNextWindowPos({20.0f, 112.0f}, ImGuiCond_Always, {0.0f, 0.0f});
+                ImGui::SetNextWindowBgAlpha(0.55f * alpha);
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {8.0f, 5.0f});
+                ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
+                ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.12f, 0.15f, 1.0f));
                 ImGui::Begin("##save_feedback", nullptr,
                     ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing);
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.8f, 0.8f, 0.85f, alpha));
+                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                    ImGuiWindowFlags_AlwaysAutoResize);
+                ImGui::SetWindowFontScale(1.2f);
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.85f, 0.9f, alpha));
                 ImGui::TextUnformatted(msg);
                 ImGui::PopStyleColor();
+                ImGui::SetWindowFontScale(1.0f);
                 ImGui::End();
+                ImGui::PopStyleColor();
+                ImGui::PopStyleVar(2);
             } else if (elapsed_ms >= fade_duration_ms) {
                 g_save_feedback_type = SaveFeedbackType::None;  // reset after fade
             }
