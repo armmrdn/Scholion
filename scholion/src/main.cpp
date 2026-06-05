@@ -3685,7 +3685,16 @@ int main(int argc, char* argv[]) {
             break;
         }
 
+#ifdef _WIN32
+        // glfwWaitEventsTimeout (MsgWaitForMultipleObjectsEx) has been observed
+        // to block indefinitely on some Windows GPU/driver configurations, causing
+        // the window to freeze after the first rendered frame. Use PollEvents +
+        // Sleep instead: same ~60fps cap, simpler Win32 code path, no hang risk.
+        glfwPollEvents();
+        Sleep(g_settings.compat_mode ? 33 : 16);
+#else
         glfwWaitEventsTimeout(g_settings.compat_mode ? 0.033 : 0.016);
+#endif
 
         // Per-frame timing for the performance overlay
         double now_t   = glfwGetTime();
