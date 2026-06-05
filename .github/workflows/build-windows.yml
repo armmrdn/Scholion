@@ -56,7 +56,10 @@ jobs:
           tar xzf mupdf-source.tar.gz || true
           [ -f mupdf-1.24.11-source/Makefile ] || { echo "Extraction failed"; exit 1; }
           cd mupdf-1.24.11-source
-          make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs -j4
+          # XCFLAGS: GCC 14 (shipped by current MSYS2) promotes -Wincompatible-pointer-types
+          # to a hard error; MuPDF 1.24.11 has a _wstat/_stat64i32 mismatch on Windows.
+          make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs -j4 \
+               XCFLAGS="-Wno-incompatible-pointer-types"
           mkdir -p ../mupdf-libs-windows
           cp build/release/libmupdf.a build/release/libmupdf-third.a \
              ../mupdf-libs-windows/
