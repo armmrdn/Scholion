@@ -3546,7 +3546,14 @@ int main(int argc, char* argv[]) {
     }
 #endif
 
+#ifdef _WIN32
+    // Disable VSync on Windows — some GPU drivers deadlock inside glfwSwapBuffers
+    // when swap interval is 1 (causes hang-on-first-frame on affected hardware).
+    // Frame rate is still capped by glfwWaitEventsTimeout(0.016) in the main loop.
+    glfwSwapInterval(0);
+#else
     glfwSwapInterval(1);
+#endif
 
     g_cursor_hand  = glfwCreateStandardCursor(GLFW_POINTING_HAND_CURSOR);
     g_cursor_arrow = glfwCreateStandardCursor(GLFW_ARROW_CURSOR);
