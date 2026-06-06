@@ -3509,6 +3509,14 @@ int main(int argc, char* argv[]) {
     signal(SIGTERM, scholion_signal_handler);
     g_debug = (std::getenv("SCHOLION_DEBUG") != nullptr);
 
+#ifdef _WIN32
+    // Win32 subsystem suppresses all console output. Redirect stderr to a log
+    // file next to the .exe so we can diagnose startup/render hangs.
+    freopen("scholion_debug.log", "w", stderr);
+    freopen("scholion_debug.log", "a", stdout);
+    fprintf(stderr, "[0] main() entered\n"); fflush(stderr);
+#endif
+
 #ifdef __APPLE__
     scholion_register_early();   // registers WillFinishLaunching observer before glfwInit
 #endif
@@ -3526,6 +3534,9 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
 
+#ifdef _WIN32
+    fprintf(stderr, "[1] glfwInit ok, creating window\n"); fflush(stderr);
+#endif
     g_window = glfwCreateWindow(1280, 800, "Scholion", nullptr, nullptr);
     GLFWwindow* window = g_window;
     if (!window) {
@@ -3537,6 +3548,7 @@ int main(int argc, char* argv[]) {
     glfwMakeContextCurrent(window);
 
 #ifdef _WIN32
+    fprintf(stderr, "[2] window created, loading GLAD\n"); fflush(stderr);
     // Load all OpenGL 3.3 core function pointers via GLAD.
     // Must happen after a GL context is made current; before any GL calls.
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
@@ -3544,6 +3556,7 @@ int main(int argc, char* argv[]) {
         glfwTerminate();
         return 1;
     }
+    fprintf(stderr, "[3] GLAD ok\n"); fflush(stderr);
 #endif
 
 #ifdef _WIN32
@@ -3575,6 +3588,10 @@ int main(int argc, char* argv[]) {
     glfwGetFramebufferSize(window, &fb_w, &fb_h);
     glViewport(0, 0, fb_w, fb_h);
 
+#ifdef _WIN32
+    fprintf(stderr, "[4] win=%dx%d fb=%dx%d\n", win_w, win_h, fb_w, fb_h); fflush(stderr);
+#endif
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
@@ -3583,6 +3600,10 @@ int main(int argc, char* argv[]) {
     apply_theme(g_settings.dark_mode);
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
+
+#ifdef _WIN32
+    fprintf(stderr, "[5] ImGui init ok\n"); fflush(stderr);
+#endif
 
     Renderer renderer;
     if (!renderer.init()) {
@@ -3594,6 +3615,9 @@ int main(int argc, char* argv[]) {
         glfwTerminate();
         return 1;
     }
+#ifdef _WIN32
+    fprintf(stderr, "[6] renderer init ok\n"); fflush(stderr);
+#endif
 
     PerformanceOverlay overlay;
     double last_frame_time = glfwGetTime();
@@ -3674,7 +3698,16 @@ int main(int argc, char* argv[]) {
             g_startup_chooser = true;
     }
 
+#ifdef _WIN32
+    fprintf(stderr, "[7] entering main loop\n"); fflush(stderr);
+#endif
+    int _dbg_frame = 0;
     while (!glfwWindowShouldClose(window)) {
+#ifdef _WIN32
+        if (_dbg_frame < 10) {
+            fprintf(stderr, "[F%d] frame start\n", _dbg_frame); fflush(stderr);
+        }
+#endif
         // Graceful exit on SIGINT/SIGTERM — autosave before breaking
         if (g_signal_received) {
             if (!g_project_path.empty() && !g_documents.empty()) {
@@ -3690,8 +3723,11 @@ int main(int argc, char* argv[]) {
         // to block indefinitely on some Windows GPU/driver configurations, causing
         // the window to freeze after the first rendered frame. Use PollEvents +
         // Sleep instead: same ~60fps cap, simpler Win32 code path, no hang risk.
+        if (_dbg_frame < 10) { fprintf(stderr, "[F%d] before PollEvents\n", _dbg_frame); fflush(stderr); }
         glfwPollEvents();
+        if (_dbg_frame < 10) { fprintf(stderr, "[F%d] after PollEvents\n", _dbg_frame); fflush(stderr); }
         Sleep(g_settings.compat_mode ? 33 : 16);
+        if (_dbg_frame < 10) { fprintf(stderr, "[F%d] after Sleep\n", _dbg_frame); fflush(stderr); }
 #else
         glfwWaitEventsTimeout(g_settings.compat_mode ? 0.033 : 0.016);
 #endif
@@ -3899,7 +3935,13 @@ int main(int argc, char* argv[]) {
         hints.box_cur_world   = g_input.box_cur_world();
         hints.grid_mode      = g_settings.grid_mode;
         hints.dark_mode      = g_settings.dark_mode;
+#ifdef _WIN32
+        if (_dbg_frame < 10) { fprintf(stderr, "[F%d] before renderer.draw\n", _dbg_frame); fflush(stderr); }
+#endif
         renderer.draw(g_canvas, g_documents, hints);
+#ifdef _WIN32
+        if (_dbg_frame < 10) { fprintf(stderr, "[F%d] after renderer.draw\n", _dbg_frame); fflush(stderr); }
+#endif
 
         // Page counter: visible pages / total pages across all documents.
         {
@@ -3974,7 +4016,14 @@ int main(int argc, char* argv[]) {
             }
         }
 
+#ifdef _WIN32
+        if (_dbg_frame < 10) { fprintf(stderr, "[F%d] before SwapBuffers\n", _dbg_frame); fflush(stderr); }
+#endif
         glfwSwapBuffers(window);
+#ifdef _WIN32
+        if (_dbg_frame < 10) { fprintf(stderr, "[F%d] after SwapBuffers\n", _dbg_frame); fflush(stderr); }
+        ++_dbg_frame;
+#endif
 
         // Exit the main loop if quit was confirmed
         if (g_quit_state == QuitState::Confirmed) {

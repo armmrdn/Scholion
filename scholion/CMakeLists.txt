@@ -5,9 +5,11 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Require macOS 10.15+ for OpenGL 3.3 core profile availability
+# Minimum macOS 12.0 (Monterey) — required for universal arm64+x86_64 distribution.
+# arm64 cannot go below 11.0, and Monterey covers all Apple Silicon Macs shipping
+# from 2020 onward plus Intel Macs that can run Monterey.
 if(APPLE)
-    set(CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "Minimum macOS version")
+    set(CMAKE_OSX_DEPLOYMENT_TARGET "12.0" CACHE STRING "Minimum macOS version")
 endif()
 
 option(SCHOLION_WITH_MUPDF "Link MuPDF for PDF rasterization (milestone 2)" OFF)

@@ -8,25 +8,55 @@ on:
 
 jobs:
   build-macos:
-    runs-on: macos-14   # Apple Silicon (arm64) — matches the bundled MuPDF libs
+    runs-on: macos-14   # Apple Silicon runner; produces universal arm64+x86_64 binary
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Install GLFW
-        run: brew install glfw
+      # ------------------------------------------------------------------
+      # GLFW 3.4 — built from source so we control the deployment target.
+      # Homebrew's pre-built bottle targets the runner OS (macOS 14), which
+      # would brand our binary with minos=14.0 and prevent it running on
+      # Monterey/Ventura. Building from source with MACOSX_DEPLOYMENT_TARGET
+      # and CMAKE_OSX_ARCHITECTURES gives a universal static lib at 12.0.
+      # ------------------------------------------------------------------
+      - name: Cache GLFW
+        id: glfw-cache
+        uses: actions/cache@v4
+        with:
+          path: glfw-install
+          key: glfw-3.4-macos-universal-12.0-v1
+
+      - name: Build GLFW from source
+        if: steps.glfw-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o glfw.tar.gz \
+            https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz
+          tar xzf glfw.tar.gz
+          cmake -S glfw-3.4 -B glfw-3.4/build \
+            -DGLFW_BUILD_DOCS=OFF \
+            -DGLFW_BUILD_TESTS=OFF \
+            -DGLFW_BUILD_EXAMPLES=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/glfw-install
+          cmake --build glfw-3.4/build -j$(sysctl -n hw.ncpu)
+          cmake --install glfw-3.4/build
 
       # ------------------------------------------------------------------
-      # MuPDF 1.24.11 — built from source, cached by version key.
-      # Cache hit: skip the ~4-minute source build on subsequent runs.
+      # MuPDF 1.24.11 — built from source for both arm64 and x86_64, then
+      # combined with lipo into universal static libraries.
+      # Cache key updated to reflect universal+deployment-target change.
       # ------------------------------------------------------------------
       - name: Cache MuPDF
         id: mupdf-cache
         uses: actions/cache@v4
         with:
           path: mupdf-libs-macos
-          key: mupdf-1.24.11-macos-arm64-v1
+          key: mupdf-1.24.11-macos-universal-12.0-v1
 
       - name: Build MuPDF from source
         if: steps.mupdf-cache.outputs.cache-hit != 'true'
@@ -35,11 +65,30 @@ jobs:
             https://mupdf.com/downloads/archive/mupdf-1.24.11-source.tar.gz
           tar xzf mupdf-source.tar.gz
           cd mupdf-1.24.11-source
+
+          # --- arm64 ---
           make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs \
-               -j$(sysctl -n hw.ncpu)
-          mkdir -p ../mupdf-libs-macos
+               -j$(sysctl -n hw.ncpu) \
+               XCFLAGS="-arch arm64 -mmacosx-version-min=12.0"
+          mkdir -p ../mupdf-arm64
           cp build/release/libmupdf.a build/release/libmupdf-third.a \
-             ../mupdf-libs-macos/
+             ../mupdf-arm64/
+
+          # --- x86_64 (clean between archs) ---
+          rm -rf build
+          make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs \
+               -j$(sysctl -n hw.ncpu) \
+               XCFLAGS="-arch x86_64 -mmacosx-version-min=12.0"
+          mkdir -p ../mupdf-x86_64
+          cp build/release/libmupdf.a build/release/libmupdf-third.a \
+             ../mupdf-x86_64/
+
+          # --- combine into universal fat archives ---
+          mkdir -p ../mupdf-libs-macos
+          lipo -create ../mupdf-arm64/libmupdf.a ../mupdf-x86_64/libmupdf.a \
+               -output ../mupdf-libs-macos/libmupdf.a
+          lipo -create ../mupdf-arm64/libmupdf-third.a ../mupdf-x86_64/libmupdf-third.a \
+               -output ../mupdf-libs-macos/libmupdf-third.a
 
       - name: Install MuPDF libs
         run: |
@@ -48,16 +97,30 @@ jobs:
              scholion/third_party/mupdf/lib/
 
       # ------------------------------------------------------------------
-      # Build Scholion.app
+      # Build Scholion.app — universal binary, deployment target 12.0.
+      # CMAKE_PREFIX_PATH points to the locally-built GLFW (not Homebrew).
       # ------------------------------------------------------------------
       - name: Configure
         run: |
           cmake -S scholion -B scholion/build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DSCHOLION_WITH_MUPDF=ON
+            -DSCHOLION_WITH_MUPDF=ON \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/glfw-install
 
       - name: Build
         run: cmake --build scholion/build -j$(sysctl -n hw.ncpu)
+
+      # ------------------------------------------------------------------
+      # Verify the binary is actually universal before packaging.
+      # ------------------------------------------------------------------
+      - name: Verify universal binary
+        run: |
+          lipo -info scholion/build/Scholion.app/Contents/MacOS/Scholion
+          echo "Deployment target:"
+          otool -l scholion/build/Scholion.app/Contents/MacOS/Scholion \
+            | grep -A3 'LC_BUILD_VERSION' | head -12
 
       # ------------------------------------------------------------------
       # Package as DMG
@@ -66,7 +129,6 @@ jobs:
         run: |
           mkdir -p scholion/build/dmg_stage
           cp -r scholion/build/Scholion.app scholion/build/dmg_stage/
-          # Applications symlink for drag-to-install UX
           ln -s /Applications scholion/build/dmg_stage/Applications
           hdiutil create \
             -volname "Scholion" \
@@ -77,7 +139,7 @@ jobs:
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
-          name: Scholion-macOS-arm64
+          name: Scholion-macOS-universal
           path: scholion/build/Scholion.dmg
           retention-days: 30
 
