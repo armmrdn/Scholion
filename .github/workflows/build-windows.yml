@@ -111,12 +111,21 @@ jobs:
 
       # ------------------------------------------------------------------
       # Publish to GitHub Releases on version tags (e.g. v0.6.0)
+      # Zip the full bundle (exe + all MinGW DLLs) so users can run the
+      # app without installing anything extra.
       # ------------------------------------------------------------------
+      - name: Zip Windows bundle
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: msys2 {0}
+        run: |
+          cd Scholion-Windows
+          zip -r ../Scholion-Windows.zip .
+
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v1
         with:
           files: |
-            Scholion-Windows/Scholion.exe
+            Scholion-Windows.zip
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
