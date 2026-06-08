@@ -1311,6 +1311,7 @@ static void draw_canvas_text_boxes() {
     // drawing whenever a blocking overlay is up. The user can't interact with
     // boxes through the overlay anyway.
     if (g_settings_open) return;
+    if (ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) return;
 
     ImDrawList* dl    = ImGui::GetForegroundDrawList();
     ImFont*     font  = ImGui::GetFont();
@@ -2810,10 +2811,9 @@ static void draw_settings_popup() {
     center_line("Scholion is a canvas-style PDF review utility.");
     center_line("designed and built by @armmrdn (2026)");
     ImGui::Spacing();
-    ImGui::PushTextWrapPos(0.0f);   // wrap to content region edge — no horizontal scroll
-    ImGui::TextWrapped("A scholion is an explanatory comment typically written in the margin of a "
-                       "manuscript by its ancient authors or students, as a guide.");
-    ImGui::PopTextWrapPos();
+    center_line("a scholion is any note, detail, or definition");
+    center_line("handwritten into the margin of a manuscript");
+    center_line("by its previous scholars and readers");
 
     ImGui::PopStyleColor();
 
