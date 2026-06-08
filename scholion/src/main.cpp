@@ -4140,8 +4140,8 @@ int main(int argc, char* argv[]) {
                 float alpha = 1.0f - (float)elapsed_ms / fade_duration_ms;
                 const char* msg = (g_save_feedback_type == SaveFeedbackType::Manual) ? "Saved!" : "saved";
 
-                // Position under the + and T toolbar buttons.
-                ImGui::SetNextWindowPos({20.0f, 112.0f}, ImGuiCond_Always, {0.0f, 0.0f});
+                // Tucked just below the toolbar (toolbar top=14, height≈37 → bottom≈51).
+                ImGui::SetNextWindowPos({14.0f, 54.0f}, ImGuiCond_Always, {0.0f, 0.0f});
                 ImGui::SetNextWindowBgAlpha(0.55f * alpha);
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {8.0f, 5.0f});
                 ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
