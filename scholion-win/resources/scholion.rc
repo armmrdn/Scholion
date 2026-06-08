@@ -6,6 +6,10 @@
 
 #include <windows.h>
 
+// Numeric ID for the application icon. Must match MAKEINTRESOURCE() in main.cpp.
+// ID=1 is what Windows Explorer uses to find the primary icon of an .exe.
+#define IDI_ICON1 1
+
 // Application icon (shown in Explorer, taskbar, window title bar)
 IDI_ICON1 ICON "AppIcon.ico"
 

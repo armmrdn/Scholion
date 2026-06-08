@@ -612,15 +612,15 @@ void Renderer::draw_threads(const Canvas& canvas, const Document& doc) {
             glow.push_back(pos.y - nrm.y * GW);
         }
 
-        // Glow: faint maroon halo (~40% more transparent than before)
-        glUniform4f(m_color_color_loc, 0.42f, 0.03f, 0.06f, 0.04f);
+        // Glow: faint maroon halo (midpoint between original and reduced opacity)
+        glUniform4f(m_color_color_loc, 0.42f, 0.03f, 0.06f, 0.055f);
         glBufferData(GL_ARRAY_BUFFER,
                      static_cast<GLsizeiptr>(glow.size() * sizeof(float)),
                      glow.data(), GL_STREAM_DRAW);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, VERT_N);
 
-        // Core wire: dark maroon (~40% more transparent than before)
-        glUniform4f(m_color_color_loc, 0.52f, 0.05f, 0.08f, 0.25f);
+        // Core wire: dark maroon (midpoint between original and reduced opacity)
+        glUniform4f(m_color_color_loc, 0.52f, 0.05f, 0.08f, 0.34f);
         glBufferData(GL_ARRAY_BUFFER,
                      static_cast<GLsizeiptr>(strip.size() * sizeof(float)),
                      strip.data(), GL_STREAM_DRAW);

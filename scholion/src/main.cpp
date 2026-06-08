@@ -898,6 +898,19 @@ static void scholion_signal_handler(int sig) {
     g_signal_received = sig;  // main loop checks this and exits cleanly
 }
 
+#ifdef _WIN32
+// Windows unhandled-exception filter: runs the minimum GL teardown so the GPU
+// driver releases the OpenGL context before the process dies. Without this,
+// some drivers hold the context open until the machine restarts, preventing
+// a relaunch. EXCEPTION_CONTINUE_SEARCH lets WER / any attached debugger handle
+// the crash normally after we've freed the context.
+static LONG WINAPI scholion_seh_filter(EXCEPTION_POINTERS*) {
+    if (g_window) { glfwDestroyWindow(g_window); g_window = nullptr; }
+    glfwTerminate();
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+#endif
+
 // --- GLFW callbacks ---------------------------------------------------------
 
 static void glfw_error_callback(int error, const char* description) {
@@ -3505,6 +3518,9 @@ static void draw_page_tooltip() {
     static constexpr double DELAY = 0.7;
     if (now - s_hover_t0 < DELAY) return;
 
+    // Only show when the hovered page belongs to the current selection.
+    if (!g_input.selection().count(const_cast<Page*>(hov_page))) return;
+
     namespace fs = std::filesystem;
     std::string fname = fs::path(hov_doc->path).filename().string();
 
@@ -3727,6 +3743,10 @@ int main(int argc, char* argv[]) {
         fprintf(stderr, "Failed to initialize GLFW\n");
         return 1;
     }
+#ifdef _WIN32
+    // Register after glfwInit so glfwTerminate() is safe to call from the filter.
+    SetUnhandledExceptionFilter(scholion_seh_filter);
+#endif
 #ifdef __APPLE__
     scholion_register_file_handler();  // re-register after glfwInit to override NSApp's default handler
 #endif
@@ -3757,11 +3777,23 @@ int main(int argc, char* argv[]) {
 #endif
 
 #ifdef _WIN32
-    // Dark title bar — paints Windows 10/11 chrome to match the app's dark theme.
     {
         HWND hwnd = glfwGetWin32Window(window);
+
+        // Dark title bar — paints Windows 10/11 chrome to match the app's dark theme.
         BOOL use_dark = TRUE;
         DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &use_dark, sizeof(use_dark));
+
+        // Set the window icon from the embedded .exe resource (GLFW does not do this).
+        // ID must match the IDI_ICON1 define in scholion.rc.
+        HICON hIcon = (HICON)LoadImage(GetModuleHandle(NULL),
+                                       MAKEINTRESOURCE(1),
+                                       IMAGE_ICON, 0, 0,
+                                       LR_DEFAULTSIZE | LR_SHARED);
+        if (hIcon) {
+            SendMessage(hwnd, WM_SETICON, ICON_BIG,   (LPARAM)hIcon);
+            SendMessage(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)hIcon);
+        }
     }
     // Disable VSync on Windows — some GPU drivers deadlock inside glfwSwapBuffers
     // when swap interval is 1 (causes hang-on-first-frame on affected hardware).
