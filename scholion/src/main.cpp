@@ -1022,7 +1022,16 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
         }
     }
 
-    if (ImGui::GetIO().WantCaptureKeyboard) return;
+    // Space key must reach on_key even when the panel has keyboard focus so that
+    // the press→release tap sequence that toggles the panel is always detected.
+    // WantCaptureKeyboard is true whenever an ImGui window is active, which means
+    // the space-up event would be swallowed and m_space_tap_pending never set,
+    // making it impossible to close the panel with spacebar.
+    if (ImGui::GetIO().WantCaptureKeyboard) {
+        if (key == GLFW_KEY_SPACE)
+            g_input.on_key(w, key, scancode, action, mods);
+        return;
+    }
 
     // InputHandler needs PRESS, REPEAT, and RELEASE so that m_space_held is cleared
     // on key-up. The early "action != GLFW_PRESS" return that used to sit above this
