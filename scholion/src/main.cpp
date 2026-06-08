@@ -2795,14 +2795,26 @@ static void draw_settings_popup() {
         ImGui::EndTable();
     }
 
-    // Footer with attribution
+    // Footer with attribution — three center-aligned lines, wrapping to available width
     ImGui::Separator();
+    ImGui::Spacing();
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextUnformatted("Scholion is a canvas-style PDF review utility designed and built by @ARMMRDN (2026)");
-    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 340.0f);
-    ImGui::TextWrapped("\"a scholion is an explanatory comment typically written in the margin of a manuscript "
-                       "by its ancient authors or students, as a guide\"");
+
+    auto center_line = [](const char* s) {
+        float avail = ImGui::GetContentRegionAvail().x;
+        float tw    = ImGui::CalcTextSize(s).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail - tw) * 0.5f));
+        ImGui::TextUnformatted(s);
+    };
+
+    center_line("Scholion is a canvas-style PDF review utility.");
+    center_line("designed and built by @armmrdn (2026)");
+    ImGui::Spacing();
+    ImGui::PushTextWrapPos(0.0f);   // wrap to content region edge — no horizontal scroll
+    ImGui::TextWrapped("A scholion is an explanatory comment typically written in the margin of a "
+                       "manuscript by its ancient authors or students, as a guide.");
     ImGui::PopTextWrapPos();
+
     ImGui::PopStyleColor();
 
     ImGui::End();
