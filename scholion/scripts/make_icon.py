@@ -7,13 +7,14 @@ import shutil, subprocess, sys
 from pathlib import Path
 
 try:
-    from PIL import Image, ImageDraw, ImageFilter
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont
 except ImportError:
     sys.exit("Pillow not found — run: pip3 install Pillow")
 
-RESOURCES = Path(__file__).parent.parent / "resources"
-ICONSET   = RESOURCES / "AppIcon.iconset"
-ICNS      = RESOURCES / "AppIcon.icns"
+RESOURCES   = Path(__file__).parent.parent / "resources"
+ICONSET     = RESOURCES / "AppIcon.iconset"
+ICNS        = RESOURCES / "AppIcon.icns"
+WIN_ICO     = Path(__file__).parent.parent.parent / "scholion-win" / "resources" / "AppIcon.ico"
 
 ICON_SIZES = [
     ("icon_16x16.png",        16),
@@ -100,6 +101,33 @@ def draw_icon(sz):
         d.rectangle([lx0, ly, lx0 + int((lx1 - lx0) * frac), ly + lh], fill=line_color)
         ly += lsp
 
+    # --- "Sc" logotype in Georgia, top-left of front sheet ---
+    fx, fy = x0, y0
+    # Font size scales with icon; target ~220pt at 1024px
+    font_size = max(12, int(220 * s))
+    font = None
+    for candidate in [
+        "/System/Library/Fonts/Supplemental/Georgia.ttf",   # macOS
+        "/System/Library/Fonts/Georgia.ttf",
+        "C:/Windows/Fonts/georgia.ttf",                     # Windows
+        "/usr/share/fonts/truetype/msttcorefonts/Georgia.ttf",  # Linux
+        "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+    ]:
+        try:
+            font = ImageFont.truetype(candidate, font_size)
+            break
+        except (IOError, OSError):
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    d = ImageDraw.Draw(img, "RGBA")
+    # Position: left-aligned, near top of front sheet; slight inset
+    tx = fx + int(52 * s)
+    ty = fy + int(56 * s)
+    # Near-black text so it reads on the warm-white sheet
+    d.text((tx, ty), "Sc", font=font, fill=(24, 22, 20, 230))
+
     return img
 
 
@@ -128,6 +156,16 @@ def main():
 
     shutil.rmtree(ICONSET)
     print(f"Done → {ICNS}")
+
+    # Also write AppIcon.ico for the Windows build (if the win resources dir exists)
+    if WIN_ICO.parent.exists():
+        ico_sizes = [16, 32, 48, 64, 128, 256]
+        ico_images = [master.resize((sz, sz), Image.LANCZOS).convert("RGBA")
+                      for sz in ico_sizes]
+        ico_images[0].save(WIN_ICO, format="ICO",
+                           sizes=[(sz, sz) for sz in ico_sizes],
+                           append_images=ico_images[1:])
+        print(f"Done → {WIN_ICO}")
 
 
 if __name__ == "__main__":

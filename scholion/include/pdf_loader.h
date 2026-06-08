@@ -3,11 +3,22 @@
 #include "document.h"
 #include "texture_cache.h"
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // fz_context / fz_document forward-declared to keep MuPDF out of this header.
 struct fz_context;
 struct fz_document;
+
+/// One character's bounding box in page-normalized [0,1] coordinates, plus
+/// its UTF-8 text and position-order key for sorting.
+struct CharQuad {
+    float x0 = 0.0f, y0 = 0.0f;  // tight bbox, normalized [0,1]
+    float x1 = 0.0f, y1 = 0.0f;
+    std::string utf8;              // UTF-8 encoded glyph
+    int  order    = 0;             // block*100000 + line*1000 + char — for sorting
+    bool line_end = false;         // true for the last char on a text line
+};
 
 /// Opens a PDF with MuPDF, maps its pages into world-space geometry, and
 /// rasterizes them to GPU textures via TextureCache.
@@ -59,7 +70,14 @@ public:
     };
     std::vector<SearchHit> search_text(const std::string& query, int max_hits = 200);
 
+    /// Return cached character quads for a page (populated lazily on first call).
+    /// Quads are in normalized [0,1] page coordinates with y=0 at the top.
+    /// Returns an empty vector for pages with no selectable text.
+    const std::vector<CharQuad>& get_char_quads(int page_index);
+
 private:
     fz_context*  m_ctx = nullptr;
     fz_document* m_doc = nullptr;
+
+    std::unordered_map<int, std::vector<CharQuad>> m_char_cache;
 };

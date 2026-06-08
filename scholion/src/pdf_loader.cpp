@@ -216,6 +216,64 @@ std::string PdfLoader::extract_text(int page_index) {
     return result;
 }
 
+const std::vector<CharQuad>& PdfLoader::get_char_quads(int page_index) {
+    auto it = m_char_cache.find(page_index);
+    if (it != m_char_cache.end()) return it->second;
+
+    auto& result = m_char_cache[page_index];
+    if (!m_ctx || !m_doc) return result;
+
+    fz_page* pg = nullptr;
+    fz_try(m_ctx)  { pg = fz_load_page(m_ctx, m_doc, page_index); }
+    fz_catch(m_ctx){ return result; }
+
+    fz_rect bounds = fz_bound_page(m_ctx, pg);
+    float ox = bounds.x0, oy = bounds.y0;
+    float pw = bounds.x1 - bounds.x0;
+    float ph = bounds.y1 - bounds.y0;
+
+    if (pw <= 0.0f || ph <= 0.0f) {
+        fz_drop_page(m_ctx, pg);
+        return result;
+    }
+
+    fz_stext_options opts = {};
+    fz_stext_page*   stext = nullptr;
+
+    fz_try(m_ctx) {
+        stext = fz_new_stext_page_from_page(m_ctx, pg, &opts);
+        int block_n = 0;
+        for (fz_stext_block* blk = stext->first_block; blk; blk = blk->next) {
+            if (blk->type != FZ_STEXT_BLOCK_TEXT) { ++block_n; continue; }
+            int line_n = 0;
+            for (fz_stext_line* ln = blk->u.t.first_line; ln; ln = ln->next, ++line_n) {
+                int char_n = 0;
+                for (fz_stext_char* ch = ln->first_char; ch; ch = ch->next, ++char_n) {
+                    fz_rect r = fz_rect_from_quad(ch->quad);
+                    CharQuad q;
+                    q.x0 = (r.x0 - ox) / pw;
+                    q.y0 = (r.y0 - oy) / ph;
+                    q.x1 = (r.x1 - ox) / pw;
+                    q.y1 = (r.y1 - oy) / ph;
+                    q.order    = block_n * 100000 + line_n * 1000 + char_n;
+                    q.line_end = (ch->next == nullptr);
+                    append_utf8(q.utf8, ch->c);
+                    result.push_back(std::move(q));
+                }
+            }
+            ++block_n;
+        }
+    }
+    fz_catch(m_ctx) {
+        fprintf(stderr, "PdfLoader::get_char_quads failed for page %d: %s\n",
+                page_index, fz_caught_message(m_ctx));
+    }
+
+    if (stext) fz_drop_stext_page(m_ctx, stext);
+    fz_drop_page(m_ctx, pg);
+    return result;
+}
+
 std::vector<PdfLoader::SearchHit> PdfLoader::search_text(const std::string& query, int max_hits) {
     std::vector<SearchHit> hits;
     if (!m_ctx || !m_doc || query.empty()) return hits;
@@ -268,5 +326,6 @@ void PdfLoader::rasterize_all(Document&, LodTier, TextureCache&)              {}
 PdfLoader::RasterBuffer PdfLoader::rasterize_to_buffer(int, LodTier)         { return {}; }
 std::string PdfLoader::extract_text(int)                                      { return {}; }
 std::vector<PdfLoader::SearchHit> PdfLoader::search_text(const std::string&, int) { return {}; }
+const std::vector<CharQuad>& PdfLoader::get_char_quads(int)                  { static std::vector<CharQuad> empty; return empty; }
 
 #endif // SCHOLION_HAVE_MUPDF
