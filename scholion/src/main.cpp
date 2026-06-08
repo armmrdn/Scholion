@@ -203,6 +203,8 @@ struct AppSettings {
 static AppSettings g_settings;
 static bool g_settings_open = false;
 
+static GLuint g_vignette_tex = 0;  // elliptical gradient texture, created once after GL init
+
 // --- Quit confirmation -------------------------------------------------------
 static bool g_quit_requested = false;
 enum class QuitState { None, Waiting, Confirmed };
@@ -1302,6 +1304,11 @@ static void imgui_dashed_rect(ImDrawList* dl, ImVec2 tl, ImVec2 br, ImU32 col,
 }
 
 static void draw_canvas_text_boxes() {
+    // ForegroundDrawList renders above all ImGui windows, so skip canvas text-box
+    // drawing whenever a blocking overlay is up. The user can't interact with
+    // boxes through the overlay anyway.
+    if (g_settings_open) return;
+
     ImDrawList* dl    = ImGui::GetForegroundDrawList();
     ImFont*     font  = ImGui::GetFont();
     ImVec2      mouse = ImGui::GetMousePos();
@@ -2684,7 +2691,7 @@ static void draw_settings_popup() {
 
     ImVec2 vp = ImGui::GetMainViewport()->Size;
     ImGui::SetNextWindowPos({vp.x * 0.5f, vp.y * 0.5f}, ImGuiCond_Appearing, {0.5f, 0.5f});
-    ImGui::SetNextWindowSize({950.0f, 0.0f}, ImGuiCond_Appearing);
+    ImGui::SetNextWindowSizeConstraints({360.0f, 100.0f}, {520.0f, vp.y * 0.9f});
 
     ImGuiWindowFlags flags = ImGuiWindowFlags_NoCollapse
                            | ImGuiWindowFlags_NoSavedSettings
@@ -2731,7 +2738,7 @@ static void draw_settings_popup() {
     ImGui::SeparatorText("Performance");
     bool prev_compat = g_settings.compat_mode;
     ImGui::Checkbox("Compatibility mode", &g_settings.compat_mode);
-    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 390.0f);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 340.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     ImGui::TextWrapped("Caps PDF rendering at Low quality when zoomed out, "
                        "freezes re-rendering at extreme zoom levels, and limits "
@@ -2746,9 +2753,9 @@ static void draw_settings_popup() {
     ImGui::SeparatorText("Keyboard Shortcuts");
     if (ImGui::BeginTable("##keys", 2, ImGuiTableFlags_BordersInnerV
                                      | ImGuiTableFlags_RowBg
-                                     | ImGuiTableFlags_SizingFixedFit)) {
-        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.5f);
-        ImGui::TableSetupColumn("Key",    ImGuiTableColumnFlags_WidthStretch, 0.5f);
+                                     | ImGuiTableFlags_SizingStretchSame)) {
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthStretch, 0.55f);
+        ImGui::TableSetupColumn("Key",    ImGuiTableColumnFlags_WidthStretch, 0.45f);
         ImGui::TableHeadersRow();
 
         auto row = [](const char* action, const char* key) {
@@ -2768,12 +2775,11 @@ static void draw_settings_popup() {
         row("Open panel",                  "Double-click");
         row("Toggle panel",                "Space (tap)");
         row("Move page",                   "Drag");
-        row("Shift+click doc",             "Toggle whole document select");
-        row("Cmd+click page/text box",     "Toggle item in selection");
-        row("Cmd+A",                       "Select all");
+        row("Toggle whole document select", "Shift+click");
+        row("Toggle item in selection",    "Cmd+click");
+        row("Select all",                  "Cmd+A");
         row("Rubber-band select",          "Drag empty canvas");
         row("Clear selection / close panel","Escape");
-        row("Remove document",             "Right-click → Remove Document");
         row("Text tool",                   "T");
         row("Pen tool (+ open panel)",     "P");
         row("Highlight tool",              "H");
@@ -2790,7 +2796,7 @@ static void draw_settings_popup() {
     ImGui::Separator();
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     ImGui::TextUnformatted("Scholion is a canvas-style PDF review utility designed and built by @ARMMRDN (2026)");
-    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 700.0f);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 340.0f);
     ImGui::TextWrapped("\"a scholion is an explanatory comment typically written in the margin of a manuscript "
                        "by its ancient authors or students, as a guide\"");
     ImGui::PopTextWrapPos();
@@ -3780,6 +3786,34 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    // Bake an elliptical vignette gradient texture (256×256, single upload).
+    // Stretched to the full viewport each frame: the circle in texture-space
+    // becomes a viewport-filling ellipse, giving smooth per-edge falloff with
+    // no corner doubling or visible rectangle edges.
+    {
+        constexpr int V = 256;
+        std::vector<uint8_t> px(V * V * 4, 0);
+        for (int y = 0; y < V; ++y) {
+            for (int x = 0; x < V; ++x) {
+                float nx = (x / (float)(V - 1)) * 2.0f - 1.0f;  // [-1, 1]
+                float ny = (y / (float)(V - 1)) * 2.0f - 1.0f;
+                float r  = sqrtf(nx * nx + ny * ny);
+                // Smoothstep from inner edge (0.45) to outer clamp (1.15).
+                // At r=1.0 (viewport edge midpoints) alpha ≈ 72; at corners
+                // (r≈1.41) clamped to max alpha 82 — smooth, no jump.
+                float t = std::clamp((r - 0.45f) / (1.15f - 0.45f), 0.0f, 1.0f);
+                t = t * t * (3.0f - 2.0f * t);  // smoothstep curve
+                px[(y * V + x) * 4 + 3] = (uint8_t)(t * 82.0f);  // alpha only; RGB stays 0
+            }
+        }
+        glGenTextures(1, &g_vignette_tex);
+        glBindTexture(GL_TEXTURE_2D, g_vignette_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, V, V, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
     PerformanceOverlay overlay;
     double last_frame_time = glfwGetTime();
 
@@ -3979,18 +4013,16 @@ int main(int argc, char* argv[]) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
-        // Subtle vignette — dark gradient from all four edges toward center.
-        if (g_settings.vignette_on) {
-            ImDrawList* dl  = ImGui::GetBackgroundDrawList();
-            ImVec2 vp       = ImGui::GetMainViewport()->Size;
-            float  w        = vp.x * 0.22f;
-            float  h        = vp.y * 0.22f;
-            ImU32  dark     = IM_COL32(0, 0, 0, 90);
-            ImU32  clear    = IM_COL32(0, 0, 0, 0);
-            dl->AddRectFilledMultiColor({0,0}, {vp.x, h}, dark, dark, clear, clear);
-            dl->AddRectFilledMultiColor({0, vp.y-h}, {vp.x, vp.y}, clear, clear, dark, dark);
-            dl->AddRectFilledMultiColor({0,0}, {w, vp.y}, dark, clear, clear, dark);
-            dl->AddRectFilledMultiColor({vp.x-w, 0}, {vp.x, vp.y}, clear, dark, dark, clear);
+        // Elliptical vignette — single texture stretched to viewport.
+        // The texture is a circular alpha gradient baked at startup; stretching
+        // it to the viewport turns the circle into an ellipse that fits the screen
+        // with smooth per-edge falloff and no corner-doubling artefact.
+        if (g_settings.vignette_on && g_vignette_tex) {
+            ImDrawList* dl = ImGui::GetBackgroundDrawList();
+            ImVec2 vp      = ImGui::GetMainViewport()->Size;
+            dl->AddImage(
+                (ImTextureID)(uintptr_t)g_vignette_tex,
+                {0.0f, 0.0f}, {vp.x, vp.y});
         }
 
         try {
@@ -4182,6 +4214,7 @@ int main(int argc, char* argv[]) {
     g_rast_cv.notify_one();
     if (g_rast_thread.joinable()) g_rast_thread.join();
 
+    if (g_vignette_tex) { glDeleteTextures(1, &g_vignette_tex); g_vignette_tex = 0; }
     if (g_cursor_hand)  { glfwDestroyCursor(g_cursor_hand);  g_cursor_hand  = nullptr; }
     if (g_cursor_arrow) { glfwDestroyCursor(g_cursor_arrow); g_cursor_arrow = nullptr; }
 
