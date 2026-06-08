@@ -23,11 +23,15 @@ extern "C" void scholion_activate_app(void);
 #include <dwmapi.h>     // DwmSetWindowAttribute — dark title bar
 #define GLFW_INCLUDE_NONE
 #include <glad/glad.h>
-#define GLFW_EXPOSE_NATIVE_WIN32
-#include <GLFW/glfw3native.h>   // glfwGetWin32Window
 #endif
 
 #include <GLFW/glfw3.h>
+
+#ifdef _WIN32
+// glfw3native.h uses GLFWAPI which is defined in glfw3.h — must come after.
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>   // glfwGetWin32Window
+#endif
 #include <algorithm>
 #include <atomic>
 #include <chrono>
