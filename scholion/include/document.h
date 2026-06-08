@@ -46,9 +46,12 @@ struct AnnotStroke {
 
 /// An axis-aligned highlight rectangle in page-normalized coordinates.
 /// x0 <= x1, y0 <= y1 (enforced at creation time).
+/// text is empty for legacy rect-only highlights; populated when the highlight
+/// was created with text-snap enabled and covers actual PDF character glyphs.
 struct AnnotHighlight {
     float x0 = 0.0f, y0 = 0.0f;
     float x1 = 0.0f, y1 = 0.0f;
+    std::string text;
 };
 
 /// A note flag stamped on a page. Label follows A–Z, then 2A–2Z, 3A–3Z, …

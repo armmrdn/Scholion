@@ -1724,6 +1724,42 @@ static void finalize_annotation() {
         hl.x1 = std::max(g_ann_hl_start.x, g_ann_cur_norm.x);
         hl.y1 = std::max(g_ann_hl_start.y, g_ann_cur_norm.y);
         if (hl.x1 > hl.x0 && hl.y1 > hl.y0) {
+            // Text-snap: collect characters whose centre falls inside the
+            // selection rect, snap the highlight bbox to them, and capture
+            // their text. Falls back to a plain rect when the page has no
+            // selectable text (scanned images, figures, etc.).
+            auto* loader = (g_ann_doc_idx >= 0 && g_ann_doc_idx < (int)g_loaders.size())
+                           ? g_loaders[g_ann_doc_idx].get() : nullptr;
+            if (loader && loader->valid()) {
+                const auto& quads = loader->get_char_quads(g_ann_page_idx);
+                std::vector<const CharQuad*> sel;
+                sel.reserve(quads.size());
+                for (const auto& q : quads) {
+                    float cx = (q.x0 + q.x1) * 0.5f;
+                    float cy = (q.y0 + q.y1) * 0.5f;
+                    if (cx >= hl.x0 && cx <= hl.x1 && cy >= hl.y0 && cy <= hl.y1)
+                        sel.push_back(&q);
+                }
+                if (!sel.empty()) {
+                    std::sort(sel.begin(), sel.end(),
+                              [](const CharQuad* a, const CharQuad* b){
+                                  return a->order < b->order; });
+                    // Snap bbox to the tight union of all selected char rects
+                    float sx0 = sel[0]->x0, sy0 = sel[0]->y0;
+                    float sx1 = sel[0]->x1, sy1 = sel[0]->y1;
+                    std::string text;
+                    for (const auto* q : sel) {
+                        sx0 = std::min(sx0, q->x0); sy0 = std::min(sy0, q->y0);
+                        sx1 = std::max(sx1, q->x1); sy1 = std::max(sy1, q->y1);
+                        text += q->utf8;
+                        if (q->line_end) text += ' ';
+                    }
+                    // Trim trailing space added by line_end logic
+                    while (!text.empty() && text.back() == ' ') text.pop_back();
+                    hl.x0 = sx0; hl.y0 = sy0; hl.x1 = sx1; hl.y1 = sy1;
+                    hl.text = std::move(text);
+                }
+            }
             fpage.annots.highlights.push_back(hl);
             UndoRecord r;
             r.type     = UndoRecord::Type::Highlight;
@@ -2177,8 +2213,14 @@ static bool save_to_path(const std::string& path) {
             const PageAnnotations& an = g_documents[di].pages[pi].annots;
             for (const auto& hl : an.highlights) {
                 sep();
-                fprintf(f, "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f] }",
-                        di, pi, hl.x0, hl.y0, hl.x1, hl.y1);
+                if (hl.text.empty()) {
+                    fprintf(f, "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f] }",
+                            di, pi, hl.x0, hl.y0, hl.x1, hl.y1);
+                } else {
+                    std::string esc = json_escape(hl.text.c_str());
+                    fprintf(f, "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f], \"ht\": \"%s\" }",
+                            di, pi, hl.x0, hl.y0, hl.x1, hl.y1, esc.c_str());
+                }
             }
             for (const auto& note : an.notes) {
                 sep();
@@ -2411,7 +2453,28 @@ static void load_project_from_path(const std::string& path) {
                     int di, pi;
                     if (sscanf(at, "\"doc\": %d, \"page\": %d, \"hl\": [%f, %f, %f, %f]",
                                &di, &pi, &a, &b, &c, &d) == 6) {
-                        flush_stroke(); saved_hls.push_back({di, pi, {a, b, c, d}});
+                        flush_stroke();
+                        AnnotHighlight parsed_hl{a, b, c, d, {}};
+                        // Restore captured text if present (optional field added in M29)
+                        const char* ht = strstr(at, "\"ht\": \"");
+                        if (ht) {
+                            ht += 7;
+                            while (*ht && *ht != '"') {
+                                if (*ht == '\\' && *(ht + 1)) {
+                                    ++ht;
+                                    switch (*ht) {
+                                        case 'n': parsed_hl.text += '\n'; break;
+                                        case '"': parsed_hl.text += '"';  break;
+                                        case '\\': parsed_hl.text += '\\'; break;
+                                        default: parsed_hl.text += *ht; break;
+                                    }
+                                } else {
+                                    parsed_hl.text += *ht;
+                                }
+                                ++ht;
+                            }
+                        }
+                        saved_hls.push_back({di, pi, std::move(parsed_hl)});
                     } else if (sscanf(at, "\"doc\": %d, \"page\": %d, \"note\": \"%[^\"]\"",
                                       &di, &pi, s) == 3) {
                         flush_stroke(); saved_notes.push_back({di, pi, s});
@@ -2852,6 +2915,105 @@ static void draw_canvas_context_menu() {
     }
 }
 
+// --- References tab (inside panel) ------------------------------------------
+
+static void draw_references_tab() {
+    namespace fs = std::filesystem;
+
+    // Right-aligned export button
+    float avail = ImGui::GetContentRegionAvail().x;
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - 95.0f);
+    if (ImGui::SmallButton("Export .md")) {
+#ifdef __APPLE__
+        scholion_activate_app();
+#endif
+        const char* filters[] = {"*.md"};
+        const char* out_path = tinyfd_saveFileDialog(
+            "Export References", "references.md", 1, filters, "Markdown");
+        if (out_path) {
+            FILE* f = fopen(out_path, "w");
+            if (f) {
+                fprintf(f, "# Scholion References\n\n");
+                for (int di = 0; di < (int)g_documents.size(); ++di) {
+                    const Document& doc = g_documents[di];
+                    bool has_refs = false;
+                    for (const auto& pg : doc.pages)
+                        for (const auto& hl : pg.annots.highlights)
+                            if (!hl.text.empty()) { has_refs = true; break; }
+                    if (!has_refs) continue;
+                    std::string fname = fs::path(doc.path).filename().string();
+                    fprintf(f, "## %s\n\n", fname.c_str());
+                    for (const auto& pg : doc.pages)
+                        for (const auto& hl : pg.annots.highlights)
+                            if (!hl.text.empty())
+                                fprintf(f, "- **p.%d** — %s\n",
+                                        pg.page_index + 1, hl.text.c_str());
+                    fprintf(f, "\n");
+                }
+                fclose(f);
+            }
+        }
+    }
+    ImGui::SetItemTooltip("Export all text highlights as a Markdown file");
+    ImGui::Separator();
+
+    bool any = false;
+    for (int di = 0; di < (int)g_documents.size(); ++di) {
+        const Document& doc = g_documents[di];
+        // Count text-bearing highlights for this document
+        int ref_count = 0;
+        for (const auto& pg : doc.pages)
+            for (const auto& hl : pg.annots.highlights)
+                if (!hl.text.empty()) ++ref_count;
+        if (ref_count == 0) continue;
+        any = true;
+
+        // Document header in its hue color
+        std::string fname = fs::path(doc.path).filename().string();
+        ImGui::PushStyleColor(ImGuiCol_Text, {doc.hue_r, doc.hue_g, doc.hue_b, 1.0f});
+        ImGui::TextUnformatted(fname.c_str());
+        ImGui::PopStyleColor();
+
+        for (int pi = 0; pi < (int)doc.pages.size(); ++pi) {
+            const Page& pg = doc.pages[pi];
+            for (int hi = 0; hi < (int)pg.annots.highlights.size(); ++hi) {
+                const AnnotHighlight& hl = pg.annots.highlights[hi];
+                if (hl.text.empty()) continue;
+
+                // Truncate display text; full text appears on hover
+                std::string display = hl.text;
+                bool truncated = display.size() > 90;
+                if (truncated) { display.resize(87); display += "..."; }
+
+                // Combined selectable row "p.N  text..."
+                char row[640];
+                snprintf(row, sizeof(row), "p.%d  %s##ref%d_%d_%d",
+                         pg.page_index + 1, display.c_str(), di, pi, hi);
+
+                if (ImGui::Selectable(row, false, ImGuiSelectableFlags_None, {0.0f, 0.0f})) {
+                    zoom_to_rect(pg.world_pos.x, pg.world_pos.y,
+                                 pg.world_pos.x + pg.world_w,
+                                 pg.world_pos.y + pg.world_h);
+                    g_input.open_panel(di, pg.page_index);
+                }
+                if (truncated)
+                    ImGui::SetItemTooltip("%s", hl.text.c_str());
+            }
+        }
+        ImGui::Spacing();
+    }
+
+    if (!any) {
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Text, {0.5f, 0.5f, 0.5f, 1.0f});
+        ImGui::TextWrapped(
+            "No text highlights yet.\n\n"
+            "Open a document, select the Highlight tool, then drag across text on the page "
+            "— it will appear here with the filename and page number.");
+        ImGui::PopStyleColor();
+    }
+}
+
 // --- Panel viewer -----------------------------------------------------------
 
 static void draw_panel_ui() {
@@ -2970,8 +3132,10 @@ static void draw_panel_ui() {
         ImGui::SetItemTooltip("Next page");
     }
 
-    ImGui::Separator();
+    // Tab bar: "Document" shows the PDF viewer; "References" lists all text highlights.
+    ImGui::BeginTabBar("##panel_tabs");
 
+    if (ImGui::BeginTabItem("Document")) {
     // Child window fills the remaining panel height and is the only scrollable region.
     // The toolbar above stays pinned regardless of scroll position.
     ImGui::BeginChild("##panel_scroll", {0.0f, 0.0f}, false, ImGuiWindowFlags_None);
@@ -3196,6 +3360,18 @@ static void draw_panel_ui() {
     }
 
     ImGui::EndChild();
+    ImGui::EndTabItem();
+    } // Document tab
+
+    if (ImGui::BeginTabItem("References")) {
+        ImGui::BeginChild("##panel_ref_scroll", {0.0f, 0.0f}, false, ImGuiWindowFlags_None);
+        ImGui::Spacing();
+        draw_references_tab();
+        ImGui::EndChild();
+        ImGui::EndTabItem();
+    }
+
+    ImGui::EndTabBar();
     ImGui::End();
 }
 
