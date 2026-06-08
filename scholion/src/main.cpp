@@ -20,8 +20,11 @@ extern "C" void scholion_activate_app(void);
 #include <windows.h>
 #include <shellapi.h>   // ShellExecuteW (reveal in Explorer)
 #include <shlobj.h>     // SHGetKnownFolderPath, FOLDERID_*
+#include <dwmapi.h>     // DwmSetWindowAttribute — dark title bar
 #define GLFW_INCLUDE_NONE
 #include <glad/glad.h>
+#define GLFW_EXPOSE_NATIVE_WIN32
+#include <GLFW/glfw3native.h>   // glfwGetWin32Window
 #endif
 
 #include <GLFW/glfw3.h>
@@ -3738,6 +3741,12 @@ int main(int argc, char* argv[]) {
 #endif
 
 #ifdef _WIN32
+    // Dark title bar — paints Windows 10/11 chrome to match the app's dark theme.
+    {
+        HWND hwnd = glfwGetWin32Window(window);
+        BOOL use_dark = TRUE;
+        DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &use_dark, sizeof(use_dark));
+    }
     // Disable VSync on Windows — some GPU drivers deadlock inside glfwSwapBuffers
     // when swap interval is 1 (causes hang-on-first-frame on affected hardware).
     // Frame rate is still capped by glfwWaitEventsTimeout(0.016) in the main loop.

@@ -139,6 +139,7 @@ target_link_libraries(Scholion PRIVATE
     ole32     # CoTaskMemFree (used by SHGetKnownFolderPath)
     gdi32     # GDI (GLFW dependency)
     user32    # Windows messaging (GLFW dependency)
+    dwmapi    # DwmSetWindowAttribute — dark title bar
 )
 
 if(SCHOLION_WITH_MUPDF)
