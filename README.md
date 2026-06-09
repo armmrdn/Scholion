@@ -60,6 +60,6 @@ Shared C++ source lives in `scholion/src/` and `scholion/include/`. Both platfor
 
 ## License
 
-© 2026 ARMMRDN. All rights reserved.
+© 2026 ARMMRDN. All rights reserved. For closed binary distribution.
 
 MuPDF is AGPL licensed. For closed binary distribution, swap to PDFium.
