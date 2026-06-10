@@ -140,6 +140,7 @@ target_link_libraries(Scholion PRIVATE
     gdi32     # GDI (GLFW dependency)
     user32    # Windows messaging (GLFW dependency)
     dwmapi    # DwmSetWindowAttribute — dark title bar
+    psapi     # GetProcessMemoryInfo — RAM working set (benchmark logger)
 )
 
 if(SCHOLION_WITH_MUPDF)
@@ -157,13 +158,16 @@ endif()
 
 # MinGW: statically link the C/C++ and pthreads runtime so the .exe
 # doesn't depend on libgcc, libstdc++, or libwinpthread DLLs.
+# Note: do NOT use --whole-archive for winpthread — that pulls in the
+# winpthreads VERSIONINFO resource, which overrides the one in scholion.rc
+# and causes Task Manager to show "POSIX WinThreads for Windows".
 if(MINGW)
     target_link_options(Scholion PRIVATE
         -static-libgcc
         -static-libstdc++
-        -Wl,-Bstatic,--whole-archive
+        -Wl,-Bstatic
         -lwinpthread
-        -Wl,--no-whole-archive
+        -Wl,-Bdynamic
     )
 endif()
 

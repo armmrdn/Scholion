@@ -11,7 +11,8 @@ extern "C" void scholion_register_early(void);
 extern "C" void scholion_register_file_handler(void);
 extern "C" int  scholion_pop_pending_open(char* buf, int buf_len);
 extern "C" void scholion_activate_app(void);
-#include <unistd.h>   // fork / execl
+#include <unistd.h>           // fork / execl
+#include <mach/mach.h>        // task_info — RAM working set (benchmark logger)
 #elif defined(_WIN32)
 // Windows: GLAD must be included before GLFW so it wins the GL symbol race.
 // GLFW_INCLUDE_NONE prevents GLFW from pulling in its own GL headers.
@@ -21,6 +22,7 @@ extern "C" void scholion_activate_app(void);
 #include <shellapi.h>   // ShellExecuteW (reveal in Explorer)
 #include <shlobj.h>     // SHGetKnownFolderPath, FOLDERID_*
 #include <dwmapi.h>     // DwmSetWindowAttribute — dark title bar
+#include <psapi.h>      // GetProcessMemoryInfo — RAM working set (benchmark logger)
 #define GLFW_INCLUDE_NONE
 #include <glad/glad.h>
 #endif
@@ -204,11 +206,12 @@ static std::chrono::steady_clock::time_point g_save_feedback_time;
 
 // --- Application settings (persisted to ~/.scholion_prefs) -------------------
 struct AppSettings {
-    bool     dark_mode   = true;
-    GridMode grid_mode   = GridMode::Lines;
-    bool     compat_mode = false;
-    float    panel_w     = 360.0f;          // persisted sidebar width
-    bool     vignette_on = true;
+    bool     dark_mode      = true;
+    GridMode grid_mode      = GridMode::Lines;
+    bool     compat_mode    = false;
+    float    panel_w        = 360.0f;          // persisted sidebar width
+    bool     vignette_on    = true;
+    bool     developer_mode = false;           // enables benchmark CSV logger
 };
 static AppSettings g_settings;
 static bool g_settings_open = false;
@@ -1014,7 +1017,7 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
 
         // Tool keys always work regardless of panel focus.
         bool cmd = super || ctrl;
-        if (!cmd && !g_search_open) {
+        if (!cmd && !g_search_open && g_editing_box < 0) {
             if (key == GLFW_KEY_P) {
                 bool was_pen = (g_annot_tool == AnnotTool::Pen);
                 g_annot_tool = was_pen ? AnnotTool::None : AnnotTool::Pen;
@@ -1029,15 +1032,29 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
                 return;
             }
             if (key == GLFW_KEY_H) {
-                g_annot_tool = (g_annot_tool == AnnotTool::Highlight)
-                               ? AnnotTool::None : AnnotTool::Highlight;
+                bool was_hl = (g_annot_tool == AnnotTool::Highlight);
+                g_annot_tool = was_hl ? AnnotTool::None : AnnotTool::Highlight;
                 g_ann_drawing = false;
+                if (!was_hl && !g_input.panel_open()) {
+                    const Document* sel = g_input.selected_doc();
+                    if (sel) {
+                        for (int i = 0; i < (int)g_documents.size(); ++i)
+                            if (&g_documents[i] == sel) { g_input.open_panel(i, -1); break; }
+                    }
+                }
                 return;
             }
             if (key == GLFW_KEY_F && !super && !ctrl) {
-                g_annot_tool = (g_annot_tool == AnnotTool::Note)
-                               ? AnnotTool::None : AnnotTool::Note;
+                bool was_note = (g_annot_tool == AnnotTool::Note);
+                g_annot_tool = was_note ? AnnotTool::None : AnnotTool::Note;
                 g_ann_drawing = false;
+                if (!was_note && !g_input.panel_open()) {
+                    const Document* sel = g_input.selected_doc();
+                    if (sel) {
+                        for (int i = 0; i < (int)g_documents.size(); ++i)
+                            if (&g_documents[i] == sel) { g_input.open_panel(i, -1); break; }
+                    }
+                }
                 return;
             }
             // ESC: deactivate active tool even when panel has keyboard focus.
@@ -1062,7 +1079,7 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
     // the space-up event would be swallowed and m_space_tap_pending never set,
     // making it impossible to close the panel with spacebar.
     if (ImGui::GetIO().WantCaptureKeyboard) {
-        if (key == GLFW_KEY_SPACE)
+        if (key == GLFW_KEY_SPACE && g_editing_box < 0)
             g_input.on_key(w, key, scancode, action, mods);
         return;
     }
@@ -1310,7 +1327,7 @@ static void draw_cursor_tool_icon() {
 static constexpr float TBOX_W        = 280.0f;  // editing window width (fixed fallback)
 static constexpr float TBOX_MIN_W    = 80.0f;
 static constexpr float TBOX_MAX_W    = 420.0f;
-static constexpr float TBOX_PAD      = 7.0f;
+static constexpr float TBOX_PAD      = 4.0f;
 static constexpr float TBOX_MIN_H    = 28.0f;
 static constexpr float TBOX_DEFAULT_W = 200.0f; // bare-click box width
 static constexpr float TBOX_MIN_DRAG  = 8.0f;   // px; smaller drags count as a click
@@ -1842,6 +1859,84 @@ static void reveal_in_file_manager(const std::string& path) {
 #endif
 }
 
+// --- Benchmark logger -------------------------------------------------------
+// Activated by the Developer Mode checkbox in Settings.
+// Writes scholion_perf_<timestamp>.csv to the user's Desktop (Windows) or
+// home directory (macOS/Linux) once per second. Zero UI impact.
+//
+// Columns: elapsed_s, fps, frame_ms, vram_used_mb, vram_budget_mb,
+//          rast_queue, ram_mb, pages_total, pages_visible
+
+static float get_process_ram_mb() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS pmc;
+    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
+        return static_cast<float>(pmc.WorkingSetSize) / (1024.0f * 1024.0f);
+#elif defined(__APPLE__)
+    // mach/task.h available on macOS; resident_size = physical RAM held
+    struct mach_task_basic_info info;
+    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
+                  (task_info_t)&info, &count) == KERN_SUCCESS)
+        return static_cast<float>(info.resident_size) / (1024.0f * 1024.0f);
+#endif
+    return 0.0f;
+}
+
+static FILE* g_bench_file = nullptr;
+static double g_bench_start = 0.0;
+static double g_bench_last_write = -1.0;
+
+static void bench_open() {
+    if (g_bench_file) return;
+    // Build a timestamped filename on the user's Desktop / home dir.
+    char path[512];
+    time_t t = time(nullptr);
+    struct tm* tm_info = localtime(&t);
+    char ts[32];
+    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", tm_info);
+#ifdef _WIN32
+    char desktop[MAX_PATH] = {};
+    SHGetFolderPathA(nullptr, CSIDL_DESKTOP, nullptr, 0, desktop);
+    snprintf(path, sizeof(path), "%s\\scholion_perf_%s.csv", desktop, ts);
+#else
+    const char* home = getenv("HOME");
+    snprintf(path, sizeof(path), "%s/scholion_perf_%s.csv",
+             home ? home : ".", ts);
+#endif
+    g_bench_file = fopen(path, "w");
+    if (g_bench_file) {
+        fprintf(g_bench_file,
+            "elapsed_s,fps,frame_ms,vram_used_mb,vram_budget_mb,"
+            "rast_queue,ram_mb,pages_total,pages_visible\n");
+        fflush(g_bench_file);
+        printf("[benchmark] logging to %s\n", path);
+    }
+    g_bench_start = glfwGetTime();
+}
+
+static void bench_write(float fps, float frame_ms,
+                        int pages_total, int pages_visible) {
+    if (!g_bench_file) return;
+    double now = glfwGetTime();
+    if (now - g_bench_last_write < 1.0) return;   // once per second
+    g_bench_last_write = now;
+
+    float vram_used_mb   = static_cast<float>(g_cache.vram_bytes()) / (1024.0f * 1024.0f);
+    float vram_budget_mb = static_cast<float>(VRAM_BUDGET)          / (1024.0f * 1024.0f);
+    int   rast_queue     = 0;
+    { std::lock_guard<std::mutex> lk(g_rast_mutex); rast_queue = (int)g_rast_tasks.size(); }
+    float ram_mb         = get_process_ram_mb();
+
+    fprintf(g_bench_file, "%.1f,%.1f,%.2f,%.1f,%.1f,%d,%.1f,%d,%d\n",
+            now - g_bench_start,
+            fps, frame_ms,
+            vram_used_mb, vram_budget_mb,
+            rast_queue, ram_mb,
+            pages_total, pages_visible);
+    fflush(g_bench_file);
+}
+
 // --- Context menu -----------------------------------------------------------
 
 static void draw_context_menu() {
@@ -2154,8 +2249,9 @@ static void save_prefs() {
     fprintf(f, "dark_mode=%d\n",   g_settings.dark_mode   ? 1 : 0);
     fprintf(f, "grid_mode=%d\n",   (int)g_settings.grid_mode);
     fprintf(f, "compat_mode=%d\n", g_settings.compat_mode ? 1 : 0);
-    fprintf(f, "vignette_on=%d\n", g_settings.vignette_on ? 1 : 0);
-    fprintf(f, "panel_w=%.1f\n",   g_settings.panel_w);
+    fprintf(f, "vignette_on=%d\n",    g_settings.vignette_on    ? 1 : 0);
+    fprintf(f, "developer_mode=%d\n", g_settings.developer_mode ? 1 : 0);
+    fprintf(f, "panel_w=%.1f\n",      g_settings.panel_w);
     fclose(f);
 }
 
@@ -2171,8 +2267,9 @@ static void load_prefs() {
         if      (!strcmp(key, "dark_mode"))   g_settings.dark_mode   = ival;
         else if (!strcmp(key, "grid_mode"))   g_settings.grid_mode   = (GridMode)ival;
         else if (!strcmp(key, "compat_mode")) g_settings.compat_mode = ival;
-        else if (!strcmp(key, "vignette_on")) g_settings.vignette_on = ival;
-        else if (!strcmp(key, "panel_w"))     g_settings.panel_w     = fval;
+        else if (!strcmp(key, "vignette_on"))    g_settings.vignette_on    = ival;
+        else if (!strcmp(key, "developer_mode")) g_settings.developer_mode = ival;
+        else if (!strcmp(key, "panel_w"))        g_settings.panel_w        = fval;
     }
     fclose(f);
 }
@@ -2793,6 +2890,25 @@ static void draw_settings_popup() {
     ImGui::PopStyleColor();
     ImGui::PopTextWrapPos();
     if (g_settings.compat_mode != prev_compat) {
+        save_prefs();
+    }
+
+    // --- Developer Mode ---
+    ImGui::Spacing();
+    bool prev_dev = g_settings.developer_mode;
+    ImGui::Checkbox("Developer mode", &g_settings.developer_mode);
+    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 340.0f);
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("Writes a benchmark CSV to the Desktop once per second "
+                       "(fps, frame time, VRAM, RAM, rast queue). "
+                       "For profiling only — disable when not measuring.");
+    ImGui::PopStyleColor();
+    ImGui::PopTextWrapPos();
+    if (g_settings.developer_mode != prev_dev) {
+        if (!g_settings.developer_mode && g_bench_file) {
+            fclose(g_bench_file);
+            g_bench_file = nullptr;
+        }
         save_prefs();
     }
 
@@ -4003,6 +4119,7 @@ int main(int argc, char* argv[]) {
         float  delta_t = static_cast<float>(now_t - last_frame_time);
         last_frame_time = now_t;
         overlay.update(delta_t);
+        if (g_settings.developer_mode) bench_open();
         if (g_input.consume_overlay_toggle()) overlay.toggle();
 
         g_input.update(window);
@@ -4210,6 +4327,7 @@ int main(int argc, char* argv[]) {
                     if (is_page_visible(pg)) ++visible_pages;
                 }
             overlay.set_page_count(visible_pages, total_pages);
+            bench_write(overlay.fps(), delta_t * 1000.0f, total_pages, visible_pages);
         }
 
         // Render save feedback (temporary "Saved!" message)

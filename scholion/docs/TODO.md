@@ -6,6 +6,31 @@ Items are ordered by priority. Completed items kept for history.
 
 ## Pending work
 
+### ⚠ Pre-release: Remove benchmarking code
+**Goal:** strip all profiling/logging code before distributing to end users.
+
+**What to remove from `scholion/src/main.cpp`:**
+- `get_process_ram_mb()` function
+- `g_bench_file`, `g_bench_start`, `g_bench_last_write` globals
+- `bench_open()` and `bench_write()` functions
+- `AppSettings::developer_mode` field
+- `save_prefs()` / `load_prefs()` lines for `developer_mode`
+- Developer Mode checkbox block in `draw_settings_popup()`
+- Main loop line: `if (g_settings.developer_mode) bench_open();`
+- `#include <psapi.h>` in the `_WIN32` block
+- `#include <mach/mach.h>` in the `__APPLE__` block
+
+**What to remove from `scholion-win/CMakeLists.txt`:**
+- `psapi` entry in `target_link_libraries`
+
+**To restore benchmarking in future:** re-add the same functions. CSV format:
+`elapsed_s, fps, frame_ms, vram_used_mb, vram_budget_mb, rast_queue, ram_mb, pages_total, pages_visible`
+Written once/second to `scholion_perf_<timestamp>.csv` on the Desktop.
+
+**Status:** benchmarking active — remove before release.
+
+---
+
 ### Performance optimization — Make program more lightweight
 **Goal:** optimize Scholion to run smoothly on more limited hardware with reduced CPU/GPU/VRAM usage.
 
