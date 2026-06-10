@@ -79,6 +79,9 @@ static std::vector<Document>                    g_documents;
 static std::vector<std::shared_ptr<PdfLoader>>  g_loaders;   // one per document, same index
 static TextureCache                             g_cache;
 
+static void before_file_dialog();
+static void after_file_dialog();
+
 // --- Background rasterization -----------------------------------------------
 // Pipeline: enqueue_rast() → g_rast_tasks (work queue) → rast_worker() (one
 // background thread) → g_rast_ready (result queue) → drain_rast_results() on
@@ -406,6 +409,13 @@ static void undo_last() {
             int idx = std::clamp(r.removed_doc_idx, 0, (int)g_documents.size());
             g_documents.insert(g_documents.begin() + idx, r.removed_doc);
             g_loaders.insert(g_loaders.begin() + idx, r.removed_loader);
+            // The GPU textures were deleted when the doc was removed; zero the
+            // stale handles so stream_lod() re-rasterizes on the next frame.
+            for (auto& page : g_documents[idx].pages) {
+                page.tex_thumb = 0;
+                page.tex_low   = 0;
+                page.tex_high  = 0;
+            }
             g_input.set_documents(g_documents.empty() ? nullptr : &g_documents);
             break;
         }
@@ -999,10 +1009,12 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
         if (key == GLFW_KEY_F && (super || ctrl)) { g_search_open = !g_search_open; return; }
         // Cmd+S: allowed mid text-box edit so you can save without closing the editor.
         if (key == GLFW_KEY_S && (super || ctrl)) { save_project_current(); return; }
+        // Cmd+0 / Ctrl+0: zoom-to-fit regardless of active tool or text editing state.
+        if (key == GLFW_KEY_0 && (super || ctrl)) { zoom_to_fit(); return; }
 
         // Tool keys always work regardless of panel focus.
         bool cmd = super || ctrl;
-        if (!cmd) {
+        if (!cmd && !g_search_open) {
             if (key == GLFW_KEY_P) {
                 bool was_pen = (g_annot_tool == AnnotTool::Pen);
                 g_annot_tool = was_pen ? AnnotTool::None : AnnotTool::Pen;
@@ -1064,7 +1076,6 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
     if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
 
     if (key == GLFW_KEY_Z && (super || ctrl)) undo_last();
-    if (key == GLFW_KEY_0 && (super || ctrl)) zoom_to_fit();
 
     // Arrow key navigation in panel or selection
     if (g_input.panel_open()) {
@@ -1328,6 +1339,7 @@ static void draw_canvas_text_boxes() {
     // drawing whenever a blocking overlay is up. The user can't interact with
     // boxes through the overlay anyway.
     if (g_settings_open) return;
+    if (g_search_open) return;
     if (ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) return;
 
     ImDrawList* dl    = ImGui::GetForegroundDrawList();
@@ -1851,12 +1863,11 @@ static void draw_context_menu() {
                 ImGui::TextDisabled("PDF not found:");
                 ImGui::TextDisabled("%s", doc->path.c_str());
                 if (ImGui::MenuItem("Relink PDF...")) {
-#ifdef __APPLE__
-                    scholion_activate_app();
-#endif
+                    before_file_dialog();
                     const char* pats[] = {"*.pdf", "*.PDF"};
                     const char* picked = tinyfd_openFileDialog(
                         "Locate the missing PDF", doc->path.c_str(), 2, pats, "PDF Documents", 0);
+                    after_file_dialog();
                     if (picked) {
                         for (int i = 0; i < (int)g_documents.size(); ++i)
                             if (&g_documents[i] == doc) { relink_document(i, picked); break; }
@@ -1868,6 +1879,7 @@ static void draw_context_menu() {
                 ImGui::Separator();
             }
             if (ImGui::MenuItem("Return to stack")) {
+                if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
                 r.page_moves.push_back({page, page->world_pos});
                 push_undo(r);
@@ -1886,6 +1898,7 @@ static void draw_context_menu() {
             }
             ImGui::Separator();
             if (ImGui::MenuItem("Fan pages vertically")) {
+                if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
                 for (auto& p : doc->pages) r.page_moves.push_back({&p, p.world_pos});
                 push_undo(r);
@@ -1893,6 +1906,7 @@ static void draw_context_menu() {
                 for (auto& p : doc->pages) { p.world_pos = {doc->stack_origin.x, y}; y += p.world_h + 20.0f; }
             }
             if (ImGui::MenuItem("Fan pages horizontally")) {
+                if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
                 for (auto& p : doc->pages) r.page_moves.push_back({&p, p.world_pos});
                 push_undo(r);
@@ -1900,6 +1914,7 @@ static void draw_context_menu() {
                 for (auto& p : doc->pages) { p.world_pos = {x, doc->stack_origin.y}; x += p.world_w + 20.0f; }
             }
             if (ImGui::MenuItem("Stack pages")) {
+                if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
                 for (auto& p : doc->pages) r.page_moves.push_back({&p, p.world_pos});
                 push_undo(r);
@@ -2296,13 +2311,30 @@ static bool save_to_path(const std::string& path) {
     return true;
 }
 
-static void save_project() {
+static void before_file_dialog() {
 #ifdef __APPLE__
     scholion_activate_app();
+#elif defined(_WIN32)
+    if (g_window) EnableWindow(glfwGetWin32Window(g_window), FALSE);
 #endif
+}
+
+static void after_file_dialog() {
+#ifdef _WIN32
+    if (g_window) {
+        HWND hwnd = glfwGetWin32Window(g_window);
+        EnableWindow(hwnd, TRUE);
+        SetForegroundWindow(hwnd);
+    }
+#endif
+}
+
+static void save_project() {
+    before_file_dialog();
     const char* filter_patterns[] = {"*.scholion"};
     const char* picked = tinyfd_saveFileDialog(
         "Save Project", "project.scholion", 1, filter_patterns, "Scholion Project");
+    after_file_dialog();
     if (!picked) return;
 
     if (save_to_path(picked)) {
@@ -2644,14 +2676,13 @@ static void load_project_from_path(const std::string& path) {
 }
 
 static void load_project() {
-#ifdef __APPLE__
-    scholion_activate_app();
-#endif
+    before_file_dialog();
     // No type filter: tinyfiledialogs passes the extension to AppleScript's
     // "choose file of type", which on macOS 12+ treats it as a UTI lookup.
     // Since "scholion" isn't a registered UTI, all .scholion files get greyed
     // out. Showing all files is more reliable; the dialog title guides the user.
     const char* p = tinyfd_openFileDialog("Open Project", "", 0, nullptr, nullptr, 0);
+    after_file_dialog();
     if (p) load_project_from_path(p);
 }
 
@@ -2675,25 +2706,20 @@ static void draw_startup_chooser() {
 
         if (ImGui::Button("Open Project File", bsz)) {
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
-#ifdef __APPLE__
-            scholion_activate_app();
-#endif
             load_project();
         }
         if (ImGui::Button("Add PDF File(s)", bsz)) {
-#ifdef __APPLE__
-            scholion_activate_app();
-#endif
+            before_file_dialog();
             const char* pats[] = {"*.pdf", "*.PDF"};
             const char* r = tinyfd_openFileDialog("Select PDF files", nullptr, 2, pats, "PDF Documents", 1);
+            after_file_dialog();
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
             if (r) load_pdfs_from_selection(r);
         }
         if (ImGui::Button("Add Folder of PDFs", bsz)) {
-#ifdef __APPLE__
-            scholion_activate_app();
-#endif
+            before_file_dialog();
             const char* d = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
+            after_file_dialog();
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
             if (d) load_pdfs_from_folder(d);
         }
@@ -2779,6 +2805,11 @@ static void draw_settings_popup() {
         ImGui::TableSetupColumn("Key",    ImGuiTableColumnFlags_WidthStretch, 0.45f);
         ImGui::TableHeadersRow();
 
+#ifdef __APPLE__
+#define MODK "Cmd"
+#else
+#define MODK "Ctrl"
+#endif
         auto row = [](const char* action, const char* key) {
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
@@ -2789,16 +2820,16 @@ static void draw_settings_popup() {
 
         row("Pan",                         "Middle-drag / Space+drag");
         row("Zoom",                        "Scroll wheel");
-        row("Zoom to Fit",                 "Cmd+0 / Middle double-click");
+        row("Zoom to Fit",                 MODK "+0 / Middle double-click");
         row("Toggle status overlay",       "F3");
-        row("Full-text search",            "Cmd+F");
+        row("Full-text search",            MODK "+F");
         row("Select page",                 "Click");
         row("Open panel",                  "Double-click");
         row("Toggle panel",                "Space (tap)");
         row("Move page",                   "Drag");
         row("Toggle whole document select", "Shift+click");
-        row("Toggle item in selection",    "Cmd+click");
-        row("Select all",                  "Cmd+A");
+        row("Toggle item in selection",    MODK "+click");
+        row("Select all",                  MODK "+A");
         row("Rubber-band select",          "Drag empty canvas");
         row("Clear selection / close panel","Escape");
         row("Text tool",                   "T");
@@ -2806,11 +2837,12 @@ static void draw_settings_popup() {
         row("Highlight tool",              "H");
         row("Create text box",             "Drag (T active)");
         row("Edit text box",               "Double-click box");
-        row("Duplicate text box",          "Cmd+C, Cmd+V");
+        row("Duplicate text box",          MODK "+C, " MODK "+V");
         row("Delete text box",             "Delete / Backspace");
-        row("Undo",                        "Cmd+Z");
-        row("Save",                        "Cmd+S");
+        row("Undo",                        MODK "+Z");
+        row("Save",                        MODK "+S");
         ImGui::EndTable();
+#undef MODK
     }
 
     // Footer with attribution — three center-aligned lines, wrapping to available width
@@ -2930,19 +2962,17 @@ static void draw_canvas_context_menu() {
 
         // Document operations
         if (ImGui::MenuItem("Add PDF...")) {
-#ifdef __APPLE__
-            scholion_activate_app();
-#endif
+            before_file_dialog();
             const char* patterns[] = {"*.pdf", "*.PDF"};
             const char* r = tinyfd_openFileDialog("Select PDF files", nullptr,
                                                   2, patterns, "PDF Documents", 1);
+            after_file_dialog();
             if (r) load_pdfs_from_selection(r);
         }
         if (ImGui::MenuItem("Add folder...")) {
-#ifdef __APPLE__
-            scholion_activate_app();
-#endif
+            before_file_dialog();
             const char* r = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
+            after_file_dialog();
             if (r) load_pdfs_from_folder(r);
         }
         ImGui::Separator();
@@ -2971,12 +3001,11 @@ static void draw_references_tab() {
     float avail = ImGui::GetContentRegionAvail().x;
     ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - 95.0f);
     if (ImGui::SmallButton("Export .md")) {
-#ifdef __APPLE__
-        scholion_activate_app();
-#endif
+        before_file_dialog();
         const char* filters[] = {"*.md"};
         const char* out_path = tinyfd_saveFileDialog(
             "Export References", "references.md", 1, filters, "Markdown");
+        after_file_dialog();
         if (out_path) {
             FILE* f = fopen(out_path, "w");
             if (f) {
@@ -3560,12 +3589,11 @@ static void draw_search_panel() {
     if (!g_search_open) return;
 
     ImVec2 vp = ImGui::GetMainViewport()->Size;
-    ImGui::SetNextWindowPos({vp.x * 0.5f - 260.0f, 50.0f}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize({520.0f, 440.0f}, ImGuiCond_Always);
+    ImGui::SetNextWindowPos({vp.x * 0.5f - 260.0f, 50.0f}, ImGuiCond_Appearing);
+    ImGui::SetNextWindowSize({520.0f, 440.0f}, ImGuiCond_Appearing);
     ImGui::SetNextWindowBgAlpha(0.97f);
 
     if (!ImGui::Begin("Search##search_panel", &g_search_open,
-                      ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
                       ImGuiWindowFlags_NoCollapse)) {
         ImGui::End();
         return;
@@ -3694,20 +3722,18 @@ static void draw_toolbar_ui() {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8.0f, 6.0f});
 
         if (ImGui::MenuItem("Add from folder...")) {
-#ifdef __APPLE__
-            scholion_activate_app();
-#endif
+            before_file_dialog();
             const char* path = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
+            after_file_dialog();
             if (path) load_pdfs_from_folder(path);
         }
         if (ImGui::MenuItem("Add from file...")) {
-#ifdef __APPLE__
-            scholion_activate_app();
-#endif
+            before_file_dialog();
             const char* patterns[] = {"*.pdf", "*.PDF"};
             const char* result = tinyfd_openFileDialog(
                 "Select PDF files", nullptr,
                 2, patterns, "PDF Documents", 1);
+            after_file_dialog();
             if (result) load_pdfs_from_selection(result);
         }
         if (ImGui::MenuItem("Add from URL...")) {

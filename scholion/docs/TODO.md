@@ -178,7 +178,6 @@ save/load, autosave, VRAM optimization, UX polish.
 
 ## Notes
 - Keymap reference lives in `../CLAUDE.md` — update it when new bindings land.
-- `Cmd+A` uses only `GLFW_MOD_SUPER`; generalize to `GLFW_MOD_CONTROL` on non-macOS
-  when the Windows port lands.
+- ✓ `Cmd+A` / `Ctrl+A` — generalized to `GLFW_MOD_SUPER || GLFW_MOD_CONTROL` in `input.cpp`.
 - No git in this tree — snapshots are tarballs in `~/Dropbox/Scholion/`. See CLAUDE.md
   Restore Points section for the full list.

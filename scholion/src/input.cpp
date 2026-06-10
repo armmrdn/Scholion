@@ -185,8 +185,9 @@ void InputHandler::on_key(GLFWwindow* /*window*/, int key, int /*scancode*/, int
     if (key == GLFW_KEY_F3 && action == GLFW_PRESS)
         m_overlay_toggle_pending = true;
 
-    // Cmd+A — select all pages
-    if (key == GLFW_KEY_A && action == GLFW_PRESS && (mods & GLFW_MOD_SUPER) && m_documents) {
+    // Cmd+A (macOS) / Ctrl+A (Windows/Linux) — select all pages
+    if (key == GLFW_KEY_A && action == GLFW_PRESS &&
+        ((mods & GLFW_MOD_SUPER) || (mods & GLFW_MOD_CONTROL)) && m_documents) {
         m_selection.clear();
         for (auto& doc : *m_documents)
             for (auto& page : doc.pages)
