@@ -13,6 +13,7 @@ if(APPLE)
 endif()
 
 option(SCHOLION_WITH_MUPDF "Link MuPDF for PDF rasterization (milestone 2)" OFF)
+option(SCHOLION_DEV       "Enable developer/diagnostic tools (benchmark, CSV logger)" OFF)
 
 # --- Dependencies -----------------------------------------------------------
 
@@ -129,4 +130,9 @@ if(SCHOLION_WITH_MUPDF)
     endif()
 
     message(STATUS "MuPDF: bundled at ${MUPDF_DIR}")
+endif()
+
+if(SCHOLION_DEV)
+    target_compile_definitions(scholion PRIVATE SCHOLION_DEV)
+    message(STATUS "SCHOLION_DEV: developer/diagnostic tools enabled")
 endif()

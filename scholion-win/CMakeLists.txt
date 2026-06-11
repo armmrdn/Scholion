@@ -71,6 +71,7 @@ target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 # MuPDF (Windows static libs — see third_party/mupdf/lib/PLACE_WINDOWS_LIBS_HERE.txt)
 # ---------------------------------------------------------------------------
 option(SCHOLION_WITH_MUPDF "Link MuPDF for PDF rasterization" OFF)
+option(SCHOLION_DEV       "Enable developer/diagnostic tools (benchmark, CSV logger)" OFF)
 
 if(SCHOLION_WITH_MUPDF)
     set(MUPDF_INC "${SHARED_3P}/mupdf/include")
@@ -169,6 +170,11 @@ if(MINGW)
         -lwinpthread
         -Wl,-Bdynamic
     )
+endif()
+
+if(SCHOLION_DEV)
+    target_compile_definitions(Scholion PRIVATE SCHOLION_DEV)
+    message(STATUS "SCHOLION_DEV: developer/diagnostic tools enabled")
 endif()
 
 message(STATUS "Scholion Windows build configured")

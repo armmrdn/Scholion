@@ -13,6 +13,7 @@ extern "C" int  scholion_pop_pending_open(char* buf, int buf_len);
 extern "C" void scholion_activate_app(void);
 #include <unistd.h>           // fork / execl
 #include <mach/mach.h>        // task_info — RAM working set (benchmark logger)
+#include <sys/sysctl.h>       // sysctl hw.memsize — total physical RAM (benchmark)
 #elif defined(_WIN32)
 // Windows: GLAD must be included before GLFW so it wins the GL symbol race.
 // GLFW_INCLUDE_NONE prevents GLFW from pulling in its own GL headers.
@@ -118,6 +119,14 @@ static std::unordered_set<std::string> g_rast_inflight;   // "path:page:tier" ke
 static std::atomic<bool>       g_rast_stop{false};
 static std::thread             g_rast_thread;
 
+// Backpressure cap: worker pauses once this many completed tiles are queued,
+// preventing multiple High-LOD tiles (~17 MB, ~110 ms to upload on Intel IGP)
+// from piling up and causing a single-frame GL stall in drain_rast_results.
+// With cap=1 the worker and main thread interleave one tile at a time; total
+// load time is unchanged (bottlenecked by rasterization) but no frame exceeds
+// one tile's upload cost.
+static constexpr int RAST_READY_MAX = 1;
+
 static std::string rast_key(const std::string& path, int pg, LodTier tier) {
     return path + '\0' + std::to_string(pg) + '\0' + std::to_string((int)tier);
 }
@@ -127,7 +136,10 @@ static void rast_worker() {
         RastTask task;
         {
             std::unique_lock<std::mutex> lk(g_rast_mutex);
-            g_rast_cv.wait(lk, []{ return g_rast_stop || !g_rast_tasks.empty(); });
+            g_rast_cv.wait(lk, []{
+                return g_rast_stop ||
+                       (!g_rast_tasks.empty() && (int)g_rast_ready.size() < RAST_READY_MAX);
+            });
             if (g_rast_stop && g_rast_tasks.empty()) break;
             task = std::move(g_rast_tasks.front());
             g_rast_tasks.erase(g_rast_tasks.begin());
@@ -163,6 +175,8 @@ static void drain_rast_results() {
         std::lock_guard<std::mutex> lk(g_rast_mutex);
         ready.swap(g_rast_ready);
     }
+    // Tell the worker it can produce the next tile now that we've drained.
+    if (!ready.empty()) g_rast_cv.notify_one();
     for (auto& res : ready) {
         // Find the page — document may have been removed since task was queued
         Page* target = nullptr;
@@ -1883,6 +1897,7 @@ static float get_process_ram_mb() {
     return 0.0f;
 }
 
+#ifdef SCHOLION_DEV
 static FILE* g_bench_file = nullptr;
 static double g_bench_start = 0.0;
 static double g_bench_last_write = -1.0;
@@ -1901,7 +1916,7 @@ static void bench_open() {
     snprintf(path, sizeof(path), "%s\\scholion_perf_%s.csv", desktop, ts);
 #else
     const char* home = getenv("HOME");
-    snprintf(path, sizeof(path), "%s/scholion_perf_%s.csv",
+    snprintf(path, sizeof(path), "%s/Desktop/scholion_perf_%s.csv",
              home ? home : ".", ts);
 #endif
     g_bench_file = fopen(path, "w");
@@ -1936,6 +1951,7 @@ static void bench_write(float fps, float frame_ms,
             pages_total, pages_visible);
     fflush(g_bench_file);
 }
+#endif // SCHOLION_DEV
 
 // --- Context menu -----------------------------------------------------------
 
@@ -2312,50 +2328,62 @@ static void new_project() {
     update_window_title();
 }
 
-static bool save_to_path(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "w");
-    if (!f) { fprintf(stderr, "save_project: cannot open %s\n", path.c_str()); return false; }
+// Serialize the entire project state to a JSON string.
+// Must be called on the main thread (reads all global app state).
+// The returned string can then be handed to write_json_file on any thread.
+static std::string build_project_json() {
+    std::string out;
+    out.reserve(128 * 1024);
+    char b[512];
 
     Vec2 offset = g_canvas.get_offset();
-    fprintf(f, "{\n");
-    fprintf(f, "  \"viewport\": { \"x\": %.4f, \"y\": %.4f, \"zoom\": %.6f },\n",
-            offset.x, offset.y, g_canvas.get_zoom());
-    fprintf(f, "  \"note_idx\": %d,\n", g_next_note_idx);
-    fprintf(f, "  \"documents\": [\n");
+    snprintf(b, sizeof(b), "{\n  \"viewport\": { \"x\": %.4f, \"y\": %.4f, \"zoom\": %.6f },\n",
+             offset.x, offset.y, g_canvas.get_zoom());
+    out += b;
+    snprintf(b, sizeof(b), "  \"note_idx\": %d,\n", g_next_note_idx);
+    out += b;
+
+    out += "  \"documents\": [\n";
     for (int di = 0; di < (int)g_documents.size(); ++di) {
         const Document& doc = g_documents[di];
-        fprintf(f, "    {\n");
-        fprintf(f, "      \"path\": \"%s\",\n", doc.path.c_str());
-        fprintf(f, "      \"stack_origin\": [%.4f, %.4f],\n",
-                doc.stack_origin.x, doc.stack_origin.y);
-        fprintf(f, "      \"pages\": [\n");
+        out += "    {\n";
+        out += "      \"path\": \""; out += doc.path; out += "\",\n";
+        snprintf(b, sizeof(b), "      \"stack_origin\": [%.4f, %.4f],\n",
+                 doc.stack_origin.x, doc.stack_origin.y);
+        out += b;
+        out += "      \"pages\": [\n";
         for (int pi = 0; pi < (int)doc.pages.size(); ++pi) {
             const Page& page = doc.pages[pi];
-            fprintf(f, "        { \"index\": %d, \"x\": %.4f, \"y\": %.4f, \"w\": %.2f, \"h\": %.2f }%s\n",
-                    page.page_index, page.world_pos.x, page.world_pos.y,
-                    page.world_w, page.world_h,
-                    pi + 1 < (int)doc.pages.size() ? "," : "");
+            snprintf(b, sizeof(b),
+                     "        { \"index\": %d, \"x\": %.4f, \"y\": %.4f, \"w\": %.2f, \"h\": %.2f }%s\n",
+                     page.page_index, page.world_pos.x, page.world_pos.y,
+                     page.world_w, page.world_h,
+                     pi + 1 < (int)doc.pages.size() ? "," : "");
+            out += b;
         }
-        fprintf(f, "      ]\n");
-        fprintf(f, "    }%s\n", di + 1 < (int)g_documents.size() ? "," : "");
+        out += "      ]\n";
+        snprintf(b, sizeof(b), "    }%s\n", di + 1 < (int)g_documents.size() ? "," : "");
+        out += b;
     }
-    fprintf(f, "  ],\n");
-    fprintf(f, "  \"text_boxes\": [\n");
+    out += "  ],\n";
+
+    out += "  \"text_boxes\": [\n";
     for (int i = 0; i < (int)g_text_boxes.size(); ++i) {
         const auto& box = g_text_boxes[i];
-        std::string esc = json_escape(box.text);
-        fprintf(f, "    { \"id\": %d, \"x\": %.4f, \"y\": %.4f, \"r\": %.3f, \"g\": %.3f, \"b\": %.3f, \"fs\": %.1f, \"w\": %.2f, \"h\": %.2f, \"text\": \"%s\" }%s\n",
-                box.id, box.world_pos.x, box.world_pos.y, box.r, box.g, box.b, box.font_size,
-                box.w, box.h, esc.c_str(),
-                i + 1 < (int)g_text_boxes.size() ? "," : "");
+        snprintf(b, sizeof(b),
+                 "    { \"id\": %d, \"x\": %.4f, \"y\": %.4f, \"r\": %.3f, \"g\": %.3f, \"b\": %.3f, \"fs\": %.1f, \"w\": %.2f, \"h\": %.2f, \"text\": \"",
+                 box.id, box.world_pos.x, box.world_pos.y, box.r, box.g, box.b, box.font_size,
+                 box.w, box.h);
+        out += b;
+        out += json_escape(box.text);
+        snprintf(b, sizeof(b), "\" }%s\n", i + 1 < (int)g_text_boxes.size() ? "," : "");
+        out += b;
     }
-    fprintf(f, "  ],\n");
+    out += "  ],\n";
 
-    // Annotations — flat list, one record per line.
-    // Stroke points follow their stroke header as "{ \"p\": [x, y] }" lines.
-    fprintf(f, "  \"annots\": [\n");
+    out += "  \"annots\": [\n";
     bool first_annot = true;
-    auto sep = [&]{ fprintf(f, first_annot ? "" : ",\n"); first_annot = false; };
+    auto sep = [&]{ if (!first_annot) out += ",\n"; first_annot = false; };
 
     for (int di = 0; di < (int)g_documents.size(); ++di) {
         for (int pi = 0; pi < (int)g_documents[di].pages.size(); ++pi) {
@@ -2363,32 +2391,81 @@ static bool save_to_path(const std::string& path) {
             for (const auto& hl : an.highlights) {
                 sep();
                 if (hl.text.empty()) {
-                    fprintf(f, "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f] }",
-                            di, pi, hl.x0, hl.y0, hl.x1, hl.y1);
+                    snprintf(b, sizeof(b),
+                             "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f] }",
+                             di, pi, hl.x0, hl.y0, hl.x1, hl.y1);
+                    out += b;
                 } else {
-                    std::string esc = json_escape(hl.text.c_str());
-                    fprintf(f, "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f], \"ht\": \"%s\" }",
-                            di, pi, hl.x0, hl.y0, hl.x1, hl.y1, esc.c_str());
+                    snprintf(b, sizeof(b),
+                             "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f], \"ht\": \"",
+                             di, pi, hl.x0, hl.y0, hl.x1, hl.y1);
+                    out += b;
+                    out += json_escape(hl.text.c_str());
+                    out += "\" }";
                 }
             }
             for (const auto& note : an.notes) {
                 sep();
-                fprintf(f, "    { \"doc\": %d, \"page\": %d, \"note\": \"%s\" }",
-                        di, pi, note.label.c_str());
+                snprintf(b, sizeof(b),
+                         "    { \"doc\": %d, \"page\": %d, \"note\": \"%s\" }",
+                         di, pi, note.label.c_str());
+                out += b;
             }
             for (const auto& stroke : an.strokes) {
                 sep();
-                fprintf(f, "    { \"doc\": %d, \"page\": %d, \"sr\": %.5f, \"sg\": %.5f, \"sb\": %.5f }",
-                        di, pi, stroke.r, stroke.g, stroke.b);
+                snprintf(b, sizeof(b),
+                         "    { \"doc\": %d, \"page\": %d, \"sr\": %.5f, \"sg\": %.5f, \"sb\": %.5f }",
+                         di, pi, stroke.r, stroke.g, stroke.b);
+                out += b;
                 for (const auto& pt : stroke.pts) {
-                    fprintf(f, ",\n    { \"p\": [%.6f, %.6f] }", pt.x, pt.y);
+                    snprintf(b, sizeof(b), ",\n    { \"p\": [%.6f, %.6f] }", pt.x, pt.y);
+                    out += b;
                 }
             }
         }
     }
-    if (!first_annot) fprintf(f, "\n");
-    fprintf(f, "  ]\n}\n");
+    if (!first_annot) out += "\n";
+    out += "  ]\n}\n";
+    return out;
+}
+
+// Write a JSON string atomically: write to <path>.tmp then rename.
+// Safe to call from a background thread — no global state is read.
+static bool write_json_file(const std::string& json, const std::string& path) {
+    std::string tmp = path + ".tmp";
+    FILE* f = fopen(tmp.c_str(), "w");
+    if (!f) { fprintf(stderr, "save: cannot open %s\n", tmp.c_str()); return false; }
+    bool ok = fwrite(json.data(), 1, json.size(), f) == json.size();
     fclose(f);
+    if (!ok) { remove(tmp.c_str()); return false; }
+#ifdef _WIN32
+    _unlink(path.c_str());   // rename() on Windows fails if the target exists
+#endif
+    if (rename(tmp.c_str(), path.c_str()) != 0) { remove(tmp.c_str()); return false; }
+    return true;
+}
+
+// True while a background autosave thread is writing to disk.
+static std::atomic<bool> g_autosave_running{false};
+
+// Serialize now (main thread), then write to disk on a background thread.
+// Skips if a previous background save is still in progress — the data is
+// recent enough that the next 60-second tick will capture any missed changes.
+static void start_autosave(const std::string& path) {
+    if (g_autosave_running.exchange(true)) return;
+    std::string json = build_project_json();
+    std::thread([json = std::move(json), path]() mutable {
+        write_json_file(json, path);
+        g_autosave_running.store(false);
+    }).detach();
+}
+
+static bool save_to_path(const std::string& path) {
+    std::string json = build_project_json();
+    if (!write_json_file(json, path)) {
+        fprintf(stderr, "save_project: cannot write %s\n", path.c_str());
+        return false;
+    }
 
     if (g_debug) {
         int s_hl = 0, s_note = 0, s_stroke = 0;
@@ -2401,7 +2478,6 @@ static bool save_to_path(const std::string& path) {
         printf("Project saved: %s — %d text boxes, %d highlights, %d notes, %d strokes\n",
                path.c_str(), (int)g_text_boxes.size(), s_hl, s_note, s_stroke);
     }
-    // Trigger save feedback (manual save by default; auto-save will override)
     if (g_save_feedback_type == SaveFeedbackType::None)
         g_save_feedback_type = SaveFeedbackType::Manual;
     g_save_feedback_time = std::chrono::steady_clock::now();
@@ -2893,6 +2969,7 @@ static void draw_settings_popup() {
         save_prefs();
     }
 
+#ifdef SCHOLION_DEV
     // --- Developer Mode ---
     ImGui::Spacing();
     bool prev_dev = g_settings.developer_mode;
@@ -2911,6 +2988,7 @@ static void draw_settings_popup() {
         }
         save_prefs();
     }
+#endif // SCHOLION_DEV
 
     // --- Keyboard Shortcuts ---
     ImGui::SeparatorText("Keyboard Shortcuts");
@@ -3871,6 +3949,273 @@ static void draw_toolbar_ui() {
 }
 
 // ---------------------------------------------------------------------------
+#ifdef SCHOLION_DEV
+// Automated diagnostic benchmark — launched via --benchmark CLI flag.
+// No PDFs needed. Three phases:
+//   Phase 1: GL texture upload timing at Thumb/Low/High tile sizes (glFinish-timed)
+//   Phase 2: Canvas render FPS with N=[10,50,100,300,500] synthetic pages (vsync off)
+// Writes scholion_diag_<timestamp>.json to the Desktop then exits.
+
+static void run_benchmark(GLFWwindow* w, Renderer& renderer) {
+    // System info --------------------------------------------------------
+    const char* gl_renderer = (const char*)glGetString(GL_RENDERER);
+    const char* gl_vendor   = (const char*)glGetString(GL_VENDOR);
+    const char* gl_version  = (const char*)glGetString(GL_VERSION);
+
+#ifdef __APPLE__
+    const char* platform = "macOS";
+#elif defined(_WIN32)
+    const char* platform = "Windows";
+#else
+    const char* platform = "Linux";
+#endif
+
+    long long ram_mb = 0;
+#ifdef __APPLE__
+    {
+        int mib[2] = { CTL_HW, HW_MEMSIZE };
+        uint64_t physmem = 0;
+        size_t len = sizeof(physmem);
+        if (sysctl(mib, 2, &physmem, &len, nullptr, 0) == 0)
+            ram_mb = static_cast<long long>(physmem / (1024ULL * 1024ULL));
+    }
+#elif defined(_WIN32)
+    {
+        MEMORYSTATUSEX ms;
+        ms.dwLength = sizeof(ms);
+        if (GlobalMemoryStatusEx(&ms))
+            ram_mb = static_cast<long long>(ms.ullTotalPhys / (1024ULL * 1024ULL));
+    }
+#endif
+
+    time_t now_t = time(nullptr);
+    struct tm tm_copy = *localtime(&now_t);
+    char ts[32], fn_ts[32];
+    strftime(ts,    sizeof(ts),    "%Y-%m-%dT%H:%M:%S", &tm_copy);
+    strftime(fn_ts, sizeof(fn_ts), "%Y%m%d_%H%M%S",     &tm_copy);
+
+    // Viewport -----------------------------------------------------------
+    int win_w, win_h, fb_w, fb_h;
+    glfwGetWindowSize(w, &win_w, &win_h);
+    g_canvas.set_viewport_size(static_cast<float>(win_w), static_cast<float>(win_h));
+    glfwGetFramebufferSize(w, &fb_w, &fb_h);
+    glViewport(0, 0, fb_w, fb_h);
+
+    // Progress display ---------------------------------------------------
+    auto show_status = [&](const char* msg) {
+        glfwPollEvents();
+        glfwGetFramebufferSize(w, &fb_w, &fb_h);
+        glViewport(0, 0, fb_w, fb_h);
+        glClearColor(0.12f, 0.12f, 0.15f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplGlfw_NewFrame();
+        ImGui::NewFrame();
+        ImGui::SetNextWindowPos({ fb_w * 0.5f, fb_h * 0.5f },
+                                ImGuiCond_Always, { 0.5f, 0.5f });
+        ImGui::SetNextWindowSize({ 580.0f, 120.0f }, ImGuiCond_Always);
+        ImGui::SetNextWindowBgAlpha(0.88f);
+        ImGui::Begin("##bench_prog", nullptr,
+            ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoResize |
+            ImGuiWindowFlags_NoMove      | ImGuiWindowFlags_NoScrollbar |
+            ImGuiWindowFlags_NoSavedSettings);
+        ImGui::TextWrapped("%s", msg);
+        ImGui::End();
+        ImGui::Render();
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        glfwSwapBuffers(w);
+    };
+
+    // Phase 1: GL upload timing ------------------------------------------
+    struct UploadResult { double p50, p95, max_ms; };
+    struct TierDef      { const char* name; int w, h; };
+    TierDef tiers[3] = {
+        { "thumb",  600,  850  },
+        { "low",   1250, 1750  },
+        { "high",  2500, 3500  },
+    };
+    UploadResult upload[3] = {};
+
+    for (int ti = 0; ti < 3; ++ti) {
+        char prog[128];
+        snprintf(prog, sizeof(prog),
+                 "Benchmark (1/2) — GL upload: %s (%dx%d px)…",
+                 tiers[ti].name, tiers[ti].w, tiers[ti].h);
+        show_status(prog);
+
+        int tw = tiers[ti].w, th = tiers[ti].h;
+        std::vector<uint8_t> data(static_cast<size_t>(tw) * th * 4, 128);
+        GLuint tex = 0;
+        glGenTextures(1, &tex);
+        glBindTexture(GL_TEXTURE_2D, tex);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        for (int i = 0; i < 2; ++i) {   // warmup
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, data.data());
+            glFinish();
+        }
+        double times[5];
+        for (int i = 0; i < 5; ++i) {
+            auto t0 = std::chrono::steady_clock::now();
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, data.data());
+            glFinish();
+            auto t1 = std::chrono::steady_clock::now();
+            times[i] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+        glDeleteTextures(1, &tex);
+        std::sort(times, times + 5);
+        upload[ti] = { times[2], times[4], times[4] };  // n=5: p50=median, p95=max
+    }
+
+    // Phase 2: Canvas render FPS -----------------------------------------
+    // 16 distinct Thumb-sized textures (600×850 RGBA, unique noise per slot)
+    // rotated across pages to exercise the texture sampler and break trivial
+    // GPU L1-cache hits that a single shared texture would allow.
+    static constexpr int THUMB_POOL = 16;
+    static constexpr int THUMB_W    = 600;
+    static constexpr int THUMB_H    = 850;
+    GLuint thumb_pool[THUMB_POOL] = {};
+    {
+        show_status("Benchmark (2/2) — uploading texture pool…");
+        std::vector<uint8_t> px(THUMB_W * THUMB_H * 4);
+        glGenTextures(THUMB_POOL, thumb_pool);
+        for (int ti = 0; ti < THUMB_POOL; ++ti) {
+            // Fill with a unique grey shade per slot so each is a distinct texture.
+            uint8_t v = static_cast<uint8_t>(160 + ti * 6);
+            for (size_t j = 0; j < px.size(); j += 4) {
+                px[j] = v; px[j+1] = v; px[j+2] = v; px[j+3] = 255;
+            }
+            glBindTexture(GL_TEXTURE_2D, thumb_pool[ti]);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, THUMB_W, THUMB_H, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        }
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+    glfwSwapInterval(0);
+
+    const int ns[5]      = { 10, 50, 100, 300, 500 };
+    double    fps_res[5] = {};
+
+    for (int ni = 0; ni < 5; ++ni) {
+        int N = ns[ni];
+        char prog[128];
+        snprintf(prog, sizeof(prog),
+                 "Benchmark (2/2) — Canvas FPS: N=%d pages (2 s run)…", N);
+        show_status(prog);
+
+        const float PAGE_W = 612.0f;
+        const float PAGE_H = 792.0f;
+        const float GAP    = 40.0f;
+        const int   COLS   = 8;
+        int rows = (N + COLS - 1) / COLS;
+
+        std::vector<Document> docs;
+        docs.reserve(N);
+        for (int i = 0; i < N; ++i) {
+            Document doc;
+            doc.hue_r = 0.3f; doc.hue_g = 0.5f; doc.hue_b = 0.8f;
+            Page pg;
+            pg.page_index = 0;
+            int col = i % COLS, row = i / COLS;
+            pg.world_pos  = { static_cast<float>(col) * (PAGE_W + GAP),
+                              static_cast<float>(row) * (PAGE_H + GAP) };
+            pg.world_w    = PAGE_W;
+            pg.world_h    = PAGE_H;
+            pg.tex_thumb  = thumb_pool[i % THUMB_POOL];
+            doc.pages.push_back(pg);
+            docs.push_back(std::move(doc));
+        }
+
+        float total_w = COLS * (PAGE_W + GAP);
+        float total_h = rows * (PAGE_H + GAP);
+        float zoom = std::min(static_cast<float>(win_w) / total_w,
+                              static_cast<float>(win_h) / total_h) * 0.9f;
+        g_canvas.set_zoom(zoom);
+        g_canvas.set_offset({ total_w * 0.5f, total_h * 0.5f });
+
+        double loop_start = glfwGetTime();
+        int    frames     = 0;
+        while (glfwGetTime() - loop_start < 2.0) {
+            glfwPollEvents();
+            glClearColor(0.12f, 0.12f, 0.15f, 1.0f);
+            glClear(GL_COLOR_BUFFER_BIT);
+            renderer.draw(g_canvas, docs, {});
+            glfwSwapBuffers(w);
+            ++frames;
+        }
+        double elapsed = glfwGetTime() - loop_start;
+        fps_res[ni] = elapsed > 0.0 ? frames / elapsed : 0.0;
+    }
+
+    glfwSwapInterval(1);
+    glDeleteTextures(THUMB_POOL, thumb_pool);
+
+    // Build JSON output --------------------------------------------------
+    std::string json;
+    json.reserve(1024);
+    char buf[512];
+    json += "{\n";
+    snprintf(buf, sizeof(buf), "  \"scholion_diag\": 1,\n");             json += buf;
+    snprintf(buf, sizeof(buf), "  \"timestamp\": \"%s\",\n", ts);        json += buf;
+    snprintf(buf, sizeof(buf), "  \"platform\": \"%s\",\n", platform);   json += buf;
+    snprintf(buf, sizeof(buf), "  \"gl_renderer\": \"%s\",\n",
+             gl_renderer ? gl_renderer : "unknown");                      json += buf;
+    snprintf(buf, sizeof(buf), "  \"gl_vendor\": \"%s\",\n",
+             gl_vendor   ? gl_vendor   : "unknown");                      json += buf;
+    snprintf(buf, sizeof(buf), "  \"gl_version\": \"%s\",\n",
+             gl_version  ? gl_version  : "unknown");                      json += buf;
+    snprintf(buf, sizeof(buf), "  \"ram_mb\": %lld,\n", ram_mb);         json += buf;
+    json += "  \"upload_ms\": {\n";
+    const char* tier_names[3] = { "thumb", "low", "high" };
+    for (int i = 0; i < 3; ++i) {
+        snprintf(buf, sizeof(buf),
+                 "    \"%s\": { \"p50\": %.3f, \"p95\": %.3f, \"max\": %.3f }%s\n",
+                 tier_names[i],
+                 upload[i].p50, upload[i].p95, upload[i].max_ms,
+                 i < 2 ? "," : "");
+        json += buf;
+    }
+    json += "  },\n";
+    json += "  \"render_fps\": {\n";
+    for (int i = 0; i < 5; ++i) {
+        snprintf(buf, sizeof(buf), "    \"n%d\": %.1f%s\n",
+                 ns[i], fps_res[i], i < 4 ? "," : "");
+        json += buf;
+    }
+    json += "  }\n}\n";
+
+    // Write to Desktop ---------------------------------------------------
+    char out_path[512];
+#ifdef _WIN32
+    char desktop[MAX_PATH] = {};
+    SHGetFolderPathA(nullptr, CSIDL_DESKTOP, nullptr, 0, desktop);
+    snprintf(out_path, sizeof(out_path),
+             "%s\\scholion_diag_%s.json", desktop, fn_ts);
+#else
+    const char* home_dir = getenv("HOME");
+    snprintf(out_path, sizeof(out_path),
+             "%s/Desktop/scholion_diag_%s.json",
+             home_dir ? home_dir : ".", fn_ts);
+#endif
+
+    if (write_json_file(json, std::string(out_path))) {
+        char done_msg[640];
+        snprintf(done_msg, sizeof(done_msg),
+                 "Done! Diagnostic written to:\n%s\n\nClosing in 3 seconds…", out_path);
+        show_status(done_msg);
+        printf("[benchmark] wrote %s\n", out_path);
+    } else {
+        show_status("Benchmark complete — ERROR: could not write output file.");
+    }
+    glfwWaitEventsTimeout(3.0);
+}
+#endif // SCHOLION_DEV
+
+// ---------------------------------------------------------------------------
 
 int main(int argc, char* argv[]) {
     signal(SIGINT,  scholion_signal_handler);
@@ -3984,6 +4329,21 @@ int main(int argc, char* argv[]) {
         glfwTerminate();
         return 1;
     }
+
+#ifdef SCHOLION_DEV
+    // --benchmark: run synthetic diagnostic and exit (no PDF, no rast thread)
+    for (int i = 1; i < argc; ++i) {
+        if (strcmp(argv[i], "--benchmark") == 0) {
+            run_benchmark(window, renderer);
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplGlfw_Shutdown();
+            ImGui::DestroyContext();
+            glfwDestroyWindow(window);
+            glfwTerminate();
+            return 0;
+        }
+    }
+#endif // SCHOLION_DEV
 
     // Bake an elliptical vignette gradient texture (256×256, single upload).
     // Stretched to the full viewport each frame: the circle in texture-space
@@ -4119,7 +4479,9 @@ int main(int argc, char* argv[]) {
         float  delta_t = static_cast<float>(now_t - last_frame_time);
         last_frame_time = now_t;
         overlay.update(delta_t);
+#ifdef SCHOLION_DEV
         if (g_settings.developer_mode) bench_open();
+#endif
         if (g_input.consume_overlay_toggle()) overlay.toggle();
 
         g_input.update(window);
@@ -4327,7 +4689,9 @@ int main(int argc, char* argv[]) {
                     if (is_page_visible(pg)) ++visible_pages;
                 }
             overlay.set_page_count(visible_pages, total_pages);
+#ifdef SCHOLION_DEV
             bench_write(overlay.fps(), delta_t * 1000.0f, total_pages, visible_pages);
+#endif
         }
 
         // Render save feedback (temporary "Saved!" message)
@@ -4385,9 +4749,10 @@ int main(int argc, char* argv[]) {
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                                now - g_last_save_time).count();
             if (elapsed >= 60) {
-                g_save_feedback_type = SaveFeedbackType::Auto;  // override to show auto-save feedback
-                if (save_to_path(g_project_path))
-                    printf("Autosaved: %s\n", g_project_path.c_str());
+                // Serialize on main thread now (fast); disk write happens in background.
+                g_save_feedback_type = SaveFeedbackType::Auto;
+                g_save_feedback_time = std::chrono::steady_clock::now();
+                start_autosave(g_project_path);
                 g_last_save_time = now;
             }
         }
@@ -4403,6 +4768,15 @@ int main(int argc, char* argv[]) {
     // Final save on clean exit (red button / Cmd+Q) so the last edits since the
     // previous autosave aren't lost. Only when a project path is already set.
     if (!g_project_path.empty() && !g_documents.empty()) {
+        // Wait up to 3 s for any in-flight background autosave before writing
+        // the exit save. The timeout prevents hanging if the background thread
+        // is blocked on a slow disk or network-backed path (e.g. Dropbox).
+        {
+            auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+            while (g_autosave_running.load() &&
+                   std::chrono::steady_clock::now() < deadline)
+                std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
         if (save_to_path(g_project_path))
             printf("Saved on exit: %s\n", g_project_path.c_str());
     }

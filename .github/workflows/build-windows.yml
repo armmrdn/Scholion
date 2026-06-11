@@ -7,6 +7,8 @@ on:
 jobs:
   build-windows:
     runs-on: windows-2022
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: Checkout
@@ -74,10 +76,15 @@ jobs:
       - name: Configure
         shell: msys2 {0}
         run: |
+          SCHOLION_DEV_FLAG=""
+          if [ "${{ github.ref_name }}" = "develop" ]; then
+            SCHOLION_DEV_FLAG="-DSCHOLION_DEV=ON"
+          fi
           cmake -S scholion-win -B scholion-win/build \
             -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DSCHOLION_WITH_MUPDF=ON
+            -DSCHOLION_WITH_MUPDF=ON \
+            $SCHOLION_DEV_FLAG
 
       - name: Build
         shell: msys2 {0}
@@ -103,7 +110,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: Scholion-Windows
+          name: Scholion-Windows-${{ github.ref_name }}
           path: Scholion-Windows/
           retention-days: 30
 
