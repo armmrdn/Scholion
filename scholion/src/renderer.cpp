@@ -410,6 +410,37 @@ void Renderer::draw_pdf_page_quad(const Canvas& canvas, const Page& page,
     glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
 }
 
+void Renderer::draw_pdf_tile_quad(const Canvas& canvas,
+                                   float wx, float wy, float ww, float wh,
+                                   uint32_t tex) {
+    Vec2 tl = canvas.world_to_screen({wx,       wy});
+    Vec2 br = canvas.world_to_screen({wx + ww,  wy + wh});
+
+    float verts[] = {
+        tl.x, tl.y,  0.0f, 0.0f,
+        br.x, tl.y,  1.0f, 0.0f,
+        br.x, br.y,  1.0f, 1.0f,
+        tl.x, tl.y,  0.0f, 0.0f,
+        br.x, br.y,  1.0f, 1.0f,
+        tl.x, br.y,  0.0f, 1.0f,
+    };
+
+    glUseProgram(m_tex_prog);
+    glBindVertexArray(m_tex_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_tex_vbo);
+    glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STREAM_DRAW);
+
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    glUniform1i(m_tex_tex_loc, 0);
+    glUniform1f(m_tex_alpha_loc, 1.0f);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+
+    glUseProgram(m_color_prog);
+    glBindVertexArray(m_vao);
+    glBindBuffer(GL_ARRAY_BUFFER, m_vbo);
+}
+
 // Coordinate systems used throughout this file:
 //   World space  — 1 unit = 1 PDF point (1/72 inch). Page positions, world_w/h,
 //                  and annotation coords are in this space. The canvas pan/zoom
@@ -451,26 +482,71 @@ void Renderer::draw_pdf_pages(const Canvas& canvas, const std::vector<Document>&
 
             static constexpr float STRIPE_H = 10.0f;
 
-            uint32_t tex = page.tex_for_lod(lod);
-            if (tex) {
-                draw_pdf_page_quad(canvas, page, tex);
-                draw_rect(canvas,
-                          page.world_pos.x, page.world_pos.y,
-                          page.world_w, STRIPE_H,
-                          doc.hue_r, doc.hue_g, doc.hue_b, 0.55f);
+            if (lod == LodTier::High && hints.tile_cache && hints.content_scale > 0.0f) {
+                // Tile-based High rendering: Low/Thumb fallback underneath, tiles on top.
+                // This lets the page appear immediately at moderate quality while high-res
+                // tiles stream in one-by-one from the background rasterizer.
+                uint32_t fallback = page.tex_low ? page.tex_low : page.tex_thumb;
+                if (fallback) {
+                    draw_pdf_page_quad(canvas, page, fallback);
+                } else {
+                    float pulse = 0.03f * std::sin(hints.draw_time * 2.5f);
+                    draw_rect(canvas, page.world_pos.x, page.world_pos.y,
+                              page.world_w, page.world_h,
+                              0.95f + pulse, 0.94f + pulse, 0.92f + pulse, 1.0f);
+                }
+                float px_per_wu = dpi_for_lod(LodTier::High) * hints.content_scale / 72.0f;
+                float tile_wu   = static_cast<float>(TILE_PX) / px_per_wu;
+                int n_cols = static_cast<int>(std::ceil(page.world_w / tile_wu));
+                int n_rows = static_cast<int>(std::ceil(page.world_h / tile_wu));
+                for (int row = 0; row < n_rows; ++row) {
+                    for (int col = 0; col < n_cols; ++col) {
+                        auto it = hints.tile_cache->find(
+                            tile_cache_key(doc.path, page.page_index, col, row));
+                        if (it == hints.tile_cache->end()) continue;
+                        float tx = page.world_pos.x + col * tile_wu;
+                        float ty = page.world_pos.y + row * tile_wu;
+                        float tw = std::min(tile_wu, page.world_pos.x + page.world_w  - tx);
+                        float th = std::min(tile_wu, page.world_pos.y + page.world_h - ty);
+                        if (tw > 0.0f && th > 0.0f)
+                            draw_pdf_tile_quad(canvas, tx, ty, tw, th, it->second);
+                    }
+                }
+                draw_rect(canvas, page.world_pos.x, page.world_pos.y,
+                          page.world_w, STRIPE_H, doc.hue_r, doc.hue_g, doc.hue_b, 0.55f);
             } else {
-                // Missing PDF → distinct grey placeholder; otherwise the warm-white
-                // "still loading" placeholder.
-                float fr = 0.95f, fg = 0.94f, fb = 0.92f;
-                if (doc.missing) { fr = 0.28f; fg = 0.28f; fb = 0.31f; }
-                draw_rect(canvas,
-                          page.world_pos.x, page.world_pos.y,
-                          page.world_w, page.world_h,
-                          fr, fg, fb, 1.0f);
-                draw_rect(canvas,
-                          page.world_pos.x, page.world_pos.y,
-                          page.world_w, STRIPE_H,
-                          doc.hue_r, doc.hue_g, doc.hue_b, 0.8f);
+                uint32_t tex = page.tex_for_lod(lod);
+                if (tex) {
+                    draw_pdf_page_quad(canvas, page, tex);
+                    draw_rect(canvas,
+                              page.world_pos.x, page.world_pos.y,
+                              page.world_w, STRIPE_H,
+                              doc.hue_r, doc.hue_g, doc.hue_b, 0.55f);
+                } else {
+                    // Three placeholder states — each with a distinct color:
+                    //   missing PDF  → dark grey (document unresolvable)
+                    //   rast failed  → warm rose (page unreadable; no retry)
+                    //   loading      → warm white with a slow breathing shimmer
+                    float fr, fg, fb;
+                    if (doc.missing) {
+                        fr = 0.28f; fg = 0.28f; fb = 0.31f;
+                    } else if (page.rast_failed) {
+                        fr = 0.96f; fg = 0.89f; fb = 0.88f;
+                    } else {
+                        float pulse = 0.03f * std::sin(hints.draw_time * 2.5f);
+                        fr = 0.95f + pulse;
+                        fg = 0.94f + pulse;
+                        fb = 0.92f + pulse;
+                    }
+                    draw_rect(canvas,
+                              page.world_pos.x, page.world_pos.y,
+                              page.world_w, page.world_h,
+                              fr, fg, fb, 1.0f);
+                    draw_rect(canvas,
+                              page.world_pos.x, page.world_pos.y,
+                              page.world_w, STRIPE_H,
+                              doc.hue_r, doc.hue_g, doc.hue_b, 0.8f);
+                }
             }
 
             // Annotations (highlights + pen strokes) drawn over the page texture

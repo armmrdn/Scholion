@@ -86,3 +86,32 @@ void TextureCache::clear() {
     m_vram_bytes = 0;
     m_tex_sizes.clear();
 }
+
+uint32_t TextureCache::upload_raw(const uint8_t* pixels, int width, int height) {
+    GLuint tex = 0;
+    glGenTextures(1, &tex);
+    glBindTexture(GL_TEXTURE_2D, tex);
+    // Tiles are only shown when zoomed in (no downscaling), so GL_LINEAR suffices.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, width, height, 0,
+                 GL_RGBA, GL_UNSIGNED_BYTE, pixels);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    size_t sz = static_cast<size_t>(width) * height * 4;
+    m_vram_bytes += sz;
+    m_tex_sizes[tex] = sz;
+    return static_cast<uint32_t>(tex);
+}
+
+void TextureCache::free_raw(uint32_t tex) {
+    if (!tex) return;
+    auto it = m_tex_sizes.find(tex);
+    if (it != m_tex_sizes.end()) {
+        m_vram_bytes -= it->second;
+        m_tex_sizes.erase(it);
+    }
+    GLuint h = static_cast<GLuint>(tex);
+    glDeleteTextures(1, &h);
+}

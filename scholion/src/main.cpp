@@ -49,6 +49,7 @@ extern "C" void scholion_activate_app(void);
 #include <set>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -81,6 +82,14 @@ static GLFWwindow*                              g_window  = nullptr;
 static std::vector<Document>                    g_documents;
 static std::vector<std::shared_ptr<PdfLoader>>  g_loaders;   // one per document, same index
 static TextureCache                             g_cache;
+static float                                    g_content_scale = 1.0f;  // set from glfwGetWindowContentScale at init
+static std::unordered_map<std::string, uint32_t> g_tile_cache;           // tile_cache_key → GL handle (High-tier tiles)
+
+// Benchmark counters — always compiled (trivial overhead), read by bench_write() each second.
+static int   g_bench_rast_cancelled = 0;
+static int   g_bench_rast_completed = 0;
+static int   g_bench_rast_perm_fail = 0;
+static float g_bench_frame_ms_max   = 0.0f;
 
 static void before_file_dialog();
 static void after_file_dialog();
@@ -103,12 +112,17 @@ struct RastTask {
     std::string doc_path;
     int         page_index = 0;
     LodTier     tier       = LodTier::Thumb;
+    float       viewport_dist_sq = 0.0f;
+    int         tile_col   = -1;  // -1 = full-page (Thumb/Low); >= 0 = High tile col
+    int         tile_row   = -1;
 };
 struct RastResult {
     std::string              doc_path;
     int                      page_index = 0;
     LodTier                  tier       = LodTier::Thumb;
     PdfLoader::RasterBuffer  buf;
+    int                      tile_col   = -1;
+    int                      tile_row   = -1;
 };
 
 static std::mutex              g_rast_mutex;
@@ -127,8 +141,11 @@ static std::thread             g_rast_thread;
 // one tile's upload cost.
 static constexpr int RAST_READY_MAX = 1;
 
-static std::string rast_key(const std::string& path, int pg, LodTier tier) {
-    return path + '\0' + std::to_string(pg) + '\0' + std::to_string((int)tier);
+static std::string rast_key(const std::string& path, int pg, LodTier tier,
+                             int tc = -1, int tr = -1) {
+    std::string k = path + '\0' + std::to_string(pg) + '\0' + std::to_string((int)tier);
+    if (tc >= 0) { k += '\0'; k += std::to_string(tc); k += '\0'; k += std::to_string(tr); }
+    return k;
 }
 
 static void rast_worker() {
@@ -143,16 +160,19 @@ static void rast_worker() {
             if (g_rast_stop && g_rast_tasks.empty()) break;
             task = std::move(g_rast_tasks.front());
             g_rast_tasks.erase(g_rast_tasks.begin());
-            g_rast_inflight.erase(rast_key(task.doc_path, task.page_index, task.tier));
+            g_rast_inflight.erase(rast_key(task.doc_path, task.page_index, task.tier,
+                                           task.tile_col, task.tile_row));
         }
-        auto buf = task.loader->rasterize_to_buffer(task.page_index, task.tier);
-        if (buf.ok) {
-            {
-                std::lock_guard<std::mutex> lk(g_rast_mutex);
-                g_rast_ready.push_back({task.doc_path, task.page_index, task.tier, std::move(buf)});
-            }
-            glfwPostEmptyEvent();   // wake main loop so the frame renders promptly
+        auto buf = task.loader->rasterize_to_buffer(task.page_index, task.tier,
+                                                     task.tile_col, task.tile_row);
+        // Always push — including failures. drain_rast_results() marks the page as
+        // rast_failed on ok=false so stream_lod() won't re-queue it indefinitely.
+        {
+            std::lock_guard<std::mutex> lk(g_rast_mutex);
+            g_rast_ready.push_back({task.doc_path, task.page_index, task.tier, std::move(buf),
+                                    task.tile_col, task.tile_row});
         }
+        glfwPostEmptyEvent();
     }
 }
 
@@ -168,8 +188,43 @@ static void enqueue_rast(const std::string& doc_path,
     g_rast_cv.notify_one();
 }
 
+// Enqueue a rasterization task for stream_lod(). Under a single lock: cancels
+// any already-queued task for this page at a different tier (stale after a zoom
+// change), then enqueues the new tier. Stale tasks that the worker already
+// started are harmless — drain_rast_results() discards results that no longer
+// match the page's needed tier.
+// viewport_dist_sq: squared world-space distance from the viewport center;
+// used by stream_lod() to sort the queue so the most visible page renders first.
+static void enqueue_rast_cancelling_stale(const std::string& doc_path,
+                                          std::shared_ptr<PdfLoader> loader,
+                                          int page_index, LodTier tier,
+                                          float viewport_dist_sq = 0.0f) {
+    std::string new_key = rast_key(doc_path, page_index, tier);
+    std::lock_guard<std::mutex> lk(g_rast_mutex);
+    // Remove queued tasks for this page at any tier other than the target.
+    auto it = std::remove_if(g_rast_tasks.begin(), g_rast_tasks.end(),
+        [&](const RastTask& t) {
+            // Only cancel full-page tasks (tile_col=-1); tile tasks are managed
+            // separately by cancel_page_tile_tasks().
+            if (t.doc_path != doc_path || t.page_index != page_index ||
+                t.tier == tier || t.tile_col >= 0)
+                return false;
+            g_rast_inflight.erase(rast_key(t.doc_path, t.page_index, t.tier));
+            ++g_bench_rast_cancelled;
+            return true;
+        });
+    g_rast_tasks.erase(it, g_rast_tasks.end());
+    // Enqueue deduplicated.
+    if (g_rast_inflight.count(new_key)) return;
+    g_rast_inflight.insert(new_key);
+    g_rast_tasks.push_back({loader, doc_path, page_index, tier, viewport_dist_sq});
+    g_rast_cv.notify_one();
+}
+
 // Upload all completed pixel buffers to the GPU (main thread only).
-static void drain_rast_results() {
+// Returns true if at least one texture was uploaded this frame — used by
+// stream_lod() to know that VRAM state changed and eviction may be needed.
+static bool drain_rast_results() {
     std::vector<RastResult> ready;
     {
         std::lock_guard<std::mutex> lk(g_rast_mutex);
@@ -177,7 +232,23 @@ static void drain_rast_results() {
     }
     // Tell the worker it can produce the next tile now that we've drained.
     if (!ready.empty()) g_rast_cv.notify_one();
+    bool did_upload = false;
     for (auto& res : ready) {
+        if (res.tile_col >= 0) {
+            // High-tier tile result: upload into g_tile_cache (not page.tex_high).
+            if (!res.buf.ok) continue;  // tile failure is non-fatal; don't mark rast_failed
+            std::string key = tile_cache_key(res.doc_path, res.page_index,
+                                             res.tile_col, res.tile_row);
+            if (g_tile_cache.count(key)) continue;  // already uploaded (race guard)
+            uint32_t tex = g_cache.upload_raw(res.buf.pixels.data(),
+                                               res.buf.width, res.buf.height);
+            g_tile_cache[key] = tex;
+            ++g_bench_rast_completed;
+            did_upload = true;
+            continue;
+        }
+
+        // Full-page result (Thumb / Low tier).
         // Find the page — document may have been removed since task was queued
         Page* target = nullptr;
         for (auto& doc : g_documents) {
@@ -187,8 +258,18 @@ static void drain_rast_results() {
             break;
         }
         if (!target || !target->needs_lod(res.tier)) continue;
+        if (!res.buf.ok) {
+            // Rasterization failed (corrupt page, OOM, MuPDF error). Mark the page
+            // permanently so stream_lod() won't re-queue it and spin the worker.
+            target->rast_failed = true;
+            ++g_bench_rast_perm_fail;
+            continue;
+        }
         g_cache.upload(*target, res.tier, res.buf.pixels.data(), res.buf.width, res.buf.height);
+        ++g_bench_rast_completed;
+        did_upload = true;
     }
+    return did_upload;
 }
 
 // --- Annotation tool state --------------------------------------------------
@@ -526,6 +607,7 @@ static void load_pdf(const std::string& path) {
         fprintf(stderr, "PdfLoader init failed for: %s\n", path.c_str());
         return;
     }
+    loader->set_content_scale(g_content_scale);
 
     Document doc;
     if (!loader->load(path, doc, next_doc_origin())) {
@@ -615,6 +697,8 @@ static Page* next_page_in_order(Page* from, int dir) {
     return nullptr;
 }
 
+static void evict_page_tiles(const std::string&, int);  // defined near stream_lod
+
 static void remove_document(int doc_idx) {
     if (doc_idx < 0 || doc_idx >= (int)g_documents.size()) return;
 
@@ -653,8 +737,10 @@ static void remove_document(int doc_idx) {
         for (auto it = g_rast_inflight.begin(); it != g_rast_inflight.end(); )
             it = (it->rfind(rpath + '\0', 0) == 0) ? g_rast_inflight.erase(it) : std::next(it);
     }
-    for (auto& page : g_documents[doc_idx].pages)
+    for (auto& page : g_documents[doc_idx].pages) {
         g_cache.evict(page);
+        evict_page_tiles(rpath, page.page_index);
+    }
     g_documents.erase(g_documents.begin() + doc_idx);
     g_loaders.erase(g_loaders.begin() + doc_idx);
     // Adjust panel state
@@ -732,39 +818,175 @@ static bool is_page_visible(const Page& page) {
 // are skipped to avoid calling enqueue_rast for a document with no real file.
 static constexpr size_t VRAM_BUDGET = 350ULL * 1024 * 1024;
 
-static void stream_lod() {
+// Returns true if an arbitrary world-space rect overlaps the current viewport.
+static bool is_world_rect_visible(float wx, float wy, float ww, float wh) {
+    Vec2 tl = g_canvas.world_to_screen({wx,       wy});
+    Vec2 br = g_canvas.world_to_screen({wx + ww,  wy + wh});
+    float vw = g_canvas.get_viewport_width();
+    float vh = g_canvas.get_viewport_height();
+    return br.x >= 0.0f && tl.x <= vw && br.y >= 0.0f && tl.y <= vh;
+}
+
+// Enqueue a single High-tier tile for background rasterization.
+static void enqueue_tile_rast(const std::string& doc_path,
+                               const std::shared_ptr<PdfLoader>& loader,
+                               int page_index, int tile_col, int tile_row,
+                               float viewport_dist_sq = 0.0f) {
+    std::string key = rast_key(doc_path, page_index, LodTier::High, tile_col, tile_row);
+    std::lock_guard<std::mutex> lk(g_rast_mutex);
+    if (g_rast_inflight.count(key)) return;
+    g_rast_inflight.insert(key);
+    g_rast_tasks.push_back({loader, doc_path, page_index, LodTier::High,
+                             viewport_dist_sq, tile_col, tile_row});
+    g_rast_cv.notify_one();
+}
+
+// Release all cached High-tier tile textures for one page and remove the cache entries.
+static void evict_page_tiles(const std::string& doc_path, int page_index) {
+    std::string prefix = doc_path + '\0' + std::to_string(page_index) + '\0';
+    for (auto it = g_tile_cache.begin(); it != g_tile_cache.end(); ) {
+        if (it->first.size() > prefix.size() &&
+            it->first.compare(0, prefix.size(), prefix) == 0) {
+            g_cache.free_raw(it->second);
+            it = g_tile_cache.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Cancel any queued (not yet started) tile tasks for one page.
+static void cancel_page_tile_tasks(const std::string& doc_path, int page_index) {
+    std::lock_guard<std::mutex> lk(g_rast_mutex);
+    auto it = std::remove_if(g_rast_tasks.begin(), g_rast_tasks.end(),
+        [&](const RastTask& t) {
+            if (t.doc_path != doc_path || t.page_index != page_index || t.tile_col < 0)
+                return false;
+            g_rast_inflight.erase(rast_key(t.doc_path, t.page_index, t.tier,
+                                           t.tile_col, t.tile_row));
+            ++g_bench_rast_cancelled;
+            return true;
+        });
+    g_rast_tasks.erase(it, g_rast_tasks.end());
+}
+
+// For each viewport-visible tile of a page that is not yet in g_tile_cache,
+// enqueue a rasterization task sorted by proximity to the viewport center.
+static void enqueue_visible_high_tiles(const Document& doc,
+                                        const std::shared_ptr<PdfLoader>& loader,
+                                        const Page& page, Vec2 vp_center) {
+    float px_per_wu = dpi_for_lod(LodTier::High) * g_content_scale / 72.0f;
+    float tile_wu   = static_cast<float>(TILE_PX) / px_per_wu;
+    int   n_cols    = static_cast<int>(std::ceil(page.world_w / tile_wu));
+    int   n_rows    = static_cast<int>(std::ceil(page.world_h / tile_wu));
+
+    for (int row = 0; row < n_rows; ++row) {
+        for (int col = 0; col < n_cols; ++col) {
+            if (g_tile_cache.count(tile_cache_key(doc.path, page.page_index, col, row)))
+                continue;  // already cached
+
+            float tx = page.world_pos.x + col * tile_wu;
+            float ty = page.world_pos.y + row * tile_wu;
+            float tw = (tx + tile_wu < page.world_pos.x + page.world_w)
+                           ? tile_wu : (page.world_pos.x + page.world_w - tx);
+            float th = (ty + tile_wu < page.world_pos.y + page.world_h)
+                           ? tile_wu : (page.world_pos.y + page.world_h - ty);
+            // Prefetch one tile margin outside the viewport so tiles are ready when
+            // the user pans. Expanding the tile rect by tile_wu on each side is
+            // equivalent to asking "is this tile within tile_wu of the viewport edge."
+            // Visible tiles still sort to the front of the queue (smaller dist_sq).
+            if (!is_world_rect_visible(tx - tile_wu, ty - tile_wu,
+                                       tw + 2.0f * tile_wu, th + 2.0f * tile_wu)) continue;
+
+            float tcx = tx + tw * 0.5f - vp_center.x;
+            float tcy = ty + th * 0.5f - vp_center.y;
+            enqueue_tile_rast(doc.path, loader, page.page_index, col, row,
+                              tcx * tcx + tcy * tcy);
+        }
+    }
+}
+
+static void stream_lod(bool vram_changed) {
     if (g_documents.empty()) return;
+
+    // Skip entirely when the viewport hasn't moved, no texture was just uploaded
+    // (VRAM state unchanged), and no tasks are waiting in the queue. This keeps
+    // the CPU from polling every frame on a still canvas.
+    {
+        static float s_last_zoom  = -1.0f;
+        static float s_last_off_x = 0.0f;
+        static float s_last_off_y = 0.0f;
+        float cur_zoom = g_canvas.get_zoom();
+        Vec2  cur_off  = g_canvas.get_offset();
+        bool view_changed = (cur_zoom != s_last_zoom ||
+                             cur_off.x != s_last_off_x ||
+                             cur_off.y != s_last_off_y);
+        bool tasks_pending;
+        { std::lock_guard<std::mutex> lk(g_rast_mutex); tasks_pending = !g_rast_tasks.empty(); }
+        if (!view_changed && !vram_changed && !tasks_pending) return;
+        s_last_zoom  = cur_zoom;
+        s_last_off_x = cur_off.x;
+        s_last_off_y = cur_off.y;
+    }
 
     LodTier target = lod_for_zoom(g_canvas.get_zoom());
     if (g_settings.compat_mode && target == LodTier::High)
         target = LodTier::Low;
+
+    // Viewport center in world space — used to score each enqueued task so the
+    // worker rasterizes the page closest to where the user is looking first.
+    Vec2 vp_center = g_canvas.screen_to_world(
+        {g_canvas.get_viewport_width() * 0.5f, g_canvas.get_viewport_height() * 0.5f});
 
     for (int di = 0; di < (int)g_documents.size(); ++di) {
         auto& doc    = g_documents[di];
         auto& loader = g_loaders[di];
         if (!loader) continue;   // placeholder (missing PDF) — nothing to rasterize
 
-        // Don't evict High tier for pages in the currently open panel document.
-        // The panel independently loads High tier (300 DPI) regardless of canvas zoom.
-        bool is_panel_doc = g_input.panel_open() && (di == g_input.panel_doc_index());
-
         for (auto& page : doc.pages) {
             bool vis = is_page_visible(page);
 
             if (vis) {
-                if (page.needs_lod(target))
-                    enqueue_rast(doc.path, loader, page.page_index, target);
-                if (!is_panel_doc && target < LodTier::High && page.tex_high)
-                    g_cache.evict_tier(page, LodTier::High);
-                if (target < LodTier::Low  && page.tex_low)
+                if (target == LodTier::High) {
+                    // Tile-based: only rasterize the viewport-visible tiles.
+                    enqueue_visible_high_tiles(doc, loader, page, vp_center);
+                } else {
+                    if (page.needs_lod(target)) {
+                        float cx = page.world_pos.x + page.world_w * 0.5f - vp_center.x;
+                        float cy = page.world_pos.y + page.world_h * 0.5f - vp_center.y;
+                        enqueue_rast_cancelling_stale(doc.path, loader, page.page_index, target,
+                                                      cx*cx + cy*cy);
+                    }
+                    // Zoom dropped below High: evict tiles + cancel pending tile tasks.
+                    evict_page_tiles(doc.path, page.page_index);
+                    cancel_page_tile_tasks(doc.path, page.page_index);
+                    if (page.tex_high)
+                        g_cache.evict_tier(page, LodTier::High);
+                }
+                if (target < LodTier::Low && page.tex_low)
                     g_cache.evict_tier(page, LodTier::Low);
             } else {
-                if (!is_panel_doc && page.tex_high)
+                // Off-screen: evict tiles and High immediately; Low only under budget pressure.
+                evict_page_tiles(doc.path, page.page_index);
+                cancel_page_tile_tasks(doc.path, page.page_index);
+                if (page.tex_high)
                     g_cache.evict_tier(page, LodTier::High);
                 if (page.tex_low && g_cache.vram_bytes() > VRAM_BUDGET)
                     g_cache.evict_tier(page, LodTier::Low);
             }
         }
+    }
+
+    // Re-sort the pending task queue so the worker always starts with the page
+    // nearest the viewport center. Tasks added from other sites (panel, initial
+    // Thumb load) keep their position and are sorted into place next frame.
+    {
+        std::lock_guard<std::mutex> lk(g_rast_mutex);
+        if (g_rast_tasks.size() > 1)
+            std::stable_sort(g_rast_tasks.begin(), g_rast_tasks.end(),
+                [](const RastTask& a, const RastTask& b) {
+                    return a.viewport_dist_sq < b.viewport_dist_sq;
+                });
     }
 }
 
@@ -1875,11 +2097,14 @@ static void reveal_in_file_manager(const std::string& path) {
 
 // --- Benchmark logger -------------------------------------------------------
 // Activated by the Developer Mode checkbox in Settings.
-// Writes scholion_perf_<timestamp>.csv to the user's Desktop (Windows) or
-// home directory (macOS/Linux) once per second. Zero UI impact.
+// Writes scholion_perf_<timestamp>.csv to the user's Desktop once per second.
 //
-// Columns: elapsed_s, fps, frame_ms, vram_used_mb, vram_budget_mb,
-//          rast_queue, ram_mb, pages_total, pages_visible
+// Columns: elapsed_s, fps, frame_ms, frame_ms_max, vram_used_mb,
+//          rast_queue, rast_cancelled, rast_completed, rast_perm_fail,
+//          ram_mb, pages_total, pages_visible, pages_thumb, pages_low, pages_high
+//
+// Counters are declared near the top globals so pipeline functions can increment
+// them without forward-reference issues. bench_write() reads and resets them.
 
 static float get_process_ram_mb() {
 #ifdef _WIN32
@@ -1904,7 +2129,6 @@ static double g_bench_last_write = -1.0;
 
 static void bench_open() {
     if (g_bench_file) return;
-    // Build a timestamped filename on the user's Desktop / home dir.
     char path[512];
     time_t t = time(nullptr);
     struct tm* tm_info = localtime(&t);
@@ -1922,33 +2146,59 @@ static void bench_open() {
     g_bench_file = fopen(path, "w");
     if (g_bench_file) {
         fprintf(g_bench_file,
-            "elapsed_s,fps,frame_ms,vram_used_mb,vram_budget_mb,"
-            "rast_queue,ram_mb,pages_total,pages_visible\n");
+            "elapsed_s,fps,frame_ms,frame_ms_max,"
+            "vram_used_mb,rast_queue,"
+            "rast_cancelled,rast_completed,rast_perm_fail,"
+            "ram_mb,pages_total,pages_visible,"
+            "pages_thumb,pages_low,pages_high\n");
         fflush(g_bench_file);
         printf("[benchmark] logging to %s\n", path);
     }
     g_bench_start = glfwGetTime();
+    // Reset running counters so they reflect this session only.
+    g_bench_rast_cancelled = 0;
+    g_bench_rast_completed = 0;
+    g_bench_rast_perm_fail = 0;
+    g_bench_frame_ms_max   = 0.0f;
 }
 
 static void bench_write(float fps, float frame_ms,
                         int pages_total, int pages_visible) {
     if (!g_bench_file) return;
     double now = glfwGetTime();
-    if (now - g_bench_last_write < 1.0) return;   // once per second
+    if (now - g_bench_last_write < 1.0) return;
     g_bench_last_write = now;
 
-    float vram_used_mb   = static_cast<float>(g_cache.vram_bytes()) / (1024.0f * 1024.0f);
-    float vram_budget_mb = static_cast<float>(VRAM_BUDGET)          / (1024.0f * 1024.0f);
-    int   rast_queue     = 0;
+    float vram_used_mb = static_cast<float>(g_cache.vram_bytes()) / (1024.0f * 1024.0f);
+    int   rast_queue   = 0;
     { std::lock_guard<std::mutex> lk(g_rast_mutex); rast_queue = (int)g_rast_tasks.size(); }
-    float ram_mb         = get_process_ram_mb();
+    float ram_mb = get_process_ram_mb();
 
-    fprintf(g_bench_file, "%.1f,%.1f,%.2f,%.1f,%.1f,%d,%.1f,%d,%d\n",
-            now - g_bench_start,
-            fps, frame_ms,
-            vram_used_mb, vram_budget_mb,
-            rast_queue, ram_mb,
-            pages_total, pages_visible);
+    // Per-tier page counts — tells you what the renderer is actually drawing.
+    int pages_thumb = 0, pages_low = 0, pages_high = 0;
+    for (const auto& doc : g_documents)
+        for (const auto& pg : doc.pages) {
+            if      (pg.tex_high)  ++pages_high;
+            else if (pg.tex_low)   ++pages_low;
+            else if (pg.tex_thumb) ++pages_thumb;
+        }
+
+    // Snapshot and reset the worst-frame tracker for the next 1-second window.
+    float frame_ms_max    = g_bench_frame_ms_max;
+    g_bench_frame_ms_max  = 0.0f;
+
+    fprintf(g_bench_file,
+        "%.1f,%.1f,%.2f,%.2f,"
+        "%.1f,%d,"
+        "%d,%d,%d,"
+        "%.1f,%d,%d,"
+        "%d,%d,%d\n",
+        now - g_bench_start,
+        fps, frame_ms, frame_ms_max,
+        vram_used_mb, rast_queue,
+        g_bench_rast_cancelled, g_bench_rast_completed, g_bench_rast_perm_fail,
+        ram_mb, pages_total, pages_visible,
+        pages_thumb, pages_low, pages_high);
     fflush(g_bench_file);
 }
 #endif // SCHOLION_DEV
@@ -3417,11 +3667,11 @@ static void draw_panel_ui() {
     for (int pi = 0; pi < (int)doc.pages.size(); ++pi) {
         Page& page = doc.pages[pi];
 
-        // Panel always targets High tier (300 DPI), independent of canvas zoom.
-        // Enqueue on demand; tex_for_lod falls back to Low/Thumb while High loads.
-        if (page.needs_lod(LodTier::High) && g_loaders[doc_idx])
-            enqueue_rast(doc.path, g_loaders[doc_idx], page.page_index, LodTier::High);
-        uint32_t tex = page.tex_for_lod(LodTier::High);
+        // Panel uses Low tier (150 DPI); sufficient for the panel's ~360px display width.
+        // High-tier tiles are managed by stream_lod for canvas use only.
+        if (page.needs_lod(LodTier::Low) && g_loaders[doc_idx])
+            enqueue_rast(doc.path, g_loaders[doc_idx], page.page_index, LodTier::Low);
+        uint32_t tex = page.tex_for_lod(LodTier::Low);
 
         float img_w = avail_w;
         float img_h = (page.world_w > 0.0f)
@@ -3950,13 +4200,13 @@ static void draw_toolbar_ui() {
 
 // ---------------------------------------------------------------------------
 #ifdef SCHOLION_DEV
-// Automated diagnostic benchmark — launched via --benchmark CLI flag.
-// No PDFs needed. Three phases:
-//   Phase 1: GL texture upload timing at Thumb/Low/High tile sizes (glFinish-timed)
-//   Phase 2: Canvas render FPS with N=[10,50,100,300,500] synthetic pages (vsync off)
+// Automated diagnostic benchmark — launched via --benchmark [pdf_path] CLI flag.
+//   Phase 1: GL texture upload latency at Thumb/Low/High sizes (glFinish-timed, synthetic)
+//   Phase 2: Canvas render FPS at N=[10,50,100,300,500] synthetic pages (vsync off)
+//   Phase 3: Real MuPDF rasterization time per tier on an actual PDF (if provided)
 // Writes scholion_diag_<timestamp>.json to the Desktop then exits.
 
-static void run_benchmark(GLFWwindow* w, Renderer& renderer) {
+static void run_benchmark(GLFWwindow* w, Renderer& renderer, const char* pdf_path = nullptr) {
     // System info --------------------------------------------------------
     const char* gl_renderer = (const char*)glGetString(GL_RENDERER);
     const char* gl_vendor   = (const char*)glGetString(GL_VENDOR);
@@ -4154,6 +4404,69 @@ static void run_benchmark(GLFWwindow* w, Renderer& renderer) {
     glfwSwapInterval(1);
     glDeleteTextures(THUMB_POOL, thumb_pool);
 
+    // Phase 3: Real PDF rasterization timing -----------------------------
+    // Only runs when a PDF path is passed: --benchmark /path/to/file.pdf
+    // Measures actual MuPDF rasterize_to_buffer() time — wall-clock CPU
+    // work per page per tier — which synthetic Phase 1 cannot capture.
+    struct RastPhase3 {
+        bool    ran       = false;
+        bool    load_ok   = false;
+        int     page_count = 0;
+        int     pages_tested = 0;   // min(page_count, 3)
+        struct TierResult {
+            double p50_ms = 0, max_ms = 0;
+            int    w = 0, h = 0;
+            float  mb = 0.0f;
+            bool   ok = false;
+        } tiers[3];
+    } phase3;
+
+    if (pdf_path) {
+        phase3.ran = true;
+        show_status("Benchmark (3/3) — loading PDF for real rasterization timing…");
+        PdfLoader p3_loader;
+        p3_loader.set_content_scale(g_content_scale);
+        Document  p3_doc;
+        phase3.load_ok = p3_loader.load(pdf_path, p3_doc, {});
+        if (phase3.load_ok) {
+            phase3.page_count  = static_cast<int>(p3_doc.pages.size());
+            phase3.pages_tested = std::min(phase3.page_count, 3);
+
+            const LodTier TIERS[3] = { LodTier::Thumb, LodTier::Low, LodTier::High };
+            const char*   TNAMES[3] = { "thumb", "low", "high" };
+            for (int ti = 0; ti < 3; ++ti) {
+                char prog[256];
+                snprintf(prog, sizeof(prog),
+                         "Benchmark (3/3) — MuPDF rasterize: %s tier, %d pages…",
+                         TNAMES[ti], phase3.pages_tested);
+                show_status(prog);
+
+                std::vector<double> times;
+                times.reserve(phase3.pages_tested);
+                for (int pi = 0; pi < phase3.pages_tested; ++pi) {
+                    auto t0  = std::chrono::steady_clock::now();
+                    auto buf = p3_loader.rasterize_to_buffer(pi, TIERS[ti]);
+                    auto t1  = std::chrono::steady_clock::now();
+                    if (!buf.ok) continue;
+                    times.push_back(
+                        std::chrono::duration<double, std::milli>(t1 - t0).count());
+                    if (pi == 0) {   // record dimensions from the first page
+                        phase3.tiers[ti].w  = buf.width;
+                        phase3.tiers[ti].h  = buf.height;
+                        phase3.tiers[ti].mb = static_cast<float>(
+                            (size_t)buf.width * buf.height * 4) / (1024.0f * 1024.0f);
+                    }
+                }
+                if (!times.empty()) {
+                    std::sort(times.begin(), times.end());
+                    phase3.tiers[ti].p50_ms = times[times.size() / 2];
+                    phase3.tiers[ti].max_ms  = times.back();
+                    phase3.tiers[ti].ok      = true;
+                }
+            }
+        }
+    }
+
     // Build JSON output --------------------------------------------------
     std::string json;
     json.reserve(1024);
@@ -4185,6 +4498,44 @@ static void run_benchmark(GLFWwindow* w, Renderer& renderer) {
         snprintf(buf, sizeof(buf), "    \"n%d\": %.1f%s\n",
                  ns[i], fps_res[i], i < 4 ? "," : "");
         json += buf;
+    }
+    json += "  },\n";
+
+    // Phase 3 — real PDF rasterization (present only when --benchmark <pdf> was used)
+    json += "  \"rast_real\": {\n";
+    if (!phase3.ran) {
+        json += "    \"skipped\": \"no PDF provided (usage: --benchmark /path/to/file.pdf)\"\n";
+    } else if (!phase3.load_ok) {
+        snprintf(buf, sizeof(buf), "    \"error\": \"could not open %s\"\n",
+                 pdf_path ? pdf_path : "");
+        json += buf;
+    } else {
+        snprintf(buf, sizeof(buf), "    \"pdf\": \"%s\",\n", pdf_path);      json += buf;
+        snprintf(buf, sizeof(buf), "    \"page_count\": %d,\n",
+                 phase3.page_count);                                          json += buf;
+        snprintf(buf, sizeof(buf), "    \"pages_tested\": %d,\n",
+                 phase3.pages_tested);                                        json += buf;
+        snprintf(buf, sizeof(buf), "    \"content_scale\": %.2f,\n",
+                 g_content_scale);                                            json += buf;
+        const char* tn[3] = { "thumb", "low", "high" };
+        json += "    \"tiers\": {\n";
+        for (int i = 0; i < 3; ++i) {
+            const auto& tr = phase3.tiers[i];
+            if (tr.ok) {
+                snprintf(buf, sizeof(buf),
+                    "      \"%s\": { \"p50_ms\": %.1f, \"max_ms\": %.1f,"
+                    " \"w\": %d, \"h\": %d, \"mb\": %.2f }%s\n",
+                    tn[i], tr.p50_ms, tr.max_ms,
+                    tr.w, tr.h, tr.mb,
+                    i < 2 ? "," : "");
+            } else {
+                snprintf(buf, sizeof(buf),
+                    "      \"%s\": { \"error\": \"rasterization failed\" }%s\n",
+                    tn[i], i < 2 ? "," : "");
+            }
+            json += buf;
+        }
+        json += "    }\n";
     }
     json += "  }\n}\n";
 
@@ -4252,6 +4603,12 @@ int main(int argc, char* argv[]) {
     }
 
     glfwMakeContextCurrent(window);
+
+    {
+        float sx = 1.0f, sy = 1.0f;
+        glfwGetWindowContentScale(window, &sx, &sy);
+        g_content_scale = sx;
+    }
 
 #ifdef _WIN32
     // Load all OpenGL 3.3 core function pointers via GLAD.
@@ -4331,10 +4688,13 @@ int main(int argc, char* argv[]) {
     }
 
 #ifdef SCHOLION_DEV
-    // --benchmark: run synthetic diagnostic and exit (no PDF, no rast thread)
+    // --benchmark [pdf]: run diagnostic and exit. Optional PDF path enables Phase 3
+    // (real MuPDF rasterization timing). Example:
+    //   ./Scholion --benchmark /path/to/paper.pdf
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--benchmark") == 0) {
-            run_benchmark(window, renderer);
+            const char* bench_pdf = (i + 1 < argc && argv[i+1][0] != '-') ? argv[i+1] : nullptr;
+            run_benchmark(window, renderer, bench_pdf);
             ImGui_ImplOpenGL3_Shutdown();
             ImGui_ImplGlfw_Shutdown();
             ImGui::DestroyContext();
@@ -4479,13 +4839,14 @@ int main(int argc, char* argv[]) {
         float  delta_t = static_cast<float>(now_t - last_frame_time);
         last_frame_time = now_t;
         overlay.update(delta_t);
+        { float ms = delta_t * 1000.0f; if (ms > g_bench_frame_ms_max) g_bench_frame_ms_max = ms; }
 #ifdef SCHOLION_DEV
         if (g_settings.developer_mode) bench_open();
 #endif
         if (g_input.consume_overlay_toggle()) overlay.toggle();
 
         g_input.update(window);
-        drain_rast_results();
+        bool rast_uploaded = drain_rast_results();
 #ifdef __APPLE__
         {
             char pending_path[4096];
@@ -4498,7 +4859,7 @@ int main(int argc, char* argv[]) {
             }
         }
 #endif
-        stream_lod();
+        stream_lod(rast_uploaded);
 
         // --- Page drag undo tracking -------------------------------------------
         // Snapshot positions when a drag begins; push undo record when it ends.
@@ -4678,6 +5039,9 @@ int main(int argc, char* argv[]) {
         hints.box_cur_world   = g_input.box_cur_world();
         hints.grid_mode      = g_settings.grid_mode;
         hints.dark_mode      = g_settings.dark_mode;
+        hints.draw_time      = (float)glfwGetTime();
+        hints.tile_cache     = &g_tile_cache;
+        hints.content_scale  = g_content_scale;
         renderer.draw(g_canvas, g_documents, hints);
 
         // Page counter: visible pages / total pages across all documents.

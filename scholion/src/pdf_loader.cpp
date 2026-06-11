@@ -7,8 +7,17 @@
 #include <cstring>
 
 
+void PdfLoader::set_content_scale(float s) {
+    // Cap at 1.5× — enough to match physical pixels on 2× Retina at normal reading
+    // zoom without the 4× VRAM cost of a full 2× DPI multiplier.
+    m_content_scale = (s > 1.5f) ? 1.5f : (s < 1.0f ? 1.0f : s);
+}
+
 PdfLoader::PdfLoader() {
-    m_ctx = fz_new_context(nullptr, nullptr, FZ_STORE_UNLIMITED);
+    // 96 MB cap per loader (one per document). MuPDF's LRU evicts glyph/image
+    // cache under pressure rather than growing without bound, preventing the
+    // runaway RAM growth that causes unexpected quits on long sessions.
+    m_ctx = fz_new_context(nullptr, nullptr, 96ULL * 1024 * 1024);
     if (m_ctx)
         fz_register_document_handlers(m_ctx);
     else
@@ -82,7 +91,7 @@ bool PdfLoader::rasterize_and_upload(Page& page, LodTier tier, TextureCache& cac
     if (!m_ctx || !m_doc) return false;
     if (!page.needs_lod(tier)) return true;   // already on GPU
 
-    float dpi   = dpi_for_lod(tier);
+    float dpi   = dpi_for_lod(tier) * m_content_scale;
     float scale = dpi / 72.0f;
 
     fz_page* fz_pg = nullptr;
@@ -128,11 +137,13 @@ void PdfLoader::rasterize_all(Document& doc, LodTier tier, TextureCache& cache) 
         rasterize_and_upload(page, tier, cache);
 }
 
-PdfLoader::RasterBuffer PdfLoader::rasterize_to_buffer(int page_index, LodTier tier) {
+PdfLoader::RasterBuffer PdfLoader::rasterize_to_buffer(int page_index, LodTier tier,
+                                                         int tile_col, int tile_row,
+                                                         int tile_size) {
     RasterBuffer result;
     if (!m_ctx || !m_doc) return result;
 
-    float dpi   = dpi_for_lod(tier);
+    float dpi   = dpi_for_lod(tier) * m_content_scale;
     float scale = dpi / 72.0f;
 
     fz_page* fz_pg = nullptr;
@@ -142,6 +153,19 @@ PdfLoader::RasterBuffer PdfLoader::rasterize_to_buffer(int page_index, LodTier t
     fz_matrix matrix = fz_scale(scale, scale);
     fz_rect   bounds = fz_bound_page(m_ctx, fz_pg);
     fz_irect  bbox   = fz_round_rect(fz_transform_rect(bounds, matrix));
+
+    // Clip to a single tile when rendering High-tier tiles.
+    // tile_col/row index into page-raster pixel space (origin = page top-left).
+    if (tile_col >= 0 && tile_row >= 0) {
+        fz_irect tile_box;
+        tile_box.x0 = bbox.x0 + tile_col * tile_size;
+        tile_box.y0 = bbox.y0 + tile_row * tile_size;
+        tile_box.x1 = (tile_box.x0 + tile_size < bbox.x1) ? tile_box.x0 + tile_size : bbox.x1;
+        tile_box.y1 = (tile_box.y0 + tile_size < bbox.y1) ? tile_box.y0 + tile_size : bbox.y1;
+        if (tile_box.x1 > tile_box.x0 && tile_box.y1 > tile_box.y0)
+            bbox = tile_box;
+        else { fz_drop_page(m_ctx, fz_pg); return result; }
+    }
 
     fz_pixmap* pix = nullptr;
     fz_try(m_ctx) {
@@ -323,7 +347,7 @@ PdfLoader::~PdfLoader() {}
 bool PdfLoader::load(const std::string&, Document&, Vec2)                     { return false; }
 bool PdfLoader::rasterize_and_upload(Page&, LodTier, TextureCache&)           { return false; }
 void PdfLoader::rasterize_all(Document&, LodTier, TextureCache&)              {}
-PdfLoader::RasterBuffer PdfLoader::rasterize_to_buffer(int, LodTier)         { return {}; }
+PdfLoader::RasterBuffer PdfLoader::rasterize_to_buffer(int, LodTier, int, int, int) { return {}; }
 std::string PdfLoader::extract_text(int)                                      { return {}; }
 std::vector<PdfLoader::SearchHit> PdfLoader::search_text(const std::string&, int) { return {}; }
 const std::vector<CharQuad>& PdfLoader::get_char_quads(int)                  { static std::vector<CharQuad> empty; return empty; }
