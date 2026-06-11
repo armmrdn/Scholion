@@ -57,7 +57,12 @@ public:
         int height = 0;
         bool ok    = false;
     };
-    RasterBuffer rasterize_to_buffer(int page_index, LodTier tier);
+    /// tile_col / tile_row: when both are >= 0, clip rasterization to that
+    /// TILE_PX × TILE_PX tile in page-raster pixel space (used for High tier).
+    /// Pass -1 / -1 for a full-page rasterization (Thumb / Low).
+    RasterBuffer rasterize_to_buffer(int page_index, LodTier tier,
+                                      int tile_col = -1, int tile_row = -1,
+                                      int tile_size = TILE_PX);
 
     /// Extract all text from one page as a UTF-8 string (newlines at line ends).
     /// Not thread-safe against concurrent rasterization on the same loader.
@@ -75,9 +80,15 @@ public:
     /// Returns an empty vector for pages with no selectable text.
     const std::vector<CharQuad>& get_char_quads(int page_index);
 
+    /// Set the display content scale (e.g. 2.0 on Retina). Applied as a DPI
+    /// multiplier (capped at 1.5×) on every subsequent rasterization call so
+    /// textures match the physical pixel density of the display.
+    void set_content_scale(float s);
+
 private:
     fz_context*  m_ctx = nullptr;
     fz_document* m_doc = nullptr;
+    float        m_content_scale = 1.0f;
 
     std::unordered_map<int, std::vector<CharQuad>> m_char_cache;
 };

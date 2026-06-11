@@ -5,6 +5,21 @@
 #include <string>
 #include <vector>
 
+// --- Tile rendering ---------------------------------------------------------
+
+/// Native pixel size of one High-tier tile.
+/// 512 px keeps each tile under 1 MB (512×512×4 = 1 MB RGBA) and gives 9–35
+/// tiles per A4/Letter page at 300 DPI, so only the visible portion is rasterized.
+inline constexpr int TILE_PX = 512;
+
+/// Key for g_tile_cache (main.cpp) and the rasterizer inflight set.
+/// Null-byte separators prevent path characters from colliding with field delimiters.
+inline std::string tile_cache_key(const std::string& path, int page_idx, int col, int row) {
+    return path + '\0' + std::to_string(page_idx)
+                + '\0' + std::to_string(col)
+                + '\0' + std::to_string(row);
+}
+
 // --- LOD tiers --------------------------------------------------------------
 
 /// Rasterization quality tier, chosen by zoom level to avoid wasting VRAM
@@ -82,6 +97,10 @@ struct Page {
     uint32_t tex_low   = 0;         // GL texture handle for Low tier
     uint32_t tex_high  = 0;         // GL texture handle for High tier
 
+    // Set by drain_rast_results() when MuPDF returns ok=false. Suppresses all
+    // future rasterization attempts so a corrupt/unreadable page doesn't loop.
+    bool rast_failed = false;
+
     /// Best available texture for the requested tier.
     /// Falls back to any loaded tier rather than returning 0.
     uint32_t tex_for_lod(LodTier tier) const {
@@ -97,6 +116,7 @@ struct Page {
     }
 
     bool needs_lod(LodTier tier) const {
+        if (rast_failed) return false;   // permanently unreadable — don't retry
         switch (tier) {
             case LodTier::Thumb: return tex_thumb == 0;
             case LodTier::Low:   return tex_low   == 0;

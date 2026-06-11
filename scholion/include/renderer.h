@@ -2,6 +2,8 @@
 
 #include "canvas.h"
 #include "document.h"
+#include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -24,6 +26,17 @@ struct DrawHints {
     // Canvas settings
     GridMode grid_mode = GridMode::Lines;
     bool     dark_mode = true;
+
+    // Time in seconds since app start — drives the loading shimmer animation.
+    float draw_time = 0.0f;
+
+    // High-tier tile cache: maps tile_cache_key() → GL texture handle.
+    // nullptr disables tiled rendering (uses full-page tex_for_lod fallback).
+    const std::unordered_map<std::string, uint32_t>* tile_cache = nullptr;
+
+    // Display content scale from glfwGetWindowContentScale, used to convert
+    // TILE_PX to world-space tile width for tile quad positioning.
+    float content_scale = 1.0f;
 };
 
 /// Handles all OpenGL drawing using a GL 3.3 core profile pipeline.
@@ -59,8 +72,11 @@ private:
                           float r, float g, float b, float a,
                           float margin_px, float dash_px, float gap_px);
 
-    // Textured quad helper — switches to m_tex_prog + m_tex_vao internally.
+    // Textured quad helpers — switch to m_tex_prog + m_tex_vao internally.
     void draw_pdf_page_quad(const Canvas& canvas, const Page& page, unsigned int tex);
+    // Tile variant: draws a textured quad over an arbitrary world-space rect.
+    void draw_pdf_tile_quad(const Canvas& canvas, float wx, float wy, float ww, float wh,
+                            uint32_t tex);
     void draw_threads(const Canvas& canvas, const Document& doc);
     void draw_page_annotations(const Canvas& canvas, const Page& page);
 

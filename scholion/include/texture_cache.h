@@ -37,6 +37,13 @@ public:
     /// Free all GPU textures managed by this cache.
     void clear();
 
+    /// Upload raw RGBA8 pixels not associated with a Page (e.g. tile textures).
+    /// Tracked in m_vram_bytes / m_tex_sizes; release with free_raw().
+    uint32_t upload_raw(const uint8_t* pixels, int width, int height);
+
+    /// Release a texture handle created by upload_raw.
+    void free_raw(uint32_t tex);
+
     /// Approximate VRAM usage in bytes (sum of width*height*4 for all textures).
     size_t vram_bytes() const { return m_vram_bytes; }
 
