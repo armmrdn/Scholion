@@ -1,19 +1,32 @@
+#include "app_settings.h"
+#include "app_state.h"
 #include "canvas.h"
+#include "canvas_annot.h"
+#include "canvas_text_box.h"
 #include "input.h"
+#include "project_io.h"
+#include "rast_pipeline.h"
 #include "renderer.h"
 #include "overlay.h"
 #include "pdf_loader.h"
+#include "save_feedback.h"
 #include "texture_cache.h"
+#include "undo.h"
 
 #ifdef __APPLE__
 #define GL_SILENCE_DEPRECATION
-extern "C" void scholion_register_early(void);
-extern "C" void scholion_register_file_handler(void);
-extern "C" int  scholion_pop_pending_open(char* buf, int buf_len);
-extern "C" void scholion_activate_app(void);
+extern "C" void        scholion_register_early(void);
+extern "C" void        scholion_register_file_handler(void);
+extern "C" int         scholion_pop_pending_open(char* buf, int buf_len);
+extern "C" void        scholion_activate_app(void);
+extern "C" void        scholion_prewarm_dialogs(void);
+extern "C" const char* scholion_open_file(const char* title,
+                                          const char** ext_patterns, int n_ext,
+                                          int allow_multi);
+extern "C" const char* scholion_save_file(const char* title, const char* default_name,
+                                          const char** ext_patterns, int n_ext);
+extern "C" const char* scholion_select_folder(const char* title);
 #include <unistd.h>           // fork / execl
-#include <mach/mach.h>        // task_info — RAM working set (benchmark logger)
-#include <sys/sysctl.h>       // sysctl hw.memsize — total physical RAM (benchmark)
 #elif defined(_WIN32)
 // Windows: GLAD must be included before GLFW so it wins the GL symbol race.
 // GLFW_INCLUDE_NONE prevents GLFW from pulling in its own GL headers.
@@ -23,7 +36,6 @@ extern "C" void scholion_activate_app(void);
 #include <shellapi.h>   // ShellExecuteW (reveal in Explorer)
 #include <shlobj.h>     // SHGetKnownFolderPath, FOLDERID_*
 #include <dwmapi.h>     // DwmSetWindowAttribute — dark title bar
-#include <psapi.h>      // GetProcessMemoryInfo — RAM working set (benchmark logger)
 #define GLFW_INCLUDE_NONE
 #include <glad/glad.h>
 #endif
@@ -59,257 +71,32 @@ extern "C" void scholion_activate_app(void);
 #include "tinyfiledialogs.h"
 #include <curl/curl.h>
 
-// --- Document colors (cycled per document) ----------------------------------
-
-static const float DOC_PALETTE[][3] = {
-    {0.30f, 0.55f, 0.85f},
-    {0.85f, 0.40f, 0.35f},
-    {0.35f, 0.75f, 0.45f},
-    {0.80f, 0.70f, 0.30f},
-    {0.65f, 0.35f, 0.75f},
-};
-static constexpr int PALETTE_SIZE = 5;
 
 // --- Globals for GLFW callbacks (GLFW C callbacks can't capture state) ------
+// Globals declared extern in app_state.h are defined here (no static).
 
-static Canvas       g_canvas;
-static InputHandler g_input(g_canvas);
+Canvas       g_canvas;
+InputHandler g_input(g_canvas);
 
 static GLFWcursor* g_cursor_hand  = nullptr;
 static GLFWcursor* g_cursor_arrow = nullptr;
 
-static GLFWwindow*                              g_window  = nullptr;
-static std::vector<Document>                    g_documents;
-static std::vector<std::shared_ptr<PdfLoader>>  g_loaders;   // one per document, same index
-static TextureCache                             g_cache;
-static float                                    g_content_scale = 1.0f;  // set from glfwGetWindowContentScale at init
-static std::unordered_map<std::string, uint32_t> g_tile_cache;           // tile_cache_key → GL handle (High-tier tiles)
+GLFWwindow*                              g_window  = nullptr;
+std::vector<Document>                    g_documents;
+std::vector<std::shared_ptr<PdfLoader>>  g_loaders;
+TextureCache                             g_cache;
+float                                    g_content_scale = 1.0f;
+std::unordered_map<std::string, uint32_t> g_tile_cache;
+bool                                     g_debug   = false;
 
-// Benchmark counters — always compiled (trivial overhead), read by bench_write() each second.
-static int   g_bench_rast_cancelled = 0;
-static int   g_bench_rast_completed = 0;
-static int   g_bench_rast_perm_fail = 0;
-static float g_bench_frame_ms_max   = 0.0f;
+// --- Definitions for globals declared extern in headers ---------------------
+// (types are defined in their own headers; only the instances live here)
 
-static void before_file_dialog();
-static void after_file_dialog();
+SaveFeedbackType                          g_save_feedback_type = SaveFeedbackType::None;
+std::chrono::steady_clock::time_point     g_save_feedback_time;
 
-// --- Background rasterization -----------------------------------------------
-// Pipeline: enqueue_rast() → g_rast_tasks (work queue) → rast_worker() (one
-// background thread) → g_rast_ready (result queue) → drain_rast_results() on
-// the main thread, which calls TextureCache::upload() (GL call).
-//
-// MuPDF is not thread-safe; each document has its own PdfLoader. The shared_ptr
-// in RastTask keeps the loader alive even if remove_document() runs concurrently.
-// GL calls are forbidden on the worker — rasterize_to_buffer() returns raw RGBA;
-// the main thread uploads after draining.
-// glfwPostEmptyEvent() wakes the main loop (blocked on glfwWaitEventsTimeout) so
-// newly-rasterized pages render in the next frame, not up to 16 ms later.
-// g_rast_inflight deduplicates tasks so the same page:tier pair isn't queued twice.
-
-struct RastTask {
-    std::shared_ptr<PdfLoader> loader;
-    std::string doc_path;
-    int         page_index = 0;
-    LodTier     tier       = LodTier::Thumb;
-    float       viewport_dist_sq = 0.0f;
-    int         tile_col   = -1;  // -1 = full-page (Thumb/Low); >= 0 = High tile col
-    int         tile_row   = -1;
-};
-struct RastResult {
-    std::string              doc_path;
-    int                      page_index = 0;
-    LodTier                  tier       = LodTier::Thumb;
-    PdfLoader::RasterBuffer  buf;
-    int                      tile_col   = -1;
-    int                      tile_row   = -1;
-};
-
-static std::mutex              g_rast_mutex;
-static std::condition_variable g_rast_cv;
-static std::vector<RastTask>   g_rast_tasks;
-static std::vector<RastResult> g_rast_ready;
-static std::unordered_set<std::string> g_rast_inflight;   // "path:page:tier" keys
-static std::atomic<bool>       g_rast_stop{false};
-static std::thread             g_rast_thread;
-
-// Backpressure cap: worker pauses once this many completed tiles are queued,
-// preventing multiple High-LOD tiles (~17 MB, ~110 ms to upload on Intel IGP)
-// from piling up and causing a single-frame GL stall in drain_rast_results.
-// With cap=1 the worker and main thread interleave one tile at a time; total
-// load time is unchanged (bottlenecked by rasterization) but no frame exceeds
-// one tile's upload cost.
-static constexpr int RAST_READY_MAX = 1;
-
-static std::string rast_key(const std::string& path, int pg, LodTier tier,
-                             int tc = -1, int tr = -1) {
-    std::string k = path + '\0' + std::to_string(pg) + '\0' + std::to_string((int)tier);
-    if (tc >= 0) { k += '\0'; k += std::to_string(tc); k += '\0'; k += std::to_string(tr); }
-    return k;
-}
-
-static void rast_worker() {
-    while (true) {
-        RastTask task;
-        {
-            std::unique_lock<std::mutex> lk(g_rast_mutex);
-            g_rast_cv.wait(lk, []{
-                return g_rast_stop ||
-                       (!g_rast_tasks.empty() && (int)g_rast_ready.size() < RAST_READY_MAX);
-            });
-            if (g_rast_stop && g_rast_tasks.empty()) break;
-            task = std::move(g_rast_tasks.front());
-            g_rast_tasks.erase(g_rast_tasks.begin());
-            g_rast_inflight.erase(rast_key(task.doc_path, task.page_index, task.tier,
-                                           task.tile_col, task.tile_row));
-        }
-        auto buf = task.loader->rasterize_to_buffer(task.page_index, task.tier,
-                                                     task.tile_col, task.tile_row);
-        // Always push — including failures. drain_rast_results() marks the page as
-        // rast_failed on ok=false so stream_lod() won't re-queue it indefinitely.
-        {
-            std::lock_guard<std::mutex> lk(g_rast_mutex);
-            g_rast_ready.push_back({task.doc_path, task.page_index, task.tier, std::move(buf),
-                                    task.tile_col, task.tile_row});
-        }
-        glfwPostEmptyEvent();
-    }
-}
-
-// Enqueue a rasterization task, skipping duplicates.
-static void enqueue_rast(const std::string& doc_path,
-                         std::shared_ptr<PdfLoader> loader,
-                         int page_index, LodTier tier) {
-    std::string key = rast_key(doc_path, page_index, tier);
-    std::lock_guard<std::mutex> lk(g_rast_mutex);
-    if (g_rast_inflight.count(key)) return;
-    g_rast_inflight.insert(key);
-    g_rast_tasks.push_back({loader, doc_path, page_index, tier});
-    g_rast_cv.notify_one();
-}
-
-// Enqueue a rasterization task for stream_lod(). Under a single lock: cancels
-// any already-queued task for this page at a different tier (stale after a zoom
-// change), then enqueues the new tier. Stale tasks that the worker already
-// started are harmless — drain_rast_results() discards results that no longer
-// match the page's needed tier.
-// viewport_dist_sq: squared world-space distance from the viewport center;
-// used by stream_lod() to sort the queue so the most visible page renders first.
-static void enqueue_rast_cancelling_stale(const std::string& doc_path,
-                                          std::shared_ptr<PdfLoader> loader,
-                                          int page_index, LodTier tier,
-                                          float viewport_dist_sq = 0.0f) {
-    std::string new_key = rast_key(doc_path, page_index, tier);
-    std::lock_guard<std::mutex> lk(g_rast_mutex);
-    // Remove queued tasks for this page at any tier other than the target.
-    auto it = std::remove_if(g_rast_tasks.begin(), g_rast_tasks.end(),
-        [&](const RastTask& t) {
-            // Only cancel full-page tasks (tile_col=-1); tile tasks are managed
-            // separately by cancel_page_tile_tasks().
-            if (t.doc_path != doc_path || t.page_index != page_index ||
-                t.tier == tier || t.tile_col >= 0)
-                return false;
-            g_rast_inflight.erase(rast_key(t.doc_path, t.page_index, t.tier));
-            ++g_bench_rast_cancelled;
-            return true;
-        });
-    g_rast_tasks.erase(it, g_rast_tasks.end());
-    // Enqueue deduplicated.
-    if (g_rast_inflight.count(new_key)) return;
-    g_rast_inflight.insert(new_key);
-    g_rast_tasks.push_back({loader, doc_path, page_index, tier, viewport_dist_sq});
-    g_rast_cv.notify_one();
-}
-
-// Upload all completed pixel buffers to the GPU (main thread only).
-// Returns true if at least one texture was uploaded this frame — used by
-// stream_lod() to know that VRAM state changed and eviction may be needed.
-static bool drain_rast_results() {
-    std::vector<RastResult> ready;
-    {
-        std::lock_guard<std::mutex> lk(g_rast_mutex);
-        ready.swap(g_rast_ready);
-    }
-    // Tell the worker it can produce the next tile now that we've drained.
-    if (!ready.empty()) g_rast_cv.notify_one();
-    bool did_upload = false;
-    for (auto& res : ready) {
-        if (res.tile_col >= 0) {
-            // High-tier tile result: upload into g_tile_cache (not page.tex_high).
-            if (!res.buf.ok) continue;  // tile failure is non-fatal; don't mark rast_failed
-            std::string key = tile_cache_key(res.doc_path, res.page_index,
-                                             res.tile_col, res.tile_row);
-            if (g_tile_cache.count(key)) continue;  // already uploaded (race guard)
-            uint32_t tex = g_cache.upload_raw(res.buf.pixels.data(),
-                                               res.buf.width, res.buf.height);
-            g_tile_cache[key] = tex;
-            ++g_bench_rast_completed;
-            did_upload = true;
-            continue;
-        }
-
-        // Full-page result (Thumb / Low tier).
-        // Find the page — document may have been removed since task was queued
-        Page* target = nullptr;
-        for (auto& doc : g_documents) {
-            if (doc.path != res.doc_path) continue;
-            for (auto& page : doc.pages)
-                if (page.page_index == res.page_index) { target = &page; break; }
-            break;
-        }
-        if (!target || !target->needs_lod(res.tier)) continue;
-        if (!res.buf.ok) {
-            // Rasterization failed (corrupt page, OOM, MuPDF error). Mark the page
-            // permanently so stream_lod() won't re-queue it and spin the worker.
-            target->rast_failed = true;
-            ++g_bench_rast_perm_fail;
-            continue;
-        }
-        g_cache.upload(*target, res.tier, res.buf.pixels.data(), res.buf.width, res.buf.height);
-        ++g_bench_rast_completed;
-        did_upload = true;
-    }
-    return did_upload;
-}
-
-// --- Annotation tool state --------------------------------------------------
-enum class AnnotTool { None, Pen, Highlight, Note, Eraser };
-static AnnotTool   g_annot_tool   = AnnotTool::None;
-static bool        g_ann_drawing  = false;
-static float       g_pen_r = 0.82f, g_pen_g = 0.06f, g_pen_b = 0.06f;
-static int         g_ann_doc_idx  = -1;
-static int         g_ann_page_idx = -1;
-static AnnotStroke g_ann_cur_stroke;
-static Vec2        g_ann_hl_start = {};
-static Vec2        g_ann_cur_norm = {};
-
-// Global note index: increments each time a note is stamped.
-// label sequence: A–Z (0–25), 2A–2Z (26–51), 3A–3Z (52–77), …
-static int g_next_note_idx = 0;
-
-static std::string note_label(int idx) {
-    int  prefix = idx / 26;
-    char letter  = 'A' + (idx % 26);
-    if (prefix == 0) return std::string(1, letter);
-    return std::to_string(prefix + 1) + letter;
-}
-
-// --- Save notification feedback -----------------------------------------------
-enum class SaveFeedbackType { None, Manual, Auto };
-static SaveFeedbackType g_save_feedback_type = SaveFeedbackType::None;
-static std::chrono::steady_clock::time_point g_save_feedback_time;
-
-// --- Application settings (persisted to ~/.scholion_prefs) -------------------
-struct AppSettings {
-    bool     dark_mode      = true;
-    GridMode grid_mode      = GridMode::Lines;
-    bool     compat_mode    = false;
-    float    panel_w        = 360.0f;          // persisted sidebar width
-    bool     vignette_on    = true;
-    bool     developer_mode = false;           // enables benchmark CSV logger
-};
-static AppSettings g_settings;
-static bool g_settings_open = false;
+AppSettings  g_settings;
+static bool  g_settings_open = false;
 
 static GLuint g_vignette_tex = 0;  // elliptical gradient texture, created once after GL init
 
@@ -319,18 +106,17 @@ enum class QuitState { None, Waiting, Confirmed };
 static QuitState g_quit_state = QuitState::None;
 
 // --- Panel width (shared between panel and resize handle) -------------------
-static float s_panel_w = 360.0f;
+float g_panel_w = 360.0f;   // also exposed as extern in app_state.h
 static int s_panel_nav_page = 0;    // current page index in open panel (0-based)
 static Page* g_nav_focus = nullptr; // focused page for arrow navigation (when panel closed)
 
 // --- Canvas text boxes -------------------------------------------------------
 // w/h are the box's on-screen size in pixels (0 = auto-size to text, used by
 // bare-click and legacy boxes). Text wraps to w; h is a floor that grows to fit.
-struct CanvasTextBox { int id; Vec2 world_pos; char text[2048]; float r=0.82f, g=0.06f, b=0.06f; float font_size=16.0f; float w=0.0f; float h=0.0f; };
-static std::vector<CanvasTextBox> g_text_boxes;
-static int  g_next_box_id    = 0;
-static int  g_selected_box   = -1;  // id, -1 = none
-static int  g_editing_box    = -1;  // id, -1 = not editing
+std::vector<CanvasTextBox> g_text_boxes;
+int  g_next_box_id    = 0;
+int  g_selected_box   = -1;  // id, -1 = none
+int  g_editing_box    = -1;  // id, -1 = not editing
 static bool  g_text_tool      = false;
 static float g_tbox_r = 0.82f, g_tbox_g = 0.06f, g_tbox_b = 0.06f;  // default red, like the pen
 static float g_tbox_font_size = 16.0f;
@@ -345,7 +131,7 @@ static Vec2 g_box_drag_start_world = {};  // world position where drag began (gr
 // Press-drag-release creation of a new text box (text tool active)
 static bool g_tbox_creating     = false;
 static Vec2 g_tbox_create_start = {};   // screen pos where the drag began
-static bool g_just_created      = false; // set on create; consumed by edit-session tracking
+bool g_just_created      = false; // set on create; consumed by edit-session tracking
 
 // Entity clipboard for Cmd+C / Cmd+V duplication of selected boxes
 static CanvasTextBox g_clip_box   = {};
@@ -353,72 +139,19 @@ static bool          g_clip_valid = false;
 
 // Undo session tracking — one record per editing session (text) and per
 // selection session (style). Snapshots taken on begin, compared on end.
-static int   g_prev_editing_box  = -1;
+int   g_prev_editing_box  = -1;
 static char  g_edit_text0[2048]  = "";
-static bool  g_edit_was_new      = false;
-static int   g_prev_selected_box = -1;
+bool  g_edit_was_new      = false;
+int   g_prev_selected_box = -1;
 static float g_style_r0 = 0, g_style_g0 = 0, g_style_b0 = 0, g_style_fs0 = 0;
 
 // --- Undo stack -------------------------------------------------------------
-// Each record is typed; the type determines which fields are meaningful.
-//
-// PageMove batches all pages moved in one drag into a single record so one
-// Cmd+Z undoes the whole group.  TextBoxMove is one record per box (boxes are
-// independently identified by ID, not by index).
-//
-// TextBoxEdit: snapshot taken when an editing session opens (double-click or
-// just-created); compared and pushed when it closes (ESC or click-off). No
-// record if the text didn't change.
-//
-// TextBoxStyle: snapshot taken on the first single-click that selects a box;
-// pushed when the selection changes or the tool exits. No record if style
-// didn't change.
-//
-// UNDO_LIMIT caps the stack at 60 records; oldest are dropped when exceeded.
-struct UndoRecord {
-    enum class Type {
-        PenStroke, Highlight, Note,
-        PageMove, PageResize,
-        TextBoxCreate, TextBoxMove, TextBoxDelete,
-        TextBoxEdit, TextBoxStyle,
-        ErasedStroke, ErasedHighlight,
-        ErasedNote,
-        DocumentRemove
-    };
-    Type type = Type::PenStroke;
-
-    // Annotation + eraser ops
-    int doc_idx         = -1;
-    int page_idx        = -1;
-    int note_idx_before = -1;   // g_next_note_idx value before the note was stamped
-
-    // Page move / resize (single or group)
-    struct PagePos { Page* page; Vec2 old_pos; float old_w = 0.0f; float old_h = 0.0f; };
-    std::vector<PagePos> page_moves;
-
-    // Text box ops
-    int           box_id       = -1;
-    Vec2          old_box_pos  = {};
-    CanvasTextBox deleted_box  = {};   // full copy for TextBoxDelete / TextBoxCreate rollback
-    std::string   prev_text;           // TextBoxEdit — text before the edit session
-    float old_r = 0, old_g = 0, old_b = 0, old_fs = 0;  // TextBoxStyle — style before change
-
-    // Erased annotations (stored so they can be re-inserted)
-    AnnotStroke    erased_stroke    = {};
-    AnnotHighlight erased_highlight = {};
-    AnnotNote      erased_note      = {};
-    int            erased_note_at   = -1;  // index within page.annots.notes
-
-    // Document removal (stores full document copy for undo)
-    int                        removed_doc_idx = -1;
-    Document                   removed_doc     = {};
-    std::shared_ptr<PdfLoader> removed_loader;
-};
+// UndoRecord is defined in undo.h. push_undo declared there, defined here.
 
 static std::vector<UndoRecord> g_undo_stack;
 static constexpr int           UNDO_LIMIT = 60;
 
-static void push_undo(UndoRecord r) {
+void push_undo(UndoRecord r) {
     g_undo_stack.push_back(std::move(r));
     if ((int)g_undo_stack.size() > UNDO_LIMIT)
         g_undo_stack.erase(g_undo_stack.begin());
@@ -569,8 +302,8 @@ static std::string      g_dl_error;
 static std::thread      g_dl_thread;
 
 // --- Search state -----------------------------------------------------------
-static bool g_search_open = false;
-static bool g_debug       = false;  // verbose save/load logging; set from SCHOLION_DEBUG env
+static bool g_search_open    = false;
+static bool g_search_running = false;  // true while background search thread is active
 static char g_search_buf[256] = {};
 struct SearchResult {
     int         doc_idx;
@@ -579,6 +312,8 @@ struct SearchResult {
     std::string doc_name;
 };
 static std::vector<SearchResult> g_search_results;
+static std::mutex                g_search_results_mutex;
+static std::thread               g_search_thread;
 static int g_highlighted_search_result = -1;  // index of the currently highlighted search result
 static std::string g_last_search_term;         // track if search term changed to clear highlight
 
@@ -597,7 +332,7 @@ static Vec2 next_doc_origin() {
     return {left + col * COL_STEP, START_Y + row * ROW_STEP};
 }
 
-static void load_pdf(const std::string& path) {
+void load_pdf(const std::string& path) {
     // Prevent duplicate loads
     for (const auto& d : g_documents)
         if (d.path == path) { printf("Already loaded: %s\n", path.c_str()); return; }
@@ -630,13 +365,8 @@ static void load_pdf(const std::string& path) {
     g_input.set_documents(&g_documents);
 }
 
-static void clear_documents() {
-    {
-        std::lock_guard<std::mutex> lk(g_rast_mutex);
-        g_rast_tasks.clear();
-        g_rast_inflight.clear();
-        g_rast_ready.clear();
-    }
+void clear_documents() {
+    rast_cancel_all();
     for (auto& doc : g_documents)
         for (auto& page : doc.pages)
             g_cache.evict(page);
@@ -645,9 +375,6 @@ static void clear_documents() {
     g_cache.clear();
     g_input.set_documents(nullptr);
 }
-
-static void new_project();          // defined after g_project_path
-static void save_project_current(); // Cmd+S handler; defined after save_project
 
 static void zoom_to_rect(float x0, float y0, float x1, float y1) {
     if (x1 <= x0 || y1 <= y0) return;
@@ -697,8 +424,6 @@ static Page* next_page_in_order(Page* from, int dir) {
     return nullptr;
 }
 
-static void evict_page_tiles(const std::string&, int);  // defined near stream_lod
-
 static void remove_document(int doc_idx) {
     if (doc_idx < 0 || doc_idx >= (int)g_documents.size()) return;
 
@@ -728,15 +453,7 @@ static void remove_document(int doc_idx) {
         g_multi_drag_snaps.end());
 
     const std::string& rpath = g_documents[doc_idx].path;
-    {
-        std::lock_guard<std::mutex> lk(g_rast_mutex);
-        g_rast_tasks.erase(
-            std::remove_if(g_rast_tasks.begin(), g_rast_tasks.end(),
-                [&](const RastTask& t){ return t.doc_path == rpath; }),
-            g_rast_tasks.end());
-        for (auto it = g_rast_inflight.begin(); it != g_rast_inflight.end(); )
-            it = (it->rfind(rpath + '\0', 0) == 0) ? g_rast_inflight.erase(it) : std::next(it);
-    }
+    rast_cancel_doc(rpath);
     for (auto& page : g_documents[doc_idx].pages) {
         g_cache.evict(page);
         evict_page_tiles(rpath, page.page_index);
@@ -796,200 +513,6 @@ static bool relink_document(int doc_idx, const std::string& new_path) {
 }
 
 // Returns true if the page's screen-space bounding box overlaps the viewport.
-static bool is_page_visible(const Page& page) {
-    Vec2 tl = g_canvas.world_to_screen({page.world_pos.x,               page.world_pos.y});
-    Vec2 br = g_canvas.world_to_screen({page.world_pos.x + page.world_w, page.world_pos.y + page.world_h});
-    float vw = g_canvas.get_viewport_width();
-    float vh = g_canvas.get_viewport_height();
-    return br.x >= 0.0f && tl.x <= vw && br.y >= 0.0f && tl.y <= vh;
-}
-
-// Called once per frame: enqueues rasterization for the zoom-appropriate LOD
-// tier of each visible page and evicts tiers that are no longer needed.
-//
-// Eviction rules:
-//   High tier (~17 MB/page) — evicted unconditionally when off-screen or zoom
-//     drops below 2.5. Left alive, off-screen pages would exhaust VRAM quickly.
-//   Low tier  (~4.3 MB/page) — evicted only when VRAM exceeds 350 MB so it
-//     survives brief zoom-out/zoom-in cycles without a re-rasterize stall.
-//   Thumb tier (~1.1 MB/page) — never evicted; always-available fallback.
-//
-// g_loaders[di] == nullptr for missing-PDF placeholder documents — those slots
-// are skipped to avoid calling enqueue_rast for a document with no real file.
-static constexpr size_t VRAM_BUDGET = 350ULL * 1024 * 1024;
-
-// Returns true if an arbitrary world-space rect overlaps the current viewport.
-static bool is_world_rect_visible(float wx, float wy, float ww, float wh) {
-    Vec2 tl = g_canvas.world_to_screen({wx,       wy});
-    Vec2 br = g_canvas.world_to_screen({wx + ww,  wy + wh});
-    float vw = g_canvas.get_viewport_width();
-    float vh = g_canvas.get_viewport_height();
-    return br.x >= 0.0f && tl.x <= vw && br.y >= 0.0f && tl.y <= vh;
-}
-
-// Enqueue a single High-tier tile for background rasterization.
-static void enqueue_tile_rast(const std::string& doc_path,
-                               const std::shared_ptr<PdfLoader>& loader,
-                               int page_index, int tile_col, int tile_row,
-                               float viewport_dist_sq = 0.0f) {
-    std::string key = rast_key(doc_path, page_index, LodTier::High, tile_col, tile_row);
-    std::lock_guard<std::mutex> lk(g_rast_mutex);
-    if (g_rast_inflight.count(key)) return;
-    g_rast_inflight.insert(key);
-    g_rast_tasks.push_back({loader, doc_path, page_index, LodTier::High,
-                             viewport_dist_sq, tile_col, tile_row});
-    g_rast_cv.notify_one();
-}
-
-// Release all cached High-tier tile textures for one page and remove the cache entries.
-static void evict_page_tiles(const std::string& doc_path, int page_index) {
-    std::string prefix = doc_path + '\0' + std::to_string(page_index) + '\0';
-    for (auto it = g_tile_cache.begin(); it != g_tile_cache.end(); ) {
-        if (it->first.size() > prefix.size() &&
-            it->first.compare(0, prefix.size(), prefix) == 0) {
-            g_cache.free_raw(it->second);
-            it = g_tile_cache.erase(it);
-        } else {
-            ++it;
-        }
-    }
-}
-
-// Cancel any queued (not yet started) tile tasks for one page.
-static void cancel_page_tile_tasks(const std::string& doc_path, int page_index) {
-    std::lock_guard<std::mutex> lk(g_rast_mutex);
-    auto it = std::remove_if(g_rast_tasks.begin(), g_rast_tasks.end(),
-        [&](const RastTask& t) {
-            if (t.doc_path != doc_path || t.page_index != page_index || t.tile_col < 0)
-                return false;
-            g_rast_inflight.erase(rast_key(t.doc_path, t.page_index, t.tier,
-                                           t.tile_col, t.tile_row));
-            ++g_bench_rast_cancelled;
-            return true;
-        });
-    g_rast_tasks.erase(it, g_rast_tasks.end());
-}
-
-// For each viewport-visible tile of a page that is not yet in g_tile_cache,
-// enqueue a rasterization task sorted by proximity to the viewport center.
-static void enqueue_visible_high_tiles(const Document& doc,
-                                        const std::shared_ptr<PdfLoader>& loader,
-                                        const Page& page, Vec2 vp_center) {
-    float px_per_wu = dpi_for_lod(LodTier::High) * g_content_scale / 72.0f;
-    float tile_wu   = static_cast<float>(TILE_PX) / px_per_wu;
-    int   n_cols    = static_cast<int>(std::ceil(page.world_w / tile_wu));
-    int   n_rows    = static_cast<int>(std::ceil(page.world_h / tile_wu));
-
-    for (int row = 0; row < n_rows; ++row) {
-        for (int col = 0; col < n_cols; ++col) {
-            if (g_tile_cache.count(tile_cache_key(doc.path, page.page_index, col, row)))
-                continue;  // already cached
-
-            float tx = page.world_pos.x + col * tile_wu;
-            float ty = page.world_pos.y + row * tile_wu;
-            float tw = (tx + tile_wu < page.world_pos.x + page.world_w)
-                           ? tile_wu : (page.world_pos.x + page.world_w - tx);
-            float th = (ty + tile_wu < page.world_pos.y + page.world_h)
-                           ? tile_wu : (page.world_pos.y + page.world_h - ty);
-            // Prefetch one tile margin outside the viewport so tiles are ready when
-            // the user pans. Expanding the tile rect by tile_wu on each side is
-            // equivalent to asking "is this tile within tile_wu of the viewport edge."
-            // Visible tiles still sort to the front of the queue (smaller dist_sq).
-            if (!is_world_rect_visible(tx - tile_wu, ty - tile_wu,
-                                       tw + 2.0f * tile_wu, th + 2.0f * tile_wu)) continue;
-
-            float tcx = tx + tw * 0.5f - vp_center.x;
-            float tcy = ty + th * 0.5f - vp_center.y;
-            enqueue_tile_rast(doc.path, loader, page.page_index, col, row,
-                              tcx * tcx + tcy * tcy);
-        }
-    }
-}
-
-static void stream_lod(bool vram_changed) {
-    if (g_documents.empty()) return;
-
-    // Skip entirely when the viewport hasn't moved, no texture was just uploaded
-    // (VRAM state unchanged), and no tasks are waiting in the queue. This keeps
-    // the CPU from polling every frame on a still canvas.
-    {
-        static float s_last_zoom  = -1.0f;
-        static float s_last_off_x = 0.0f;
-        static float s_last_off_y = 0.0f;
-        float cur_zoom = g_canvas.get_zoom();
-        Vec2  cur_off  = g_canvas.get_offset();
-        bool view_changed = (cur_zoom != s_last_zoom ||
-                             cur_off.x != s_last_off_x ||
-                             cur_off.y != s_last_off_y);
-        bool tasks_pending;
-        { std::lock_guard<std::mutex> lk(g_rast_mutex); tasks_pending = !g_rast_tasks.empty(); }
-        if (!view_changed && !vram_changed && !tasks_pending) return;
-        s_last_zoom  = cur_zoom;
-        s_last_off_x = cur_off.x;
-        s_last_off_y = cur_off.y;
-    }
-
-    LodTier target = lod_for_zoom(g_canvas.get_zoom());
-    if (g_settings.compat_mode && target == LodTier::High)
-        target = LodTier::Low;
-
-    // Viewport center in world space — used to score each enqueued task so the
-    // worker rasterizes the page closest to where the user is looking first.
-    Vec2 vp_center = g_canvas.screen_to_world(
-        {g_canvas.get_viewport_width() * 0.5f, g_canvas.get_viewport_height() * 0.5f});
-
-    for (int di = 0; di < (int)g_documents.size(); ++di) {
-        auto& doc    = g_documents[di];
-        auto& loader = g_loaders[di];
-        if (!loader) continue;   // placeholder (missing PDF) — nothing to rasterize
-
-        for (auto& page : doc.pages) {
-            bool vis = is_page_visible(page);
-
-            if (vis) {
-                if (target == LodTier::High) {
-                    // Tile-based: only rasterize the viewport-visible tiles.
-                    enqueue_visible_high_tiles(doc, loader, page, vp_center);
-                } else {
-                    if (page.needs_lod(target)) {
-                        float cx = page.world_pos.x + page.world_w * 0.5f - vp_center.x;
-                        float cy = page.world_pos.y + page.world_h * 0.5f - vp_center.y;
-                        enqueue_rast_cancelling_stale(doc.path, loader, page.page_index, target,
-                                                      cx*cx + cy*cy);
-                    }
-                    // Zoom dropped below High: evict tiles + cancel pending tile tasks.
-                    evict_page_tiles(doc.path, page.page_index);
-                    cancel_page_tile_tasks(doc.path, page.page_index);
-                    if (page.tex_high)
-                        g_cache.evict_tier(page, LodTier::High);
-                }
-                if (target < LodTier::Low && page.tex_low)
-                    g_cache.evict_tier(page, LodTier::Low);
-            } else {
-                // Off-screen: evict tiles and High immediately; Low only under budget pressure.
-                evict_page_tiles(doc.path, page.page_index);
-                cancel_page_tile_tasks(doc.path, page.page_index);
-                if (page.tex_high)
-                    g_cache.evict_tier(page, LodTier::High);
-                if (page.tex_low && g_cache.vram_bytes() > VRAM_BUDGET)
-                    g_cache.evict_tier(page, LodTier::Low);
-            }
-        }
-    }
-
-    // Re-sort the pending task queue so the worker always starts with the page
-    // nearest the viewport center. Tasks added from other sites (panel, initial
-    // Thumb load) keep their position and are sorted into place next frame.
-    {
-        std::lock_guard<std::mutex> lk(g_rast_mutex);
-        if (g_rast_tasks.size() > 1)
-            std::stable_sort(g_rast_tasks.begin(), g_rast_tasks.end(),
-                [](const RastTask& a, const RastTask& b) {
-                    return a.viewport_dist_sq < b.viewport_dist_sq;
-                });
-    }
-}
-
 static void load_pdfs_from_folder(const std::string& folder) {
     namespace fs = std::filesystem;
     std::vector<fs::path> pdfs;
@@ -1168,9 +691,51 @@ static void glfw_error_callback(int error, const char* description) {
 
 static int g_doc_z_counter = 0;
 
+static int  s_editing_ref_note = -1;    // ref index of the note being edited; -1 = none
+static char s_ref_note_buf[2048] = {};
+
 static void mouse_button_callback(GLFWwindow* w, int button, int action, int mods) {
     if (ImGui::GetIO().WantCaptureMouse) return;
     if (g_hovered_box >= 0) return;  // text box owns this click (one-frame lookahead)
+
+    // Annotation tool: intercept LMB press on a page before InputHandler sees it.
+    // The page owns the click — InputHandler does not receive it, so no drag/select starts.
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS
+            && g_annot_tool != AnnotTool::None) {
+        double cx, cy;
+        glfwGetCursorPos(w, &cx, &cy);
+        int doc_idx = -1;
+        Page* page = hit_test_page((float)cx, (float)cy, &doc_idx);
+        if (page) {
+            Vec2 norm = screen_to_page_norm(*page, (float)cx, (float)cy);
+            if (g_annot_tool == AnnotTool::Note) {
+                int snap = g_next_note_idx;
+                page->annots.notes.push_back({note_label(g_next_note_idx++)});
+                UndoRecord r;
+                r.type            = UndoRecord::Type::Note;
+                r.doc_idx         = doc_idx;
+                r.page_idx        = page->page_index;
+                r.note_idx_before = snap;
+                push_undo(r);
+            } else {
+                g_ann_drawing  = true;
+                g_ann_doc_idx  = doc_idx;
+                g_ann_page_idx = page->page_index;
+                if (g_annot_tool == AnnotTool::Pen) {
+                    g_ann_cur_stroke     = {};
+                    g_ann_cur_stroke.r   = g_pen_r;
+                    g_ann_cur_stroke.g   = g_pen_g;
+                    g_ann_cur_stroke.b   = g_pen_b;
+                    g_ann_cur_stroke.pts.push_back(norm);
+                } else {
+                    g_ann_hl_start = norm;
+                    g_ann_cur_norm = norm;
+                }
+            }
+            return; // page owns this click — don't pass to InputHandler
+        }
+    }
+
     bool was_box_sel = g_input.box_selecting();
     g_input.on_mouse_button(w, button, action, mods);
 
@@ -1223,6 +788,18 @@ static void mouse_button_callback(GLFWwindow* w, int button, int action, int mod
 static void cursor_pos_callback(GLFWwindow* w, double x, double y) {
     if (ImGui::GetIO().WantCaptureMouse) { g_input.clear_hover(); return; }
     g_input.on_cursor_move(w, x, y);
+    // Accumulate pen points at mouse-move rate (more points per frame = smoother stroke).
+    if (g_ann_drawing && g_annot_tool == AnnotTool::Pen
+            && g_ann_doc_idx >= 0 && g_ann_doc_idx < (int)g_documents.size()
+            && g_ann_page_idx >= 0) {
+        const Document& doc = g_documents[g_ann_doc_idx];
+        for (const auto& pg : doc.pages) {
+            if (pg.page_index == g_ann_page_idx) {
+                g_ann_cur_stroke.pts.push_back(screen_to_page_norm(pg, (float)x, (float)y));
+                break;
+            }
+        }
+    }
 }
 
 static void scroll_callback(GLFWwindow* w, double xoff, double yoff) {
@@ -1258,39 +835,18 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
                 bool was_pen = (g_annot_tool == AnnotTool::Pen);
                 g_annot_tool = was_pen ? AnnotTool::None : AnnotTool::Pen;
                 g_ann_drawing = false;
-                if (!was_pen && !g_input.panel_open()) {
-                    const Document* sel = g_input.selected_doc();
-                    if (sel) {
-                        for (int i = 0; i < (int)g_documents.size(); ++i)
-                            if (&g_documents[i] == sel) { g_input.open_panel(i, -1); break; }
-                    }
-                }
                 return;
             }
             if (key == GLFW_KEY_H) {
                 bool was_hl = (g_annot_tool == AnnotTool::Highlight);
                 g_annot_tool = was_hl ? AnnotTool::None : AnnotTool::Highlight;
                 g_ann_drawing = false;
-                if (!was_hl && !g_input.panel_open()) {
-                    const Document* sel = g_input.selected_doc();
-                    if (sel) {
-                        for (int i = 0; i < (int)g_documents.size(); ++i)
-                            if (&g_documents[i] == sel) { g_input.open_panel(i, -1); break; }
-                    }
-                }
                 return;
             }
             if (key == GLFW_KEY_F && !super && !ctrl) {
                 bool was_note = (g_annot_tool == AnnotTool::Note);
                 g_annot_tool = was_note ? AnnotTool::None : AnnotTool::Note;
                 g_ann_drawing = false;
-                if (!was_note && !g_input.panel_open()) {
-                    const Document* sel = g_input.selected_doc();
-                    if (sel) {
-                        for (int i = 0; i < (int)g_documents.size(); ++i)
-                            if (&g_documents[i] == sel) { g_input.open_panel(i, -1); break; }
-                    }
-                }
                 return;
             }
             // ESC: deactivate active tool even when panel has keyboard focus.
@@ -1309,13 +865,31 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
         }
     }
 
+    // While a ref-note is being edited in the panel, suppress all shortcuts and
+    // canvas input — only Escape is allowed (to confirm and close the note).
+    if (s_editing_ref_note >= 0) {
+        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
+            for (int ni = 0; ni < (int)g_ref_notes.size(); ++ni) {
+                if (g_ref_notes[ni].after_idx == s_editing_ref_note) {
+                    g_ref_notes[ni].text = s_ref_note_buf;
+                    if (g_ref_notes[ni].text.empty())
+                        g_ref_notes.erase(g_ref_notes.begin() + ni);
+                    break;
+                }
+            }
+            s_editing_ref_note = -1;
+        }
+        return;
+    }
+
     // Space key must reach on_key even when the panel has keyboard focus so that
     // the press→release tap sequence that toggles the panel is always detected.
-    // WantCaptureKeyboard is true whenever an ImGui window is active, which means
-    // the space-up event would be swallowed and m_space_tap_pending never set,
-    // making it impossible to close the panel with spacebar.
+    // WantCaptureKeyboard is true whenever any ImGui window is active — but we
+    // must NOT route space to on_key when the user is actually typing (text box,
+    // search field, ref-note editor). WantTextInput is specifically true only when
+    // a text input widget has keyboard focus and wants character input.
     if (ImGui::GetIO().WantCaptureKeyboard) {
-        if (key == GLFW_KEY_SPACE && g_editing_box < 0)
+        if (key == GLFW_KEY_SPACE && g_editing_box < 0 && !ImGui::GetIO().WantTextInput)
             g_input.on_key(w, key, scancode, action, mods);
         return;
     }
@@ -1364,30 +938,12 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
 
     if (action != GLFW_PRESS) return;
 
-    // Tool shortcuts (no modifier)
+    // Tool shortcuts (no modifier) — T for text tool only; P/H/F handled above
     bool cmd = super || ctrl;
     if (!cmd) {
         if (key == GLFW_KEY_T) {
             g_text_tool = !g_text_tool;
             g_editing_box = -1;
-        }
-        if (key == GLFW_KEY_H) {
-            g_annot_tool = (g_annot_tool == AnnotTool::Highlight)
-                           ? AnnotTool::None : AnnotTool::Highlight;
-            g_ann_drawing = false;
-        }
-        if (key == GLFW_KEY_P) {
-            bool was_pen = (g_annot_tool == AnnotTool::Pen);
-            g_annot_tool = was_pen ? AnnotTool::None : AnnotTool::Pen;
-            g_ann_drawing = false;
-            // Open panel if activating pen and panel not already open
-            if (!was_pen && !g_input.panel_open()) {
-                const Document* sel = g_input.selected_doc();
-                if (sel) {
-                    for (int i = 0; i < (int)g_documents.size(); ++i)
-                        if (&g_documents[i] == sel) { g_input.open_panel(i, -1); break; }
-                }
-            }
         }
     }
 
@@ -1421,8 +977,6 @@ static void focus_callback(GLFWwindow* /*w*/, int focused) {
     // Clear panning state so space+drag doesn't stay active after a cmd-tab.
     if (!focused) g_input.clear_held_keys();
 }
-
-static void load_project_from_path(const std::string&);  // defined after project I/O helpers
 
 static void drop_callback(GLFWwindow* /*w*/, int count, const char** paths) {
     namespace fs = std::filesystem;
@@ -1717,8 +1271,8 @@ static void draw_canvas_text_boxes() {
 
     // Clip all ForegroundDrawList drawing to the canvas area so text boxes don't
     // render on top of the panel when it is open. The panel occupies the rightmost
-    // s_panel_w pixels; boxes that overlap it are clipped at the panel's left edge.
-    float canvas_right = g_input.panel_open() ? (vp.x - s_panel_w) : vp.x;
+    // g_panel_w pixels; boxes that overlap it are clipped at the panel's left edge.
+    float canvas_right = g_input.panel_open() ? (vp.x - g_panel_w) : vp.x;
     dl->PushClipRect({0.0f, 0.0f}, {canvas_right, vp.y}, true);
 
     for (auto& box : g_text_boxes) {
@@ -1998,80 +1552,6 @@ static void draw_canvas_text_boxes() {
     }
 }
 
-// --- Annotation finalization ------------------------------------------------
-
-static void finalize_annotation() {
-    if (g_ann_doc_idx < 0 || g_ann_doc_idx >= (int)g_documents.size()) {
-        g_ann_drawing = false; return;
-    }
-    Document& fdoc = g_documents[g_ann_doc_idx];
-    if (g_ann_page_idx < 0 || g_ann_page_idx >= (int)fdoc.pages.size()) {
-        g_ann_drawing = false; return;
-    }
-    Page& fpage = fdoc.pages[g_ann_page_idx];
-    if (g_annot_tool == AnnotTool::Pen) {
-        if (g_ann_cur_stroke.pts.size() >= 2) {
-            fpage.annots.strokes.push_back(std::move(g_ann_cur_stroke));
-            UndoRecord r;
-            r.type     = UndoRecord::Type::PenStroke;
-            r.doc_idx  = g_ann_doc_idx;
-            r.page_idx = g_ann_page_idx;
-            push_undo(r);
-        }
-        g_ann_cur_stroke = {};
-    } else if (g_annot_tool == AnnotTool::Highlight) {
-        AnnotHighlight hl;
-        hl.x0 = std::min(g_ann_hl_start.x, g_ann_cur_norm.x);
-        hl.y0 = std::min(g_ann_hl_start.y, g_ann_cur_norm.y);
-        hl.x1 = std::max(g_ann_hl_start.x, g_ann_cur_norm.x);
-        hl.y1 = std::max(g_ann_hl_start.y, g_ann_cur_norm.y);
-        if (hl.x1 > hl.x0 && hl.y1 > hl.y0) {
-            // Text-snap: collect characters whose centre falls inside the
-            // selection rect, snap the highlight bbox to them, and capture
-            // their text. Falls back to a plain rect when the page has no
-            // selectable text (scanned images, figures, etc.).
-            auto* loader = (g_ann_doc_idx >= 0 && g_ann_doc_idx < (int)g_loaders.size())
-                           ? g_loaders[g_ann_doc_idx].get() : nullptr;
-            if (loader && loader->valid()) {
-                const auto& quads = loader->get_char_quads(g_ann_page_idx);
-                std::vector<const CharQuad*> sel;
-                sel.reserve(quads.size());
-                for (const auto& q : quads) {
-                    float cx = (q.x0 + q.x1) * 0.5f;
-                    float cy = (q.y0 + q.y1) * 0.5f;
-                    if (cx >= hl.x0 && cx <= hl.x1 && cy >= hl.y0 && cy <= hl.y1)
-                        sel.push_back(&q);
-                }
-                if (!sel.empty()) {
-                    std::sort(sel.begin(), sel.end(),
-                              [](const CharQuad* a, const CharQuad* b){
-                                  return a->order < b->order; });
-                    // Snap bbox to the tight union of all selected char rects
-                    float sx0 = sel[0]->x0, sy0 = sel[0]->y0;
-                    float sx1 = sel[0]->x1, sy1 = sel[0]->y1;
-                    std::string text;
-                    for (const auto* q : sel) {
-                        sx0 = std::min(sx0, q->x0); sy0 = std::min(sy0, q->y0);
-                        sx1 = std::max(sx1, q->x1); sy1 = std::max(sy1, q->y1);
-                        text += q->utf8;
-                        if (q->line_end) text += ' ';
-                    }
-                    // Trim trailing space added by line_end logic
-                    while (!text.empty() && text.back() == ' ') text.pop_back();
-                    hl.x0 = sx0; hl.y0 = sy0; hl.x1 = sx1; hl.y1 = sy1;
-                    hl.text = std::move(text);
-                }
-            }
-            fpage.annots.highlights.push_back(hl);
-            UndoRecord r;
-            r.type     = UndoRecord::Type::Highlight;
-            r.doc_idx  = g_ann_doc_idx;
-            r.page_idx = g_ann_page_idx;
-            push_undo(r);
-        }
-    }
-    g_ann_drawing = false;
-}
 
 // Open the system file manager and highlight the given path.
 // macOS: fork/execl with /usr/bin/open -R — no shell, immune to special chars.
@@ -2103,106 +1583,6 @@ static void reveal_in_file_manager(const std::string& path) {
 //          rast_queue, rast_cancelled, rast_completed, rast_perm_fail,
 //          ram_mb, pages_total, pages_visible, pages_thumb, pages_low, pages_high
 //
-// Counters are declared near the top globals so pipeline functions can increment
-// them without forward-reference issues. bench_write() reads and resets them.
-
-static float get_process_ram_mb() {
-#ifdef _WIN32
-    PROCESS_MEMORY_COUNTERS pmc;
-    if (GetProcessMemoryInfo(GetCurrentProcess(), &pmc, sizeof(pmc)))
-        return static_cast<float>(pmc.WorkingSetSize) / (1024.0f * 1024.0f);
-#elif defined(__APPLE__)
-    // mach/task.h available on macOS; resident_size = physical RAM held
-    struct mach_task_basic_info info;
-    mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
-    if (task_info(mach_task_self(), MACH_TASK_BASIC_INFO,
-                  (task_info_t)&info, &count) == KERN_SUCCESS)
-        return static_cast<float>(info.resident_size) / (1024.0f * 1024.0f);
-#endif
-    return 0.0f;
-}
-
-#ifdef SCHOLION_DEV
-static FILE* g_bench_file = nullptr;
-static double g_bench_start = 0.0;
-static double g_bench_last_write = -1.0;
-
-static void bench_open() {
-    if (g_bench_file) return;
-    char path[512];
-    time_t t = time(nullptr);
-    struct tm* tm_info = localtime(&t);
-    char ts[32];
-    strftime(ts, sizeof(ts), "%Y%m%d_%H%M%S", tm_info);
-#ifdef _WIN32
-    char desktop[MAX_PATH] = {};
-    SHGetFolderPathA(nullptr, CSIDL_DESKTOP, nullptr, 0, desktop);
-    snprintf(path, sizeof(path), "%s\\scholion_perf_%s.csv", desktop, ts);
-#else
-    const char* home = getenv("HOME");
-    snprintf(path, sizeof(path), "%s/Desktop/scholion_perf_%s.csv",
-             home ? home : ".", ts);
-#endif
-    g_bench_file = fopen(path, "w");
-    if (g_bench_file) {
-        fprintf(g_bench_file,
-            "elapsed_s,fps,frame_ms,frame_ms_max,"
-            "vram_used_mb,rast_queue,"
-            "rast_cancelled,rast_completed,rast_perm_fail,"
-            "ram_mb,pages_total,pages_visible,"
-            "pages_thumb,pages_low,pages_high\n");
-        fflush(g_bench_file);
-        printf("[benchmark] logging to %s\n", path);
-    }
-    g_bench_start = glfwGetTime();
-    // Reset running counters so they reflect this session only.
-    g_bench_rast_cancelled = 0;
-    g_bench_rast_completed = 0;
-    g_bench_rast_perm_fail = 0;
-    g_bench_frame_ms_max   = 0.0f;
-}
-
-static void bench_write(float fps, float frame_ms,
-                        int pages_total, int pages_visible) {
-    if (!g_bench_file) return;
-    double now = glfwGetTime();
-    if (now - g_bench_last_write < 1.0) return;
-    g_bench_last_write = now;
-
-    float vram_used_mb = static_cast<float>(g_cache.vram_bytes()) / (1024.0f * 1024.0f);
-    int   rast_queue   = 0;
-    { std::lock_guard<std::mutex> lk(g_rast_mutex); rast_queue = (int)g_rast_tasks.size(); }
-    float ram_mb = get_process_ram_mb();
-
-    // Per-tier page counts — tells you what the renderer is actually drawing.
-    int pages_thumb = 0, pages_low = 0, pages_high = 0;
-    for (const auto& doc : g_documents)
-        for (const auto& pg : doc.pages) {
-            if      (pg.tex_high)  ++pages_high;
-            else if (pg.tex_low)   ++pages_low;
-            else if (pg.tex_thumb) ++pages_thumb;
-        }
-
-    // Snapshot and reset the worst-frame tracker for the next 1-second window.
-    float frame_ms_max    = g_bench_frame_ms_max;
-    g_bench_frame_ms_max  = 0.0f;
-
-    fprintf(g_bench_file,
-        "%.1f,%.1f,%.2f,%.2f,"
-        "%.1f,%d,"
-        "%d,%d,%d,"
-        "%.1f,%d,%d,"
-        "%d,%d,%d\n",
-        now - g_bench_start,
-        fps, frame_ms, frame_ms_max,
-        vram_used_mb, rast_queue,
-        g_bench_rast_cancelled, g_bench_rast_completed, g_bench_rast_perm_fail,
-        ram_mb, pages_total, pages_visible,
-        pages_thumb, pages_low, pages_high);
-    fflush(g_bench_file);
-}
-#endif // SCHOLION_DEV
-
 // --- Context menu -----------------------------------------------------------
 
 static void draw_context_menu() {
@@ -2224,11 +1604,15 @@ static void draw_context_menu() {
                 ImGui::TextDisabled("PDF not found:");
                 ImGui::TextDisabled("%s", doc->path.c_str());
                 if (ImGui::MenuItem("Relink PDF...")) {
-                    before_file_dialog();
                     const char* pats[] = {"*.pdf", "*.PDF"};
+#ifdef __APPLE__
+                    const char* picked = scholion_open_file("Locate the missing PDF", pats, 2, 0);
+#else
+                    before_file_dialog();
                     const char* picked = tinyfd_openFileDialog(
                         "Locate the missing PDF", doc->path.c_str(), 2, pats, "PDF Documents", 0);
                     after_file_dialog();
+#endif
                     if (picked) {
                         for (int i = 0; i < (int)g_documents.size(); ++i)
                             if (&g_documents[i] == doc) { relink_document(i, picked); break; }
@@ -2245,8 +1629,8 @@ static void draw_context_menu() {
                 r.page_moves.push_back({page, page->world_pos});
                 push_undo(r);
                 page->world_pos = {
-                    doc->stack_origin.x + page->page_index * DocumentStack::FAN_OFFSET,
-                    doc->stack_origin.y + page->page_index * DocumentStack::FAN_OFFSET
+                    doc->stack_origin.x + page->page_index * PAGE_FAN_OFFSET,
+                    doc->stack_origin.y + page->page_index * PAGE_FAN_OFFSET
                 };
             }
             if (ImGui::MenuItem("View in panel")) {
@@ -2281,8 +1665,8 @@ static void draw_context_menu() {
                 push_undo(r);
                 for (auto& p : doc->pages) {
                     p.world_pos = {
-                        doc->stack_origin.x + p.page_index * DocumentStack::FAN_OFFSET,
-                        doc->stack_origin.y + p.page_index * DocumentStack::FAN_OFFSET
+                        doc->stack_origin.x + p.page_index * PAGE_FAN_OFFSET,
+                        doc->stack_origin.y + p.page_index * PAGE_FAN_OFFSET
                     };
                 }
             }
@@ -2383,186 +1767,6 @@ static void draw_context_menu() {
     }
 }
 
-// --- JSON string helpers ----------------------------------------------------
-
-static std::string json_escape(const char* s) {
-    std::string out;
-    for (; *s; ++s) {
-        if      (*s == '\\') out += "\\\\";
-        else if (*s == '"')  out += "\\\"";
-        else if (*s == '\n') out += "\\n";
-        else if (*s == '\r') out += "\\r";
-        else                 out += *s;
-    }
-    return out;
-}
-
-// Reads the value of the first "text": "..." field on a line, handling escapes.
-static bool extract_json_text(const char* line, char* out, int out_sz) {
-    const char* p = strstr(line, "\"text\": \"");
-    if (!p) return false;
-    p += 9;
-    int j = 0;
-    while (*p && j < out_sz - 1) {
-        if (*p == '\\' && *(p + 1)) {
-            ++p;
-            switch (*p) {
-                case 'n':  out[j++] = '\n'; break;
-                case 'r':  out[j++] = '\r'; break;
-                case '"':  out[j++] = '"';  break;
-                case '\\': out[j++] = '\\'; break;
-                default:   out[j++] = *p;   break;
-            }
-        } else if (*p == '"') {
-            break;
-        } else {
-            out[j++] = *p;
-        }
-        ++p;
-    }
-    out[j] = '\0';
-    return true;
-}
-
-// --- Save / load project ----------------------------------------------------
-
-static std::string g_project_path;
-static std::chrono::steady_clock::time_point g_last_save_time;
-
-static std::vector<std::string> g_recents;
-static constexpr int RECENTS_MAX = 10;
-
-static std::string recents_file_path() {
-#ifdef _WIN32
-    // Store in %APPDATA%\Scholion\recents (roaming so it follows the user profile).
-    PWSTR wpath = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &wpath))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, nullptr, 0, nullptr, nullptr);
-        std::string appdata(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &appdata[0], len, nullptr, nullptr);
-        CoTaskMemFree(wpath);
-        std::string dir = appdata + "\\Scholion";
-        // Use error_code overload — prevents std::filesystem exceptions if the
-        // directory already exists (known MinGW / GCC behaviour on second run).
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        return dir + "\\recents";
-    }
-    return "";
-#else
-    const char* home = std::getenv("HOME");
-    return home ? std::string(home) + "/.scholion_recents" : "";
-#endif
-}
-
-static void save_recents() {
-    std::string p = recents_file_path();
-    if (p.empty()) return;
-    FILE* f = fopen(p.c_str(), "w");
-    if (!f) return;
-    for (const auto& r : g_recents) fprintf(f, "%s\n", r.c_str());
-    fclose(f);
-}
-
-static void load_recents() {
-    std::string p = recents_file_path();
-    if (p.empty()) return;
-    FILE* f = fopen(p.c_str(), "r");
-    if (!f) return;
-    char line[4096];
-    while (fgets(line, sizeof(line), f)) {
-        std::string s(line);
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-        if (!s.empty()) g_recents.push_back(s);
-    }
-    fclose(f);
-}
-
-static void add_to_recents(const std::string& path) {
-    g_recents.erase(std::remove(g_recents.begin(), g_recents.end(), path), g_recents.end());
-    g_recents.insert(g_recents.begin(), path);
-    if ((int)g_recents.size() > RECENTS_MAX) g_recents.resize(RECENTS_MAX);
-    save_recents();
-}
-
-// --- Application preferences persistence ---
-
-static std::string prefs_file_path() {
-#ifdef _WIN32
-    PWSTR wpath = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &wpath))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, nullptr, 0, nullptr, nullptr);
-        std::string appdata(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &appdata[0], len, nullptr, nullptr);
-        CoTaskMemFree(wpath);
-        std::string dir = appdata + "\\Scholion";
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        return dir + "\\prefs";
-    }
-    return "";
-#else
-    const char* home = std::getenv("HOME");
-    return home ? std::string(home) + "/.scholion_prefs" : "";
-#endif
-}
-
-static void save_prefs() {
-    std::string p = prefs_file_path();
-    if (p.empty()) return;
-    FILE* f = fopen(p.c_str(), "w");
-    if (!f) return;
-    fprintf(f, "dark_mode=%d\n",   g_settings.dark_mode   ? 1 : 0);
-    fprintf(f, "grid_mode=%d\n",   (int)g_settings.grid_mode);
-    fprintf(f, "compat_mode=%d\n", g_settings.compat_mode ? 1 : 0);
-    fprintf(f, "vignette_on=%d\n",    g_settings.vignette_on    ? 1 : 0);
-    fprintf(f, "developer_mode=%d\n", g_settings.developer_mode ? 1 : 0);
-    fprintf(f, "panel_w=%.1f\n",      g_settings.panel_w);
-    fclose(f);
-}
-
-static void load_prefs() {
-    std::string p = prefs_file_path();
-    if (p.empty()) return;
-    FILE* f = fopen(p.c_str(), "r");
-    if (!f) return;
-    char key[64];
-    float fval;
-    while (fscanf(f, " %63[^=]=%f", key, &fval) == 2) {
-        int ival = (int)fval;
-        if      (!strcmp(key, "dark_mode"))   g_settings.dark_mode   = ival;
-        else if (!strcmp(key, "grid_mode"))   g_settings.grid_mode   = (GridMode)ival;
-        else if (!strcmp(key, "compat_mode")) g_settings.compat_mode = ival;
-        else if (!strcmp(key, "vignette_on"))    g_settings.vignette_on    = ival;
-        else if (!strcmp(key, "developer_mode")) g_settings.developer_mode = ival;
-        else if (!strcmp(key, "panel_w"))        g_settings.panel_w        = fval;
-    }
-    fclose(f);
-}
-
-// Theme application with custom rounding
-static void apply_theme(bool dark) {
-    if (dark) {
-        ImGui::StyleColorsDark();
-    } else {
-        ImGui::StyleColorsLight();
-        ImGui::GetStyle().Colors[ImGuiCol_WindowBg] = ImVec4(0.94f, 0.93f, 0.91f, 0.96f);
-    }
-    ImGui::GetStyle().WindowRounding   = 6.0f;
-    ImGui::GetStyle().PopupRounding    = 5.0f;
-    ImGui::GetStyle().FrameRounding    = 4.0f;
-    ImGui::GetStyle().WindowBorderSize = 0.0f;
-}
-
-static void update_window_title() {
-    if (!g_window) return;
-    if (g_project_path.empty()) {
-        glfwSetWindowTitle(g_window, "Scholion");
-    } else {
-        std::string name = std::filesystem::path(g_project_path).stem().string();
-        glfwSetWindowTitle(g_window, ("Scholion \xe2\x80\x94 " + name).c_str());
-    }
-}
 
 static void new_project() {
     clear_documents();
@@ -2576,537 +1780,6 @@ static void new_project() {
     g_clip_valid    = false;   // don't carry a copied box across projects
     g_project_path.clear();
     update_window_title();
-}
-
-// Serialize the entire project state to a JSON string.
-// Must be called on the main thread (reads all global app state).
-// The returned string can then be handed to write_json_file on any thread.
-static std::string build_project_json() {
-    std::string out;
-    out.reserve(128 * 1024);
-    char b[512];
-
-    Vec2 offset = g_canvas.get_offset();
-    snprintf(b, sizeof(b), "{\n  \"viewport\": { \"x\": %.4f, \"y\": %.4f, \"zoom\": %.6f },\n",
-             offset.x, offset.y, g_canvas.get_zoom());
-    out += b;
-    snprintf(b, sizeof(b), "  \"note_idx\": %d,\n", g_next_note_idx);
-    out += b;
-
-    out += "  \"documents\": [\n";
-    for (int di = 0; di < (int)g_documents.size(); ++di) {
-        const Document& doc = g_documents[di];
-        out += "    {\n";
-        out += "      \"path\": \""; out += doc.path; out += "\",\n";
-        snprintf(b, sizeof(b), "      \"stack_origin\": [%.4f, %.4f],\n",
-                 doc.stack_origin.x, doc.stack_origin.y);
-        out += b;
-        out += "      \"pages\": [\n";
-        for (int pi = 0; pi < (int)doc.pages.size(); ++pi) {
-            const Page& page = doc.pages[pi];
-            snprintf(b, sizeof(b),
-                     "        { \"index\": %d, \"x\": %.4f, \"y\": %.4f, \"w\": %.2f, \"h\": %.2f }%s\n",
-                     page.page_index, page.world_pos.x, page.world_pos.y,
-                     page.world_w, page.world_h,
-                     pi + 1 < (int)doc.pages.size() ? "," : "");
-            out += b;
-        }
-        out += "      ]\n";
-        snprintf(b, sizeof(b), "    }%s\n", di + 1 < (int)g_documents.size() ? "," : "");
-        out += b;
-    }
-    out += "  ],\n";
-
-    out += "  \"text_boxes\": [\n";
-    for (int i = 0; i < (int)g_text_boxes.size(); ++i) {
-        const auto& box = g_text_boxes[i];
-        snprintf(b, sizeof(b),
-                 "    { \"id\": %d, \"x\": %.4f, \"y\": %.4f, \"r\": %.3f, \"g\": %.3f, \"b\": %.3f, \"fs\": %.1f, \"w\": %.2f, \"h\": %.2f, \"text\": \"",
-                 box.id, box.world_pos.x, box.world_pos.y, box.r, box.g, box.b, box.font_size,
-                 box.w, box.h);
-        out += b;
-        out += json_escape(box.text);
-        snprintf(b, sizeof(b), "\" }%s\n", i + 1 < (int)g_text_boxes.size() ? "," : "");
-        out += b;
-    }
-    out += "  ],\n";
-
-    out += "  \"annots\": [\n";
-    bool first_annot = true;
-    auto sep = [&]{ if (!first_annot) out += ",\n"; first_annot = false; };
-
-    for (int di = 0; di < (int)g_documents.size(); ++di) {
-        for (int pi = 0; pi < (int)g_documents[di].pages.size(); ++pi) {
-            const PageAnnotations& an = g_documents[di].pages[pi].annots;
-            for (const auto& hl : an.highlights) {
-                sep();
-                if (hl.text.empty()) {
-                    snprintf(b, sizeof(b),
-                             "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f] }",
-                             di, pi, hl.x0, hl.y0, hl.x1, hl.y1);
-                    out += b;
-                } else {
-                    snprintf(b, sizeof(b),
-                             "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f], \"ht\": \"",
-                             di, pi, hl.x0, hl.y0, hl.x1, hl.y1);
-                    out += b;
-                    out += json_escape(hl.text.c_str());
-                    out += "\" }";
-                }
-            }
-            for (const auto& note : an.notes) {
-                sep();
-                snprintf(b, sizeof(b),
-                         "    { \"doc\": %d, \"page\": %d, \"note\": \"%s\" }",
-                         di, pi, note.label.c_str());
-                out += b;
-            }
-            for (const auto& stroke : an.strokes) {
-                sep();
-                snprintf(b, sizeof(b),
-                         "    { \"doc\": %d, \"page\": %d, \"sr\": %.5f, \"sg\": %.5f, \"sb\": %.5f }",
-                         di, pi, stroke.r, stroke.g, stroke.b);
-                out += b;
-                for (const auto& pt : stroke.pts) {
-                    snprintf(b, sizeof(b), ",\n    { \"p\": [%.6f, %.6f] }", pt.x, pt.y);
-                    out += b;
-                }
-            }
-        }
-    }
-    if (!first_annot) out += "\n";
-    out += "  ]\n}\n";
-    return out;
-}
-
-// Write a JSON string atomically: write to <path>.tmp then rename.
-// Safe to call from a background thread — no global state is read.
-static bool write_json_file(const std::string& json, const std::string& path) {
-    std::string tmp = path + ".tmp";
-    FILE* f = fopen(tmp.c_str(), "w");
-    if (!f) { fprintf(stderr, "save: cannot open %s\n", tmp.c_str()); return false; }
-    bool ok = fwrite(json.data(), 1, json.size(), f) == json.size();
-    fclose(f);
-    if (!ok) { remove(tmp.c_str()); return false; }
-#ifdef _WIN32
-    _unlink(path.c_str());   // rename() on Windows fails if the target exists
-#endif
-    if (rename(tmp.c_str(), path.c_str()) != 0) { remove(tmp.c_str()); return false; }
-    return true;
-}
-
-// True while a background autosave thread is writing to disk.
-static std::atomic<bool> g_autosave_running{false};
-
-// Serialize now (main thread), then write to disk on a background thread.
-// Skips if a previous background save is still in progress — the data is
-// recent enough that the next 60-second tick will capture any missed changes.
-static void start_autosave(const std::string& path) {
-    if (g_autosave_running.exchange(true)) return;
-    std::string json = build_project_json();
-    std::thread([json = std::move(json), path]() mutable {
-        write_json_file(json, path);
-        g_autosave_running.store(false);
-    }).detach();
-}
-
-static bool save_to_path(const std::string& path) {
-    std::string json = build_project_json();
-    if (!write_json_file(json, path)) {
-        fprintf(stderr, "save_project: cannot write %s\n", path.c_str());
-        return false;
-    }
-
-    if (g_debug) {
-        int s_hl = 0, s_note = 0, s_stroke = 0;
-        for (const auto& doc : g_documents)
-            for (const auto& pg : doc.pages) {
-                s_hl += (int)pg.annots.highlights.size();
-                s_note += (int)pg.annots.notes.size();
-                s_stroke += (int)pg.annots.strokes.size();
-            }
-        printf("Project saved: %s — %d text boxes, %d highlights, %d notes, %d strokes\n",
-               path.c_str(), (int)g_text_boxes.size(), s_hl, s_note, s_stroke);
-    }
-    if (g_save_feedback_type == SaveFeedbackType::None)
-        g_save_feedback_type = SaveFeedbackType::Manual;
-    g_save_feedback_time = std::chrono::steady_clock::now();
-    return true;
-}
-
-static void before_file_dialog() {
-#ifdef __APPLE__
-    scholion_activate_app();
-#elif defined(_WIN32)
-    if (g_window) EnableWindow(glfwGetWin32Window(g_window), FALSE);
-#endif
-}
-
-static void after_file_dialog() {
-#ifdef _WIN32
-    if (g_window) {
-        HWND hwnd = glfwGetWin32Window(g_window);
-        EnableWindow(hwnd, TRUE);
-        SetForegroundWindow(hwnd);
-    }
-#endif
-}
-
-static void save_project() {
-    before_file_dialog();
-    const char* filter_patterns[] = {"*.scholion"};
-    const char* picked = tinyfd_saveFileDialog(
-        "Save Project", "project.scholion", 1, filter_patterns, "Scholion Project");
-    after_file_dialog();
-    if (!picked) return;
-
-    if (save_to_path(picked)) {
-        g_project_path   = picked;
-        g_last_save_time = std::chrono::steady_clock::now();
-        add_to_recents(picked);
-        update_window_title();
-        printf("Project saved: %s\n", picked);
-    }
-}
-
-// Cmd+S: silently overwrite the known project file; if none is set yet, fall
-// back to the Save-As dialog (which sets g_project_path on success).
-static void save_project_current() {
-    if (g_project_path.empty()) {
-        save_project();
-        return;
-    }
-    if (save_to_path(g_project_path)) {
-        g_last_save_time = std::chrono::steady_clock::now();
-        printf("Project saved: %s\n", g_project_path.c_str());
-    } else {
-        fprintf(stderr, "save_project: failed to write %s\n", g_project_path.c_str());
-    }
-}
-
-// --- Load project -----------------------------------------------------------
-// load_project_from_path reads the entire file into memory and locates tokens
-// by position rather than by line, making it tolerant of compact/pretty-printed
-// JSON, CRLF line endings, and reordered top-level keys.
-//
-// doc_map (saved index → actual g_documents index) handles the case where one
-// or more PDFs are missing at load time: a missing PDF becomes a placeholder
-// Document (doc.missing = true, loader = nullptr) that keeps its pages and
-// annotations alive. Subsequent saved docs shift their actual index relative to
-// their saved index. Annotations are re-keyed through doc_map after all docs
-// load so they attach to the right document even when indices shifted.
-static void load_project_from_path(const std::string& path) {
-    FILE* f = fopen(path.c_str(), "r");
-    if (!f) { fprintf(stderr, "load_project: cannot open %s\n", path.c_str()); return; }
-
-    struct SavedPage { int idx; float x, y; float w = 0.0f, h = 0.0f; };
-    struct SavedDoc  { std::string path; float sox, soy; std::vector<SavedPage> pages; };
-
-    // Saved annotation records collected during parse, applied after docs load.
-    struct SavedHL     { int doc, page; AnnotHighlight hl; };
-    struct SavedNote   { int doc, page; std::string label; };
-    struct SavedStroke { int doc, page; AnnotStroke stroke; };
-
-    std::vector<SavedDoc>      saved;
-    std::vector<SavedHL>       saved_hls;
-    std::vector<SavedNote>     saved_notes;
-    std::vector<SavedStroke>   saved_strokes;
-    std::vector<CanvasTextBox> saved_boxes;   // applied after the reset, like annotations
-
-    float vx = 0.0f, vy = 0.0f, vz = 0.6f;
-    int   cur = -1;
-
-    enum class Section { Docs, TextBoxes, Annots, Other };
-
-    // State for multi-line stroke parsing
-    int   stroke_doc = -1, stroke_page = -1;
-    AnnotStroke building_stroke;
-    bool  building = false;
-
-    auto flush_stroke = [&]() {
-        if (building && !building_stroke.pts.empty())
-            saved_strokes.push_back({stroke_doc, stroke_page, std::move(building_stroke)});
-        building_stroke = {};
-        building = false;
-    };
-
-    // Read the whole file (CR-stripped for CRLF tolerance). We then locate key
-    // tokens by position rather than by line, so a record may span lines or share
-    // a line and field order/whitespace doesn't matter — sscanf treats any run of
-    // whitespace (incl. newlines) the same, so the same field patterns apply.
-    std::string content;
-    if (fseek(f, 0, SEEK_END) == 0) {
-        long sz = ftell(f);
-        if (sz > 0) {
-            if ((size_t)sz > 20 * 1024 * 1024) {
-                fclose(f);
-                fprintf(stderr, "load: project file exceeds 20 MB limit (%ld bytes)\n", sz);
-                return;
-            }
-            content.resize((size_t)sz);
-            fseek(f, 0, SEEK_SET);
-            size_t rd = fread(&content[0], 1, (size_t)sz, f);
-            content.resize(rd);
-        }
-    }
-    fclose(f);
-    content.erase(std::remove(content.begin(), content.end(), '\r'), content.end());
-
-    // Section is determined by which named-array key most recently precedes a
-    // token's position (the file writes viewport, documents, text_boxes, annots
-    // in that order). Colon-anchored so a path value can't be mistaken for one.
-    const size_t npos = std::string::npos;
-    size_t doc_key = content.find("\"documents\":");
-    size_t tb_key  = content.find("\"text_boxes\":");
-    size_t an_key  = content.find("\"annots\":");
-    auto section_at = [&](size_t at) -> Section {
-        Section sec = Section::Other;
-        if (doc_key != npos && at > doc_key) sec = Section::Docs;
-        if (tb_key  != npos && at > tb_key)  sec = Section::TextBoxes;
-        if (an_key  != npos && at > an_key)  sec = Section::Annots;
-        return sec;
-    };
-
-    enum Tok { T_VIEWPORT, T_NOTE_IDX, T_PATH, T_STACK, T_INDEX, T_ID, T_DOC, T_POINT };
-    struct TokDef { const char* s; size_t len; Tok t; };
-    static const TokDef toks[] = {
-        {"\"viewport\":",     11, T_VIEWPORT},
-        {"\"note_idx\":",     11, T_NOTE_IDX},
-        {"\"path\":",          7, T_PATH},
-        {"\"stack_origin\":", 15, T_STACK},
-        {"\"index\":",         8, T_INDEX},
-        {"\"id\":",            5, T_ID},
-        {"\"doc\":",           6, T_DOC},
-        {"\"p\":",             4, T_POINT},
-    };
-    bool note_idx_loaded = false;
-
-    size_t scan = 0;
-    while (scan < content.size()) {
-        size_t best = npos; const TokDef* bt = nullptr;
-        for (const auto& td : toks) {
-            size_t fnd = content.find(td.s, scan);
-            if (fnd < best) { best = fnd; bt = &td; }
-        }
-        if (!bt) break;
-        const char* at  = content.c_str() + best;
-        Section     sec = section_at(best);
-        float a, b, c, d; int n; char s[4096];
-
-        switch (bt->t) {
-            case T_VIEWPORT:
-                if (sscanf(at, "\"viewport\": { \"x\": %f, \"y\": %f, \"zoom\": %f }", &a, &b, &c) == 3) {
-                    vx = a; vy = b; vz = c;
-                }
-                break;
-            case T_NOTE_IDX:
-                if (sscanf(at, "\"note_idx\": %d", &n) == 1) {
-                    g_next_note_idx = n;
-                    note_idx_loaded = true;
-                }
-                break;
-            case T_PATH:
-                if (sec == Section::Docs && sscanf(at, "\"path\": \"%[^\"]\"", s) == 1) {
-                    saved.push_back({s, 0.0f, 0.0f, {}});
-                    cur = (int)saved.size() - 1;
-                }
-                break;
-            case T_STACK:
-                if (sec == Section::Docs && cur >= 0 &&
-                    sscanf(at, "\"stack_origin\": [%f, %f]", &a, &b) == 2) {
-                    saved[cur].sox = a; saved[cur].soy = b;
-                }
-                break;
-            case T_INDEX:
-                if (sec == Section::Docs && cur >= 0) {
-                    float pw = 0.0f, ph = 0.0f;
-                    int np = sscanf(at, "\"index\": %d, \"x\": %f, \"y\": %f, \"w\": %f, \"h\": %f",
-                                    &n, &a, &b, &pw, &ph);
-                    if (np >= 3) saved[cur].pages.push_back({n, a, b, pw, ph});
-                }
-                break;
-            case T_ID:
-                if (sec == Section::TextBoxes) {
-                    int id; float x, y, tr = 0.82f, tg = 0.06f, tb2 = 0.06f, tfs = 16.0f, tw = 0.0f, th = 0.0f;
-                    int np = sscanf(at,
-                        "\"id\": %d, \"x\": %f, \"y\": %f, \"r\": %f, \"g\": %f, \"b\": %f, \"fs\": %f, \"w\": %f, \"h\": %f",
-                        &id, &x, &y, &tr, &tg, &tb2, &tfs, &tw, &th);
-                    if (np >= 3) {
-                        CanvasTextBox tb; tb.id = id; tb.world_pos = {x, y}; tb.text[0] = '\0';
-                        if (np >= 7) { tb.r = tr; tb.g = tg; tb.b = tb2; tb.font_size = tfs; }
-                        if (np >= 9) { tb.w = tw; tb.h = th; }
-                        extract_json_text(at, tb.text, sizeof(tb.text));  // finds this record's "text"
-                        saved_boxes.push_back(tb);
-                    }
-                }
-                break;
-            case T_DOC:
-                if (sec == Section::Annots) {
-                    int di, pi;
-                    if (sscanf(at, "\"doc\": %d, \"page\": %d, \"hl\": [%f, %f, %f, %f]",
-                               &di, &pi, &a, &b, &c, &d) == 6) {
-                        flush_stroke();
-                        AnnotHighlight parsed_hl{a, b, c, d, {}};
-                        // Restore captured text if present (optional field added in M29)
-                        const char* ht = strstr(at, "\"ht\": \"");
-                        if (ht) {
-                            ht += 7;
-                            while (*ht && *ht != '"') {
-                                if (*ht == '\\' && *(ht + 1)) {
-                                    ++ht;
-                                    switch (*ht) {
-                                        case 'n': parsed_hl.text += '\n'; break;
-                                        case '"': parsed_hl.text += '"';  break;
-                                        case '\\': parsed_hl.text += '\\'; break;
-                                        default: parsed_hl.text += *ht; break;
-                                    }
-                                } else {
-                                    parsed_hl.text += *ht;
-                                }
-                                ++ht;
-                            }
-                        }
-                        saved_hls.push_back({di, pi, std::move(parsed_hl)});
-                    } else if (sscanf(at, "\"doc\": %d, \"page\": %d, \"note\": \"%[^\"]\"",
-                                      &di, &pi, s) == 3) {
-                        flush_stroke(); saved_notes.push_back({di, pi, s});
-                    } else if (sscanf(at, "\"doc\": %d, \"page\": %d, \"sr\": %f, \"sg\": %f, \"sb\": %f",
-                                      &di, &pi, &a, &b, &c) == 5) {
-                        flush_stroke();
-                        stroke_doc = di; stroke_page = pi;
-                        building_stroke = {}; building_stroke.r = a; building_stroke.g = b; building_stroke.b = c;
-                        building = true;
-                    }
-                }
-                break;
-            case T_POINT:
-                if (sec == Section::Annots && building &&
-                    sscanf(at, "\"p\": [%f, %f]", &a, &b) == 2) {
-                    building_stroke.pts.push_back({a, b});
-                }
-                break;
-        }
-        scan = best + bt->len;
-    }
-    flush_stroke();
-
-    clear_documents();
-    g_text_boxes.clear();
-    g_selected_box = g_editing_box = -1;
-    g_prev_selected_box = g_prev_editing_box = -1;
-    g_just_created = g_edit_was_new = false;
-    namespace fs = std::filesystem;
-
-    // Restore the parsed text boxes now that the reset is done.
-    g_text_boxes = std::move(saved_boxes);
-    for (const auto& tb : g_text_boxes)
-        g_next_box_id = std::max(g_next_box_id, tb.id + 1);
-
-    // Map each saved document index → its actual index in g_documents. A skipped
-    // (missing) PDF shifts later indices, so annotations must be re-keyed through
-    // this map or they'd attach to the wrong document (or be dropped).
-    // Default placeholder page size (US Letter, in PDF points = world units).
-    // Page dimensions aren't stored in the project file, so a missing PDF's
-    // pages fall back to this until the real file is available again.
-    constexpr float PLACEHOLDER_PAGE_W = 612.0f, PLACEHOLDER_PAGE_H = 792.0f;
-
-    std::vector<int> doc_map(saved.size(), -1);
-    for (size_t si = 0; si < saved.size(); ++si) {
-        const auto& sd = saved[si];
-        if (!fs::exists(sd.path)) {
-            fprintf(stderr, "load_project: PDF not found, keeping placeholder: %s\n", sd.path.c_str());
-            // Keep a placeholder document so its reference + annotations survive a
-            // re-save and document indices stay aligned with the saved file.
-            Document d;
-            d.path         = sd.path;
-            d.missing      = true;
-            d.stack_origin = {sd.sox, sd.soy};
-            auto& c = DOC_PALETTE[g_documents.size() % PALETTE_SIZE];
-            d.hue_r = c[0]; d.hue_g = c[1]; d.hue_b = c[2];
-            for (const auto& sp : sd.pages) {
-                Page p;
-                p.page_index = sp.idx;
-                p.world_pos  = {sp.x, sp.y};
-                p.world_w    = sp.w > 0.0f ? sp.w : PLACEHOLDER_PAGE_W;  // saved size if present
-                p.world_h    = sp.h > 0.0f ? sp.h : PLACEHOLDER_PAGE_H;
-                d.pages.push_back(p);
-            }
-            doc_map[si] = (int)g_documents.size();
-            g_documents.push_back(std::move(d));
-            g_loaders.push_back(nullptr);   // keep parallel arrays aligned
-            continue;
-        }
-        printf("Loading: %s\n", sd.path.c_str());
-        size_t before = g_documents.size();
-        load_pdf(sd.path);
-        if (g_documents.size() == before) continue;  // load failed; leave map at -1
-
-        doc_map[si] = (int)g_documents.size() - 1;
-        Document& doc = g_documents.back();
-        doc.stack_origin = {sd.sox, sd.soy};
-        for (const auto& sp : sd.pages) {
-            for (auto& pg : doc.pages) {
-                if (pg.page_index == sp.idx) { pg.world_pos = {sp.x, sp.y}; break; }
-            }
-        }
-    }
-    g_input.set_documents(&g_documents);  // ensure input has docs even if all are placeholders
-    auto map_doc = [&](int sd) -> int {
-        return (sd >= 0 && sd < (int)doc_map.size()) ? doc_map[sd] : -1;
-    };
-
-    // Apply saved annotations now that documents and pages are in place.
-    auto safe_page = [&](int di, int pi) -> Page* {
-        if (di < 0 || di >= (int)g_documents.size()) return nullptr;
-        auto& pages = g_documents[di].pages;
-        auto it = std::find_if(pages.begin(), pages.end(),
-                               [pi](const Page& p){ return p.page_index == pi; });
-        return it != pages.end() ? &*it : nullptr;
-    };
-
-    for (const auto& sh : saved_hls)    if (auto* p = safe_page(map_doc(sh.doc), sh.page)) p->annots.highlights.push_back(sh.hl);
-    for (const auto& sn : saved_notes)  if (auto* p = safe_page(map_doc(sn.doc), sn.page)) p->annots.notes.push_back({sn.label});
-    for (auto& ss : saved_strokes)      if (auto* p = safe_page(map_doc(ss.doc), ss.page)) p->annots.strokes.push_back(std::move(ss.stroke));
-
-    // Restore note counter. Newer files save it directly; older files fall back
-    // to counting notes (correct as long as no notes were deleted before saving).
-    if (!note_idx_loaded) {
-        g_next_note_idx = 0;
-        for (const auto& doc : g_documents)
-            for (const auto& pg : doc.pages)
-                g_next_note_idx += (int)pg.annots.notes.size();
-    }
-
-    g_canvas.set_offset({vx, vy});
-    g_canvas.set_zoom(vz);
-
-    g_project_path   = path;
-    g_last_save_time = std::chrono::steady_clock::now();
-    add_to_recents(path);
-    update_window_title();
-
-    if (g_debug) {
-        int n_hl = 0, n_note = 0, n_stroke = 0;
-        for (const auto& doc : g_documents)
-            for (const auto& pg : doc.pages) {
-                n_hl += (int)pg.annots.highlights.size();
-                n_note += (int)pg.annots.notes.size();
-                n_stroke += (int)pg.annots.strokes.size();
-            }
-        printf("Project loaded: %s — %d docs, %d text boxes, %d highlights, %d notes, %d strokes\n",
-               path.c_str(), (int)g_documents.size(), (int)g_text_boxes.size(), n_hl, n_note, n_stroke);
-    }
-}
-
-static void load_project() {
-    before_file_dialog();
-    // No type filter: tinyfiledialogs passes the extension to AppleScript's
-    // "choose file of type", which on macOS 12+ treats it as a UTI lookup.
-    // Since "scholion" isn't a registered UTI, all .scholion files get greyed
-    // out. Showing all files is more reliable; the dialog title guides the user.
-    const char* p = tinyfd_openFileDialog("Open Project", "", 0, nullptr, nullptr, 0);
-    after_file_dialog();
-    if (p) load_project_from_path(p);
 }
 
 // --- Startup chooser (bare/native launch only) ------------------------------
@@ -3132,17 +1805,25 @@ static void draw_startup_chooser() {
             load_project();
         }
         if (ImGui::Button("Add PDF File(s)", bsz)) {
-            before_file_dialog();
             const char* pats[] = {"*.pdf", "*.PDF"};
+#ifdef __APPLE__
+            const char* r = scholion_open_file("Select PDF files", pats, 2, 1);
+#else
+            before_file_dialog();
             const char* r = tinyfd_openFileDialog("Select PDF files", nullptr, 2, pats, "PDF Documents", 1);
             after_file_dialog();
+#endif
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
             if (r) load_pdfs_from_selection(r);
         }
         if (ImGui::Button("Add Folder of PDFs", bsz)) {
+#ifdef __APPLE__
+            const char* d = scholion_select_folder("Select PDF folder");
+#else
             before_file_dialog();
             const char* d = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
             after_file_dialog();
+#endif
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
             if (d) load_pdfs_from_folder(d);
         }
@@ -3219,26 +1900,6 @@ static void draw_settings_popup() {
         save_prefs();
     }
 
-#ifdef SCHOLION_DEV
-    // --- Developer Mode ---
-    ImGui::Spacing();
-    bool prev_dev = g_settings.developer_mode;
-    ImGui::Checkbox("Developer mode", &g_settings.developer_mode);
-    ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 340.0f);
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("Writes a benchmark CSV to the Desktop once per second "
-                       "(fps, frame time, VRAM, RAM, rast queue). "
-                       "For profiling only — disable when not measuring.");
-    ImGui::PopStyleColor();
-    ImGui::PopTextWrapPos();
-    if (g_settings.developer_mode != prev_dev) {
-        if (!g_settings.developer_mode && g_bench_file) {
-            fclose(g_bench_file);
-            g_bench_file = nullptr;
-        }
-        save_prefs();
-    }
-#endif // SCHOLION_DEV
 
     // --- Keyboard Shortcuts ---
     ImGui::SeparatorText("Keyboard Shortcuts");
@@ -3406,17 +2067,25 @@ static void draw_canvas_context_menu() {
 
         // Document operations
         if (ImGui::MenuItem("Add PDF...")) {
-            before_file_dialog();
             const char* patterns[] = {"*.pdf", "*.PDF"};
+#ifdef __APPLE__
+            const char* r = scholion_open_file("Select PDF files", patterns, 2, 1);
+#else
+            before_file_dialog();
             const char* r = tinyfd_openFileDialog("Select PDF files", nullptr,
                                                   2, patterns, "PDF Documents", 1);
             after_file_dialog();
+#endif
             if (r) load_pdfs_from_selection(r);
         }
         if (ImGui::MenuItem("Add folder...")) {
+#ifdef __APPLE__
+            const char* r = scholion_select_folder("Select PDF folder");
+#else
             before_file_dialog();
             const char* r = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
             after_file_dialog();
+#endif
             if (r) load_pdfs_from_folder(r);
         }
         ImGui::Separator();
@@ -3428,8 +2097,6 @@ static void draw_canvas_context_menu() {
 
         // Exit
         if (ImGui::MenuItem("Quit", "Cmd+Q")) {
-            // TODO: Show save confirmation dialog
-            // For now, just set a flag to trigger the quit dialog
             g_quit_requested = true;
         }
         ImGui::EndPopup();
@@ -3438,99 +2105,262 @@ static void draw_canvas_context_menu() {
 
 // --- References tab (inside panel) ------------------------------------------
 
+struct RefEntry { int di, pi, hi; };  // indices into g_documents[di].pages[pi].annots.highlights[hi]
+
 static void draw_references_tab() {
     namespace fs = std::filesystem;
 
+    // Build a flat sorted list of all text highlights across all documents.
+    // Sorted by document order then page order (stable presentation).
+    std::vector<RefEntry> entries;
+    for (int di = 0; di < (int)g_documents.size(); ++di)
+        for (int pi = 0; pi < (int)g_documents[di].pages.size(); ++pi)
+            for (int hi = 0; hi < (int)g_documents[di].pages[pi].annots.highlights.size(); ++hi)
+                if (!g_documents[di].pages[pi].annots.highlights[hi].text.empty())
+                    entries.push_back({di, pi, hi});
+
     // Right-aligned export button
     float avail = ImGui::GetContentRegionAvail().x;
-    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - 95.0f);
-    if (ImGui::SmallButton("Export .md")) {
+    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + avail - 100.0f);
+    if (ImGui::SmallButton("Export .html")) {
+        const char* filters[] = {"*.html"};
+#ifdef __APPLE__
+        const char* out_path = scholion_save_file("Export References", "references.html", filters, 1);
+#else
         before_file_dialog();
-        const char* filters[] = {"*.md"};
         const char* out_path = tinyfd_saveFileDialog(
-            "Export References", "references.md", 1, filters, "Markdown");
+            "Export References", "references.html", 1, filters, "HTML file");
         after_file_dialog();
+#endif
         if (out_path) {
             FILE* f = fopen(out_path, "w");
             if (f) {
-                fprintf(f, "# Scholion References\n\n");
-                for (int di = 0; di < (int)g_documents.size(); ++di) {
-                    const Document& doc = g_documents[di];
-                    bool has_refs = false;
-                    for (const auto& pg : doc.pages)
-                        for (const auto& hl : pg.annots.highlights)
-                            if (!hl.text.empty()) { has_refs = true; break; }
-                    if (!has_refs) continue;
-                    std::string fname = fs::path(doc.path).filename().string();
-                    fprintf(f, "## %s\n\n", fname.c_str());
-                    for (const auto& pg : doc.pages)
-                        for (const auto& hl : pg.annots.highlights)
-                            if (!hl.text.empty())
-                                fprintf(f, "- **p.%d** — %s\n",
-                                        pg.page_index + 1, hl.text.c_str());
-                    fprintf(f, "\n");
+                // Escape < > & " for safe HTML embedding
+                auto esc = [](const std::string& s) {
+                    std::string r; r.reserve(s.size());
+                    for (char c : s) {
+                        if      (c == '&')  r += "&amp;";
+                        else if (c == '<')  r += "&lt;";
+                        else if (c == '>')  r += "&gt;";
+                        else if (c == '"')  r += "&quot;";
+                        else                r += c;
+                    }
+                    return r;
+                };
+                fprintf(f,
+                    "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n"
+                    "<meta charset=\"UTF-8\">\n"
+                    "<title>Scholion References</title>\n"
+                    "<style>\n"
+                    "  body{font-family:Georgia,serif;max-width:740px;margin:40px auto;"
+                         "padding:0 24px;background:#f9f9f7;color:#222;}\n"
+                    "  h1{font-size:1.3em;font-weight:normal;color:#666;"
+                         "border-bottom:1px solid #ccc;padding-bottom:8px;margin-bottom:24px;}\n"
+                    "  .entry{margin:0 0 20px 0;}\n"
+                    "  blockquote{margin:0 0 5px 0;padding:10px 16px;"
+                         "background:#fffef0;border-left:3px solid #c8a84b;"
+                         "font-style:italic;color:#333;}\n"
+                    "  .source{font-size:0.80em;color:#999;margin:0 0 6px 16px;}\n"
+                    "  .note{font-size:0.88em;color:#555;margin:6px 0 0 20px;"
+                         "padding:7px 12px;background:#f0f0f5;border-radius:4px;"
+                         "font-style:italic;white-space:pre-wrap;"
+                         "border-left:2px solid #aab;}\n"
+                    "  hr{border:none;border-top:1px solid #ddd;margin:20px 0;}\n"
+                    "  @media print{body{background:#fff;}}\n"
+                    "</style>\n</head>\n<body>\n"
+                    "<h1>Scholion References</h1>\n");
+                for (int gi = 0; gi < (int)entries.size(); ++gi) {
+                    const auto& e = entries[gi];
+                    const Document& doc = g_documents[e.di];
+                    const Page&     pg  = doc.pages[e.pi];
+                    const auto&     hl  = pg.annots.highlights[e.hi];
+                    std::string fname = esc(fs::path(doc.path).filename().string());
+                    std::string text  = esc(hl.text);
+                    fprintf(f, "<div class=\"entry\">\n");
+                    fprintf(f, "  <blockquote>&#8220;%s&#8221;</blockquote>\n", text.c_str());
+                    fprintf(f, "  <div class=\"source\">%s &mdash; p.%d</div>\n",
+                            fname.c_str(), pg.page_index + 1);
+                    for (const auto& rn : g_ref_notes) {
+                        if (rn.after_idx == gi && !rn.text.empty())
+                            fprintf(f, "  <div class=\"note\">%s</div>\n",
+                                    esc(rn.text).c_str());
+                    }
+                    fprintf(f, "</div>\n");
+                    if (gi + 1 < (int)entries.size()) fprintf(f, "<hr>\n");
                 }
+                fprintf(f, "</body>\n</html>\n");
                 fclose(f);
             }
         }
     }
-    ImGui::SetItemTooltip("Export all text highlights as a Markdown file");
+    ImGui::SetItemTooltip("Export all highlights and notes as an HTML file (opens in any browser)");
     ImGui::Separator();
 
-    bool any = false;
-    for (int di = 0; di < (int)g_documents.size(); ++di) {
-        const Document& doc = g_documents[di];
-        // Count text-bearing highlights for this document
-        int ref_count = 0;
-        for (const auto& pg : doc.pages)
-            for (const auto& hl : pg.annots.highlights)
-                if (!hl.text.empty()) ++ref_count;
-        if (ref_count == 0) continue;
-        any = true;
-
-        // Document header in its hue color
-        std::string fname = fs::path(doc.path).filename().string();
-        ImGui::PushStyleColor(ImGuiCol_Text, {doc.hue_r, doc.hue_g, doc.hue_b, 1.0f});
-        ImGui::TextUnformatted(fname.c_str());
-        ImGui::PopStyleColor();
-
-        for (int pi = 0; pi < (int)doc.pages.size(); ++pi) {
-            const Page& pg = doc.pages[pi];
-            for (int hi = 0; hi < (int)pg.annots.highlights.size(); ++hi) {
-                const AnnotHighlight& hl = pg.annots.highlights[hi];
-                if (hl.text.empty()) continue;
-
-                // Truncate display text; full text appears on hover
-                std::string display = hl.text;
-                bool truncated = display.size() > 90;
-                if (truncated) { display.resize(87); display += "..."; }
-
-                // Combined selectable row "p.N  text..."
-                char row[640];
-                snprintf(row, sizeof(row), "p.%d  %s##ref%d_%d_%d",
-                         pg.page_index + 1, display.c_str(), di, pi, hi);
-
-                if (ImGui::Selectable(row, false, ImGuiSelectableFlags_None, {0.0f, 0.0f})) {
-                    zoom_to_rect(pg.world_pos.x, pg.world_pos.y,
-                                 pg.world_pos.x + pg.world_w,
-                                 pg.world_pos.y + pg.world_h);
-                    g_input.open_panel(di, pg.page_index);
-                }
-                if (truncated)
-                    ImGui::SetItemTooltip("%s", hl.text.c_str());
-            }
-        }
-        ImGui::Spacing();
-    }
-
-    if (!any) {
+    if (entries.empty()) {
         ImGui::Spacing();
         ImGui::PushStyleColor(ImGuiCol_Text, {0.5f, 0.5f, 0.5f, 1.0f});
         ImGui::TextWrapped(
             "No text highlights yet.\n\n"
-            "Open a document, select the Highlight tool, then drag across text on the page "
+            "Select the Highlight tool, then drag across text on a page "
             "— it will appear here with the filename and page number.");
         ImGui::PopStyleColor();
+        return;
+    }
+
+    for (int gi = 0; gi < (int)entries.size(); ++gi) {
+        const auto& e = entries[gi];
+        const Document& doc = g_documents[e.di];
+        const Page&     pg  = doc.pages[e.pi];
+        const auto&     hl  = pg.annots.highlights[e.hi];
+
+        // --- Highlight card ---
+        ImGui::PushStyleColor(ImGuiCol_Text, {doc.hue_r, doc.hue_g, doc.hue_b, 0.85f});
+        std::string fname = fs::path(doc.path).filename().string();
+        char source[256]; snprintf(source, sizeof(source), "%s · p.%d", fname.c_str(), pg.page_index + 1);
+        ImGui::TextUnformatted(source);
+        ImGui::PopStyleColor();
+
+        std::string display = hl.text;
+        bool truncated = display.size() > 120;
+        if (truncated) { display.resize(117); display += "..."; }
+        char row[512];
+        snprintf(row, sizeof(row), "\"%s\"##hl%d", display.c_str(), gi);
+        if (ImGui::Selectable(row, false)) {
+            zoom_to_rect(pg.world_pos.x, pg.world_pos.y,
+                         pg.world_pos.x + pg.world_w, pg.world_pos.y + pg.world_h);
+        }
+        if (truncated) ImGui::SetItemTooltip("%s", hl.text.c_str());
+
+        // --- Note for this reference (indexed by gi) ---
+        int note_slot = -1;
+        for (int ni = 0; ni < (int)g_ref_notes.size(); ++ni)
+            if (g_ref_notes[ni].after_idx == gi) { note_slot = ni; break; }
+
+        {
+            const float kXW    = 20.0f;
+            const float kPad   = 5.0f;
+            const float kSpc   = ImGui::GetStyle().ItemSpacing.x;
+            const float avail  = ImGui::GetContentRegionAvail().x;
+            const float kRound = 3.0f;
+            const ImU32 kBord  = IM_COL32(80, 80, 96, 150);
+
+            // tl/cb saved before any content is drawn for this note row.
+            ImVec2 cb = ImGui::GetCursorPos();
+            ImVec2 tl = ImGui::GetCursorScreenPos();
+
+            if (note_slot >= 0 && s_editing_ref_note == gi) {
+                // ---- Editing: text box inset inside border, X top-right ----
+                const float kTextH = 76.0f;
+                const float box_h  = kPad * 2.0f + kTextH;
+
+                // Inset cursor so text box sits inside the border with kPad margin
+                ImGui::SetCursorPos({cb.x + kPad, cb.y + kPad});
+                ImGui::PushStyleColor(ImGuiCol_FrameBg, {0.10f, 0.10f, 0.13f, 0.9f});
+                ImGui::SetNextItemWidth(avail - kXW - kSpc - kPad * 2.0f);
+                char edit_id[32]; snprintf(edit_id, sizeof(edit_id), "##rnedit%d", gi);
+                ImGui::InputTextMultiline(edit_id, s_ref_note_buf, sizeof(s_ref_note_buf),
+                                          {0.0f, kTextH});
+                ImGui::PopStyleColor();
+
+                // Border drawn after text box (outline only, doesn't obscure content)
+                ImGui::GetWindowDrawList()->AddRect(
+                    tl, {tl.x + avail, tl.y + box_h}, kBord, kRound);
+
+                // X pinned to top-right corner of the border box
+                ImGui::SetCursorScreenPos({tl.x + avail - kXW - 1.0f, tl.y + 2.0f});
+                char del_id[32]; snprintf(del_id, sizeof(del_id), "X##rnd%d", gi);
+                if (ImGui::SmallButton(del_id)) {
+                    g_ref_notes.erase(g_ref_notes.begin() + note_slot);
+                    s_editing_ref_note = -1;
+                }
+
+                // Advance cursor past the whole box
+                ImGui::SetCursorPos({cb.x, cb.y + box_h + ImGui::GetStyle().ItemSpacing.y});
+
+            } else if (note_slot >= 0) {
+                // ---- Display: full-box hitbox, DrawList text, X top-right ----
+                const char* note_text = g_ref_notes[note_slot].text.c_str();
+                // Wrap width: avail minus X button, border padding, and extra indent
+                const float wrap_w = avail - kXW - kSpc - kPad * 2.0f - 8.0f;
+                ImVec2 text_sz = ImGui::CalcTextSize(note_text, nullptr, false, wrap_w);
+                const float box_h = kPad * 2.0f + text_sz.y;
+
+                // InvisibleButton covers the whole box — becomes the re-edit hit target
+                char bg_id[32]; snprintf(bg_id, sizeof(bg_id), "##rna_bg%d", gi);
+                ImGui::InvisibleButton(bg_id, {avail, box_h});
+                bool bg_clicked = ImGui::IsItemClicked();
+
+                // Border
+                ImGui::GetWindowDrawList()->AddRect(
+                    tl, {tl.x + avail, tl.y + box_h}, kBord, kRound);
+
+                // Left accent bar — visually marks the block as a note
+                ImGui::GetWindowDrawList()->AddLine(
+                    {tl.x + 3.5f, tl.y + 4.0f},
+                    {tl.x + 3.5f, tl.y + box_h - 4.0f},
+                    IM_COL32(130, 130, 178, 180), 2.0f);
+
+                // Note text: indented, lighter colour (italic not available in default font)
+                ImGui::GetWindowDrawList()->AddText(
+                    ImGui::GetFont(), ImGui::GetFontSize(),
+                    {tl.x + kPad + 8.0f, tl.y + kPad},
+                    IM_COL32(185, 185, 205, 240),
+                    note_text, nullptr, wrap_w);
+
+                // X pinned top-right — drawn after InvisibleButton so it wins the hit test
+                ImGui::SetCursorScreenPos({tl.x + avail - kXW - 1.0f, tl.y + 2.0f});
+                char del_id[32]; snprintf(del_id, sizeof(del_id), "X##rnd%d", gi);
+                bool x_clicked = ImGui::SmallButton(del_id);
+
+                // Restore cursor to after the box
+                ImGui::SetCursorPos({cb.x, cb.y + box_h + ImGui::GetStyle().ItemSpacing.y});
+
+                if (x_clicked) {
+                    g_ref_notes.erase(g_ref_notes.begin() + note_slot);
+                } else if (bg_clicked) {
+                    s_editing_ref_note = gi;
+                    strncpy(s_ref_note_buf, note_text, sizeof(s_ref_note_buf) - 1);
+                    s_ref_note_buf[sizeof(s_ref_note_buf) - 1] = '\0';
+                }
+
+            } else {
+                // ---- No note: bordered placeholder, full box is the hit target ----
+                const float box_h = ImGui::GetFrameHeight() + kPad * 2.0f;
+
+                char bg_id[32]; snprintf(bg_id, sizeof(bg_id), "##rna_bg%d", gi);
+                ImGui::InvisibleButton(bg_id, {avail, box_h});
+                bool activated = ImGui::IsItemClicked();
+
+                // Subtle hover fill
+                if (ImGui::IsItemHovered())
+                    ImGui::GetWindowDrawList()->AddRectFilled(
+                        tl, {tl.x + avail, tl.y + box_h},
+                        IM_COL32(80, 80, 100, 22), kRound);
+
+                // Border
+                ImGui::GetWindowDrawList()->AddRect(
+                    tl, {tl.x + avail, tl.y + box_h}, kBord, kRound);
+
+                // Centered placeholder text
+                const char* ph = "Attach Note to Reference";
+                ImVec2 ts = ImGui::CalcTextSize(ph);
+                ImGui::GetWindowDrawList()->AddText(
+                    {tl.x + (avail - ts.x) * 0.5f, tl.y + (box_h - ts.y) * 0.5f},
+                    IM_COL32(90, 90, 108, 200), ph);
+
+                if (activated) {
+                    g_ref_notes.push_back({gi, ""});
+                    s_editing_ref_note = gi;
+                    s_ref_note_buf[0] = '\0';
+                }
+            }
+        }
+
+        ImGui::Spacing();
+        ImGui::PushStyleColor(ImGuiCol_Separator, {0.45f, 0.45f, 0.52f, 0.85f});
+        ImGui::Separator();
+        ImGui::PopStyleColor();
+        ImGui::Spacing();
     }
 }
 
@@ -3548,8 +2378,8 @@ static void draw_panel_ui() {
     Document& doc = g_documents[doc_idx];
     ImVec2 vp = ImGui::GetMainViewport()->Size;
 
-    ImGui::SetNextWindowPos({vp.x - s_panel_w, 0.0f}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize({s_panel_w, vp.y}, ImGuiCond_Always);
+    ImGui::SetNextWindowPos({vp.x - g_panel_w, 0.0f}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({g_panel_w, vp.y}, ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.94f);
 
     constexpr ImGuiWindowFlags kFlags =
@@ -3586,8 +2416,6 @@ static void draw_panel_ui() {
     ImGui::PopStyleColor();
 
     if (ImGui::SmallButton("Close##panel")) {
-        g_annot_tool  = AnnotTool::None;
-        g_ann_drawing = false;
         g_input.close_panel();
         ImGui::End();
         return;
@@ -3595,47 +2423,8 @@ static void draw_panel_ui() {
     ImGui::SetItemTooltip("Close this document panel");
     ImGui::SameLine();
 
-    // Annotation tool buttons — capture active state before button call to keep Push/Pop balanced
+    // Page navigation  < p.N/Total >
     {
-        bool pen_was    = (g_annot_tool == AnnotTool::Pen);
-        bool hl_was     = (g_annot_tool == AnnotTool::Highlight);
-        bool note_was   = (g_annot_tool == AnnotTool::Note);
-        bool eraser_was = (g_annot_tool == AnnotTool::Eraser);
-
-        if (pen_was)    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.08f, 0.08f, 1.0f));
-        if (ImGui::SmallButton("Pen"))       { g_annot_tool = pen_was    ? AnnotTool::None : AnnotTool::Pen;       g_ann_drawing = false; }
-        if (pen_was)    ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Freehand pen - draw on the page (Escape to cancel)");
-        if (g_annot_tool == AnnotTool::Pen) {
-            ImGui::SameLine();
-            float pcol[3] = {g_pen_r, g_pen_g, g_pen_b};
-            if (ImGui::ColorEdit3("##pencolor", pcol, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
-                { g_pen_r = pcol[0]; g_pen_g = pcol[1]; g_pen_b = pcol[2]; }
-            ImGui::SetItemTooltip("Pen color");
-        }
-        ImGui::SameLine();
-
-        if (hl_was)     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.60f, 0.55f, 0.0f,  1.0f));
-        if (ImGui::SmallButton("Highlight")) { g_annot_tool = hl_was     ? AnnotTool::None : AnnotTool::Highlight; g_ann_drawing = false; }
-        if (hl_was)     ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Highlight tool - drag to draw a yellow rectangle (Escape to cancel)");
-        ImGui::SameLine();
-
-        if (note_was)   ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.40f, 0.70f, 1.0f));
-        if (ImGui::SmallButton("Flag"))      { g_annot_tool = note_was   ? AnnotTool::None : AnnotTool::Note;      g_ann_drawing = false; }
-        if (note_was)   ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Flag - mark a page for quick reference (A, B, C...); visible even when zoomed out");
-        ImGui::SameLine();
-
-        if (eraser_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.30f, 0.30f, 1.0f));
-        if (ImGui::SmallButton("Erase"))     { g_annot_tool = eraser_was ? AnnotTool::None : AnnotTool::Eraser;    g_ann_drawing = false; }
-        if (eraser_was) ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Eraser - drag over strokes or highlights to remove them (Escape to cancel)");
-
-        ImGui::SameLine();
-        ImGui::Spacing(); ImGui::SameLine();
-
-        // Page navigation  < p.N/Total >
         int total = (int)doc.pages.size();
         if (ImGui::SmallButton("<") && s_panel_nav_page > 0) {
             s_panel_nav_page--;
@@ -3738,136 +2527,6 @@ static void draw_panel_ui() {
                 ImVec2 tsz = ImGui::CalcTextSize(note.label.c_str());
                 dl->AddText({ntl.x + (NBW - tsz.x) * 0.5f, ntl.y + (NBH - tsz.y) * 0.5f},
                             IM_COL32(255, 255, 255, 255), note.label.c_str());
-                if (g_annot_tool == AnnotTool::Note) {
-                    char bid[40];
-                    snprintf(bid, sizeof(bid), "##rmflag_%d_%d", page.page_index, ni);
-                    ImGui::SetCursorScreenPos(ntl);
-                    if (ImGui::InvisibleButton(bid, {NBW, NBH}))
-                        remove_idx = ni;
-                }
-            }
-            if (remove_idx >= 0) {
-                UndoRecord r;
-                r.type           = UndoRecord::Type::ErasedNote;
-                r.doc_idx        = doc_idx;
-                r.page_idx       = page.page_index;
-                r.erased_note    = page.annots.notes[remove_idx];
-                r.erased_note_at = remove_idx;
-                push_undo(r);
-                page.annots.notes.erase(page.annots.notes.begin() + remove_idx);
-            }
-        }
-
-        // Mouse capture overlay when a tool is active
-        if (g_annot_tool != AnnotTool::None) {
-            ImGui::SetCursorScreenPos(img_pos);
-            char btn_id[32];
-            snprintf(btn_id, sizeof(btn_id), "##ann_%d", page.page_index);
-            ImGui::InvisibleButton(btn_id, {img_w, img_h});
-            bool pressed = ImGui::IsItemActivated();
-            bool active  = ImGui::IsItemActive();
-
-            ImVec2 mpos = ImGui::GetMousePos();
-            float nx = std::clamp((mpos.x - img_pos.x) / img_w, 0.0f, 1.0f);
-            float ny = std::clamp((mpos.y - img_pos.y) / img_h, 0.0f, 1.0f);
-
-            // --- Eraser tool ---
-            if (g_annot_tool == AnnotTool::Eraser && active) {
-                constexpr float ER = 0.025f;  // eraser radius in normalized page coords
-                // Erase highlights
-                for (int hi = (int)page.annots.highlights.size() - 1; hi >= 0; --hi) {
-                    auto& hl = page.annots.highlights[hi];
-                    float cx = std::clamp(nx, hl.x0, hl.x1);
-                    float cy = std::clamp(ny, hl.y0, hl.y1);
-                    if ((nx-cx)*(nx-cx) + (ny-cy)*(ny-cy) <= ER*ER) {
-                        UndoRecord r;
-                        r.type             = UndoRecord::Type::ErasedHighlight;
-                        r.doc_idx          = doc_idx;
-                        r.page_idx         = page.page_index;
-                        r.erased_highlight = hl;
-                        push_undo(r);
-                        page.annots.highlights.erase(page.annots.highlights.begin() + hi);
-                    }
-                }
-                // Erase strokes — remove any stroke with a point within the eraser circle
-                for (int si = (int)page.annots.strokes.size() - 1; si >= 0; --si) {
-                    bool hit = false;
-                    for (auto& pt : page.annots.strokes[si].pts) {
-                        float dx = nx - pt.x, dy = ny - pt.y;
-                        if (dx*dx + dy*dy <= ER*ER) { hit = true; break; }
-                    }
-                    if (hit) {
-                        UndoRecord r;
-                        r.type          = UndoRecord::Type::ErasedStroke;
-                        r.doc_idx       = doc_idx;
-                        r.page_idx      = page.page_index;
-                        r.erased_stroke = page.annots.strokes[si];
-                        push_undo(r);
-                        page.annots.strokes.erase(page.annots.strokes.begin() + si);
-                    }
-                }
-            }
-
-            // --- Draw/stamp tools ---
-            if (g_annot_tool != AnnotTool::Eraser) {
-                if (pressed) {
-                    if (g_annot_tool == AnnotTool::Note) {
-                        int snap = g_next_note_idx;
-                        page.annots.notes.push_back({note_label(g_next_note_idx++)});
-                        UndoRecord r;
-                        r.type            = UndoRecord::Type::Note;
-                        r.doc_idx         = doc_idx;
-                        r.page_idx        = page.page_index;
-                        r.note_idx_before = snap;
-                        push_undo(r);
-                    } else {
-                        g_ann_drawing  = true;
-                        g_ann_doc_idx  = doc_idx;
-                        g_ann_page_idx = page.page_index;
-                        if (g_annot_tool == AnnotTool::Pen) {
-                            g_ann_cur_stroke = {};
-                            g_ann_cur_stroke.r = g_pen_r;
-                            g_ann_cur_stroke.g = g_pen_g;
-                            g_ann_cur_stroke.b = g_pen_b;
-                            g_ann_cur_stroke.pts.push_back({nx, ny});
-                        } else {
-                            g_ann_hl_start = {nx, ny};
-                            g_ann_cur_norm = {nx, ny};
-                        }
-                    }
-                }
-
-                bool this_page_drawing = g_ann_drawing
-                    && g_ann_doc_idx  == doc_idx
-                    && g_ann_page_idx == page.page_index;
-
-                if (active && this_page_drawing) {
-                    if (g_annot_tool == AnnotTool::Pen)
-                        g_ann_cur_stroke.pts.push_back({nx, ny});
-                    else
-                        g_ann_cur_norm = {nx, ny};
-                }
-
-                // Live preview
-                if (this_page_drawing) {
-                    if (g_annot_tool == AnnotTool::Pen) {
-                        for (int si = 1; si < (int)g_ann_cur_stroke.pts.size(); ++si) {
-                            ImVec2 a = {img_pos.x + g_ann_cur_stroke.pts[si-1].x * img_w,
-                                        img_pos.y + g_ann_cur_stroke.pts[si-1].y * img_h};
-                            ImVec2 b = {img_pos.x + g_ann_cur_stroke.pts[si  ].x * img_w,
-                                        img_pos.y + g_ann_cur_stroke.pts[si  ].y * img_h};
-                            dl->AddLine(a, b, IM_COL32((int)(g_pen_r*255),(int)(g_pen_g*255),(int)(g_pen_b*255),220), 2.0f);
-                        }
-                    } else {
-                        float x0 = std::min(g_ann_hl_start.x, g_ann_cur_norm.x);
-                        float y0 = std::min(g_ann_hl_start.y, g_ann_cur_norm.y);
-                        float x1 = std::max(g_ann_hl_start.x, g_ann_cur_norm.x);
-                        float y1 = std::max(g_ann_hl_start.y, g_ann_cur_norm.y);
-                        ImVec2 tl = {img_pos.x + x0 * img_w, img_pos.y + y0 * img_h};
-                        ImVec2 br = {img_pos.x + x1 * img_w, img_pos.y + y1 * img_h};
-                        dl->AddRectFilled(tl, br, IM_COL32(255, 224, 0, 80));
-                    }
-                }
             }
         }
 
@@ -3938,7 +2597,7 @@ static void draw_panel_resize_handle() {
     ImVec2 vp = ImGui::GetMainViewport()->Size;
     constexpr float STRIP_W = 8.0f;
 
-    ImGui::SetNextWindowPos({vp.x - s_panel_w - STRIP_W * 0.5f, 0.0f}, ImGuiCond_Always);
+    ImGui::SetNextWindowPos({vp.x - g_panel_w - STRIP_W * 0.5f, 0.0f}, ImGuiCond_Always);
     ImGui::SetNextWindowSize({STRIP_W, vp.y}, ImGuiCond_Always);
     ImGui::SetNextWindowBgAlpha(0.0f);
 
@@ -3959,10 +2618,10 @@ static void draw_panel_resize_handle() {
     ImGui::InvisibleButton("##drag", {STRIP_W, vp.y});
     bool was_dragging = ImGui::IsItemActive();
     if (was_dragging) {
-        s_panel_w -= ImGui::GetIO().MouseDelta.x;
-        s_panel_w  = std::clamp(s_panel_w, 180.0f, vp.x - 30.0f);
+        g_panel_w -= ImGui::GetIO().MouseDelta.x;
+        g_panel_w  = std::clamp(g_panel_w, 180.0f, vp.x - 30.0f);
     } else if (ImGui::IsItemDeactivated()) {
-        g_settings.panel_w = s_panel_w;
+        g_settings.panel_w = g_panel_w;
         save_prefs();
     }
     if (ImGui::IsItemHovered() || ImGui::IsItemActive())
@@ -4013,20 +2672,45 @@ static void draw_page_tooltip() {
 // --- Search panel (Cmd+F) ---------------------------------------------------
 
 static void run_search() {
-    g_search_results.clear();
     std::string q(g_search_buf);
     if (q.empty()) return;
+    if (g_search_running) return;  // previous search still in flight
 
-    namespace fs = std::filesystem;
-    for (int di = 0; di < (int)g_documents.size(); ++di) {
-        PdfLoader tmp;
-        Document  dummy;
-        if (!tmp.load(g_documents[di].path, dummy)) continue;
-        auto hits = tmp.search_text(q, 50);
-        std::string name = fs::path(g_documents[di].path).filename().string();
-        for (auto& h : hits)
-            g_search_results.push_back({di, h.page_index, std::move(h.excerpt), name});
+    // Clear previous results immediately so the UI shows "Searching..."
+    {
+        std::lock_guard<std::mutex> lk(g_search_results_mutex);
+        g_search_results.clear();
     }
+    g_highlighted_search_result = -1;
+    g_search_running = true;
+
+    // Snapshot doc paths so the thread doesn't touch g_documents.
+    namespace fs = std::filesystem;
+    struct DocSnap { int idx; std::string path; std::string name; };
+    std::vector<DocSnap> snap;
+    snap.reserve(g_documents.size());
+    for (int di = 0; di < (int)g_documents.size(); ++di)
+        snap.push_back({di, g_documents[di].path,
+                        fs::path(g_documents[di].path).filename().string()});
+
+    if (g_search_thread.joinable()) g_search_thread.join();
+    g_search_thread = std::thread([q, snap = std::move(snap)]() {
+        std::vector<SearchResult> results;
+        for (const auto& d : snap) {
+            PdfLoader tmp;
+            Document  dummy;
+            if (!tmp.load(d.path, dummy)) continue;
+            auto hits = tmp.search_text(q, 50);
+            for (auto& h : hits)
+                results.push_back({d.idx, h.page_index, std::move(h.excerpt), d.name});
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_search_results_mutex);
+            g_search_results = std::move(results);
+        }
+        g_search_running = false;
+        glfwPostEmptyEvent();  // wake the main loop so results appear immediately
+    });
 }
 
 static void draw_search_panel() {
@@ -4044,23 +2728,34 @@ static void draw_search_panel() {
     }
 
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+
+    // Disable input field and button while search is running
+    if (g_search_running) ImGui::BeginDisabled();
     bool enter = ImGui::InputText("##sq", g_search_buf, sizeof(g_search_buf),
                                   ImGuiInputTextFlags_EnterReturnsTrue);
-
-    // Clear highlight if search term changed
     if (g_last_search_term != std::string(g_search_buf)) {
         g_highlighted_search_result = -1;
         g_last_search_term = std::string(g_search_buf);
     }
-
     ImGui::SameLine();
     if (ImGui::Button("Search") || enter) run_search();
-    ImGui::SameLine();
-    ImGui::TextDisabled("%d result%s", (int)g_search_results.size(),
-                        g_search_results.size() == 1 ? "" : "s");
+    if (g_search_running) ImGui::EndDisabled();
 
-    // Escape closes search and clears highlight
-    if (ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+    // Result count / loading indicator
+    ImGui::SameLine();
+    if (g_search_running) {
+        // Animated ellipsis as a simple "working" indicator
+        double t = ImGui::GetTime();
+        int    dots = (int)(t * 2.0) % 4;
+        static const char* spinner[] = {"Searching", "Searching.", "Searching..", "Searching..."};
+        ImGui::TextDisabled("%s", spinner[dots]);
+    } else {
+        std::lock_guard<std::mutex> lk(g_search_results_mutex);
+        ImGui::TextDisabled("%d result%s", (int)g_search_results.size(),
+                            g_search_results.size() == 1 ? "" : "s");
+    }
+
+    if (ImGui::IsKeyPressed(ImGuiKey_Escape) && !g_search_running) {
         g_search_open = false;
         g_highlighted_search_result = -1;
         ImGui::End();
@@ -4070,40 +2765,66 @@ static void draw_search_panel() {
     ImGui::Separator();
     ImGui::BeginChild("##search_results", {0.0f, 0.0f}, false);
 
-    for (int i = 0; i < (int)g_search_results.size(); ++i) {
-        auto& hit = g_search_results[i];
-        ImGui::PushID(&hit);
-
-        float hr = 0.5f, hg = 0.5f, hb = 0.5f;
-        if (hit.doc_idx < (int)g_documents.size()) {
-            hr = g_documents[hit.doc_idx].hue_r;
-            hg = g_documents[hit.doc_idx].hue_g;
-            hb = g_documents[hit.doc_idx].hue_b;
-        }
-
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(hr, hg, hb, 1.0f));
-        ImGui::TextUnformatted(hit.doc_name.c_str());
+    if (g_search_running) {
+        // Centred "searching" message with animated dots — blocks result interaction
+        ImGui::Spacing();
+        ImGui::Spacing();
+        float avail = ImGui::GetContentRegionAvail().x;
+        double t  = ImGui::GetTime();
+        int    dots = (int)(t * 2.0) % 4;
+        static const char* msgs[] = {"◌", "◎", "◉", "●"};
+        const char* icon = msgs[dots % 4];
+        float tw = ImGui::CalcTextSize(icon).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - tw) * 0.5f);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+        ImGui::TextUnformatted(icon);
+        const char* label = "Searching documents...";
+        tw = ImGui::CalcTextSize(label).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + (avail - tw) * 0.5f);
+        ImGui::TextUnformatted(label);
         ImGui::PopStyleColor();
-        ImGui::SameLine();
-        ImGui::TextDisabled("p.%d", hit.page_idx + 1);
-
-        bool clicked = ImGui::IsItemClicked();
-        ImGui::TextWrapped("%s", hit.excerpt.c_str());
-        clicked = clicked || ImGui::IsItemClicked();
-
-        if (clicked && hit.doc_idx < (int)g_documents.size()) {
-            Document& doc = g_documents[hit.doc_idx];
-            // Zoom canvas to the target page
-            Page& pg = doc.pages[std::min(hit.page_idx, (int)doc.pages.size() - 1)];
-            zoom_to_rect(pg.world_pos.x, pg.world_pos.y,
-                         pg.world_pos.x + pg.world_w,
-                         pg.world_pos.y + pg.world_h);
-            g_input.open_panel(hit.doc_idx, hit.page_idx);
-            g_highlighted_search_result = i;  // Mark this result as highlighted
+    } else {
+        // Take a snapshot of results under the lock so we don't hold it while rendering
+        std::vector<SearchResult> results_snap;
+        {
+            std::lock_guard<std::mutex> lk(g_search_results_mutex);
+            results_snap = g_search_results;
         }
 
-        ImGui::Separator();
-        ImGui::PopID();
+        for (int i = 0; i < (int)results_snap.size(); ++i) {
+            auto& hit = results_snap[i];
+            ImGui::PushID(i);
+
+            float hr = 0.5f, hg = 0.5f, hb = 0.5f;
+            if (hit.doc_idx < (int)g_documents.size()) {
+                hr = g_documents[hit.doc_idx].hue_r;
+                hg = g_documents[hit.doc_idx].hue_g;
+                hb = g_documents[hit.doc_idx].hue_b;
+            }
+
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(hr, hg, hb, 1.0f));
+            ImGui::TextUnformatted(hit.doc_name.c_str());
+            ImGui::PopStyleColor();
+            ImGui::SameLine();
+            ImGui::TextDisabled("p.%d", hit.page_idx + 1);
+
+            bool clicked = ImGui::IsItemClicked();
+            ImGui::TextWrapped("%s", hit.excerpt.c_str());
+            clicked = clicked || ImGui::IsItemClicked();
+
+            if (clicked && hit.doc_idx < (int)g_documents.size()) {
+                Document& doc = g_documents[hit.doc_idx];
+                Page& pg = doc.pages[std::min(hit.page_idx, (int)doc.pages.size() - 1)];
+                zoom_to_rect(pg.world_pos.x, pg.world_pos.y,
+                             pg.world_pos.x + pg.world_w,
+                             pg.world_pos.y + pg.world_h);
+                g_input.open_panel(hit.doc_idx, hit.page_idx);
+                g_highlighted_search_result = i;
+            }
+
+            ImGui::Separator();
+            ImGui::PopID();
+        }
     }
 
     ImGui::EndChild();
@@ -4140,6 +2861,47 @@ static void draw_toolbar_ui() {
     }
     if (text_was_active) ImGui::PopStyleColor();
     ImGui::SetItemTooltip("Text box tool - click canvas to insert (Escape to cancel)");
+    ImGui::SameLine();
+
+    // Annotation tools
+    ImGui::Spacing(); ImGui::SameLine();
+    {
+        bool pen_was    = (g_annot_tool == AnnotTool::Pen);
+        bool hl_was     = (g_annot_tool == AnnotTool::Highlight);
+        bool note_was   = (g_annot_tool == AnnotTool::Note);
+        bool eraser_was = (g_annot_tool == AnnotTool::Eraser);
+
+        if (pen_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.08f, 0.08f, 1.0f));
+        if (ImGui::Button("Pen")) { g_annot_tool = pen_was ? AnnotTool::None : AnnotTool::Pen; g_ann_drawing = false; }
+        if (pen_was) ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("Freehand pen — draw on pages (P)");
+
+        if (pen_was) {
+            ImGui::SameLine();
+            float pcol[3] = {g_pen_r, g_pen_g, g_pen_b};
+            if (ImGui::ColorEdit3("##pencolor", pcol, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
+                { g_pen_r = pcol[0]; g_pen_g = pcol[1]; g_pen_b = pcol[2]; }
+            ImGui::SetItemTooltip("Pen color");
+        }
+        ImGui::SameLine();
+
+        if (hl_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.60f, 0.55f, 0.0f, 1.0f));
+        if (ImGui::Button("HL")) { g_annot_tool = hl_was ? AnnotTool::None : AnnotTool::Highlight; g_ann_drawing = false; }
+        if (hl_was) ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("Highlight — drag across text on a page (H)");
+        ImGui::SameLine();
+
+        if (note_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.40f, 0.70f, 1.0f));
+        if (ImGui::Button("Flag")) { g_annot_tool = note_was ? AnnotTool::None : AnnotTool::Note; g_ann_drawing = false; }
+        if (note_was) ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("Flag — stamp a note marker on a page (F)");
+        ImGui::SameLine();
+
+        if (eraser_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.30f, 0.30f, 1.0f));
+        if (ImGui::Button("Erase")) { g_annot_tool = eraser_was ? AnnotTool::None : AnnotTool::Eraser; g_ann_drawing = false; }
+        if (eraser_was) ImGui::PopStyleColor();
+        ImGui::SetItemTooltip("Eraser — drag over annotations to remove them");
+    }
 
     if (g_text_tool || g_selected_box >= 0) {
         ImGui::SameLine();
@@ -4166,18 +2928,26 @@ static void draw_toolbar_ui() {
         ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, {8.0f, 6.0f});
 
         if (ImGui::MenuItem("Add from folder...")) {
+#ifdef __APPLE__
+            const char* path = scholion_select_folder("Select PDF folder");
+#else
             before_file_dialog();
             const char* path = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
             after_file_dialog();
+#endif
             if (path) load_pdfs_from_folder(path);
         }
         if (ImGui::MenuItem("Add from file...")) {
-            before_file_dialog();
             const char* patterns[] = {"*.pdf", "*.PDF"};
+#ifdef __APPLE__
+            const char* result = scholion_open_file("Select PDF files", patterns, 2, 1);
+#else
+            before_file_dialog();
             const char* result = tinyfd_openFileDialog(
                 "Select PDF files", nullptr,
                 2, patterns, "PDF Documents", 1);
             after_file_dialog();
+#endif
             if (result) load_pdfs_from_selection(result);
         }
         if (ImGui::MenuItem("Add from URL...")) {
@@ -4199,18 +2969,47 @@ static void draw_toolbar_ui() {
 }
 
 // ---------------------------------------------------------------------------
-#ifdef SCHOLION_DEV
-// Automated diagnostic benchmark — launched via --benchmark [pdf_path] CLI flag.
-//   Phase 1: GL texture upload latency at Thumb/Low/High sizes (glFinish-timed, synthetic)
-//   Phase 2: Canvas render FPS at N=[10,50,100,300,500] synthetic pages (vsync off)
-//   Phase 3: Real MuPDF rasterization time per tier on an actual PDF (if provided)
-// Writes scholion_diag_<timestamp>.json to the Desktop then exits.
 
-static void run_benchmark(GLFWwindow* w, Renderer& renderer, const char* pdf_path = nullptr) {
-    // System info --------------------------------------------------------
+// --- Developer benchmark (--benchmark flag; dev build only) -----------------
+//
+// Measures real-world-ish GPU and rasterization performance without requiring
+// a PDF file.  Outputs results to stdout and a JSON file on the Desktop.
+//
+// Usage:   ./Scholion.app/Contents/MacOS/Scholion --benchmark
+//          Scholion.exe --benchmark
+//
+// Phases:
+//  1. System info (GPU, RAM, platform, GL version)
+//  2. GL texture upload — Thumb/Low/High sizes, p50/p95 latency (ms)
+//  3. Synthetic rasterization — simulate the background rast worker rendering
+//     TILE_PX tiles and uploading them; measures time per tile at 256 px
+//  4. Canvas FPS — render loop with N synthetic pages (10/50/100/300/500),
+//     16-texture thumb pool, vsync off; measures min/avg/max FPS per N
+//
+#ifdef SCHOLION_DEV
+#include <sys/types.h>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#endif
+
+static void run_benchmark(GLFWwindow* window, Renderer& renderer) {
+    using Clock = std::chrono::steady_clock;
+    using ms    = std::chrono::duration<double, std::milli>;
+
+    // ---- System info --------------------------------------------------------
     const char* gl_renderer = (const char*)glGetString(GL_RENDERER);
     const char* gl_vendor   = (const char*)glGetString(GL_VENDOR);
     const char* gl_version  = (const char*)glGetString(GL_VERSION);
+
+    uint64_t ram_bytes = 0;
+#ifdef __APPLE__
+    size_t sz = sizeof(ram_bytes);
+    sysctlbyname("hw.memsize", &ram_bytes, &sz, nullptr, 0);
+#elif defined(_WIN32)
+    MEMORYSTATUSEX ms2{}; ms2.dwLength = sizeof(ms2);
+    GlobalMemoryStatusEx(&ms2); ram_bytes = ms2.ullTotalPhys;
+#endif
+    double ram_gb = (double)ram_bytes / (1024.0 * 1024.0 * 1024.0);
 
 #ifdef __APPLE__
     const char* platform = "macOS";
@@ -4220,349 +3019,221 @@ static void run_benchmark(GLFWwindow* w, Renderer& renderer, const char* pdf_pat
     const char* platform = "Linux";
 #endif
 
-    long long ram_mb = 0;
-#ifdef __APPLE__
-    {
-        int mib[2] = { CTL_HW, HW_MEMSIZE };
-        uint64_t physmem = 0;
-        size_t len = sizeof(physmem);
-        if (sysctl(mib, 2, &physmem, &len, nullptr, 0) == 0)
-            ram_mb = static_cast<long long>(physmem / (1024ULL * 1024ULL));
-    }
-#elif defined(_WIN32)
-    {
-        MEMORYSTATUSEX ms;
-        ms.dwLength = sizeof(ms);
-        if (GlobalMemoryStatusEx(&ms))
-            ram_mb = static_cast<long long>(ms.ullTotalPhys / (1024ULL * 1024ULL));
-    }
-#endif
+    printf("\n=== Scholion Benchmark ===\n");
+    printf("Platform : %s\n", platform);
+    printf("GPU      : %s (%s)\n", gl_renderer, gl_vendor);
+    printf("GL       : %s\n", gl_version);
+    printf("RAM      : %.1f GB\n\n", ram_gb);
 
-    time_t now_t = time(nullptr);
-    struct tm tm_copy = *localtime(&now_t);
-    char ts[32], fn_ts[32];
-    strftime(ts,    sizeof(ts),    "%Y-%m-%dT%H:%M:%S", &tm_copy);
-    strftime(fn_ts, sizeof(fn_ts), "%Y%m%d_%H%M%S",     &tm_copy);
-
-    // Viewport -----------------------------------------------------------
-    int win_w, win_h, fb_w, fb_h;
-    glfwGetWindowSize(w, &win_w, &win_h);
-    g_canvas.set_viewport_size(static_cast<float>(win_w), static_cast<float>(win_h));
-    glfwGetFramebufferSize(w, &fb_w, &fb_h);
-    glViewport(0, 0, fb_w, fb_h);
-
-    // Progress display ---------------------------------------------------
-    auto show_status = [&](const char* msg) {
-        glfwPollEvents();
-        glfwGetFramebufferSize(w, &fb_w, &fb_h);
-        glViewport(0, 0, fb_w, fb_h);
-        glClearColor(0.12f, 0.12f, 0.15f, 1.0f);
-        glClear(GL_COLOR_BUFFER_BIT);
-        ImGui_ImplOpenGL3_NewFrame();
-        ImGui_ImplGlfw_NewFrame();
-        ImGui::NewFrame();
-        ImGui::SetNextWindowPos({ fb_w * 0.5f, fb_h * 0.5f },
-                                ImGuiCond_Always, { 0.5f, 0.5f });
-        ImGui::SetNextWindowSize({ 580.0f, 120.0f }, ImGuiCond_Always);
-        ImGui::SetNextWindowBgAlpha(0.88f);
-        ImGui::Begin("##bench_prog", nullptr,
-            ImGuiWindowFlags_NoTitleBar  | ImGuiWindowFlags_NoResize |
-            ImGuiWindowFlags_NoMove      | ImGuiWindowFlags_NoScrollbar |
-            ImGuiWindowFlags_NoSavedSettings);
-        ImGui::TextWrapped("%s", msg);
-        ImGui::End();
-        ImGui::Render();
-        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-        glfwSwapBuffers(w);
+    // ---- Phase 1: GL texture upload latency ---------------------------------
+    struct TierTest { const char* name; int w; int h; };
+    TierTest tiers[] = {
+        { "Thumb (600×850)",   600,  850 },
+        { "Low  (1250×1750)", 1250, 1750 },
+        { "High-tile (256×256)", 256,  256 },
     };
 
-    // Phase 1: GL upload timing ------------------------------------------
-    struct UploadResult { double p50, p95, max_ms; };
-    struct TierDef      { const char* name; int w, h; };
-    TierDef tiers[3] = {
-        { "thumb",  600,  850  },
-        { "low",   1250, 1750  },
-        { "high",  2500, 3500  },
-    };
-    UploadResult upload[3] = {};
+    printf("--- Phase 1: Texture upload latency ---\n");
+    printf("%-24s  %8s  %8s  %8s\n", "Tier", "p50 ms", "p95 ms", "max ms");
 
-    for (int ti = 0; ti < 3; ++ti) {
-        char prog[128];
-        snprintf(prog, sizeof(prog),
-                 "Benchmark (1/2) — GL upload: %s (%dx%d px)…",
-                 tiers[ti].name, tiers[ti].w, tiers[ti].h);
-        show_status(prog);
-
-        int tw = tiers[ti].w, th = tiers[ti].h;
-        std::vector<uint8_t> data(static_cast<size_t>(tw) * th * 4, 128);
+    for (auto& t : tiers) {
+        std::vector<uint8_t> px((size_t)t.w * t.h * 4, 128);
         GLuint tex = 0;
         glGenTextures(1, &tex);
         glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-        for (int i = 0; i < 2; ++i) {   // warmup
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, data.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+
+        // 2 warmup, 7 timed
+        for (int i = 0; i < 2; ++i) {
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t.w, t.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
             glFinish();
         }
-        double times[5];
-        for (int i = 0; i < 5; ++i) {
-            auto t0 = std::chrono::steady_clock::now();
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, tw, th, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, data.data());
+        std::vector<double> times(7);
+        for (int i = 0; i < 7; ++i) {
+            auto t0 = Clock::now();
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t.w, t.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
             glFinish();
-            auto t1 = std::chrono::steady_clock::now();
-            times[i] = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            times[i] = ms(Clock::now() - t0).count();
         }
         glDeleteTextures(1, &tex);
-        std::sort(times, times + 5);
-        upload[ti] = { times[2], times[4], times[4] };  // n=5: p50=median, p95=max
+        std::sort(times.begin(), times.end());
+        printf("%-24s  %8.2f  %8.2f  %8.2f\n",
+               t.name, times[3], times[6], times[6]);
     }
 
-    // Phase 2: Canvas render FPS -----------------------------------------
-    // 16 distinct Thumb-sized textures (600×850 RGBA, unique noise per slot)
-    // rotated across pages to exercise the texture sampler and break trivial
-    // GPU L1-cache hits that a single shared texture would allow.
-    static constexpr int THUMB_POOL = 16;
-    static constexpr int THUMB_W    = 600;
-    static constexpr int THUMB_H    = 850;
-    GLuint thumb_pool[THUMB_POOL] = {};
+    // ---- Phase 2: Tile throughput (simulate background rasterizer) ----------
+    // Render TILE_PX×TILE_PX tiles with unique content (like real LOD tiles),
+    // upload them, measure how many tiles/second the GL path can sustain.
+    printf("\n--- Phase 2: Tile throughput ---\n");
     {
-        show_status("Benchmark (2/2) — uploading texture pool…");
-        std::vector<uint8_t> px(THUMB_W * THUMB_H * 4);
-        glGenTextures(THUMB_POOL, thumb_pool);
-        for (int ti = 0; ti < THUMB_POOL; ++ti) {
-            // Fill with a unique grey shade per slot so each is a distinct texture.
-            uint8_t v = static_cast<uint8_t>(160 + ti * 6);
-            for (size_t j = 0; j < px.size(); j += 4) {
-                px[j] = v; px[j+1] = v; px[j+2] = v; px[j+3] = 255;
-            }
-            glBindTexture(GL_TEXTURE_2D, thumb_pool[ti]);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA8, THUMB_W, THUMB_H, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        constexpr int N_TILES = 64;
+        std::vector<GLuint> texs(N_TILES, 0);
+        glGenTextures(N_TILES, texs.data());
+        std::vector<uint8_t> tile_px((size_t)TILE_PX * TILE_PX * 4);
+
+        auto start = Clock::now();
+        for (int i = 0; i < N_TILES; ++i) {
+            uint8_t grey = (uint8_t)(40 + (i * 3) % 200);
+            std::fill(tile_px.begin(), tile_px.end(), grey);
+            glBindTexture(GL_TEXTURE_2D, texs[i]);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, TILE_PX, TILE_PX, 0,
+                         GL_RGBA, GL_UNSIGNED_BYTE, tile_px.data());
         }
-        glBindTexture(GL_TEXTURE_2D, 0);
+        glFinish();
+        double elapsed = ms(Clock::now() - start).count();
+        glDeleteTextures(N_TILES, texs.data());
+        printf("%d tiles (%dx%d) uploaded in %.1f ms = %.0f tiles/sec\n",
+               N_TILES, TILE_PX, TILE_PX, elapsed, N_TILES * 1000.0 / elapsed);
     }
-    glfwSwapInterval(0);
 
-    const int ns[5]      = { 10, 50, 100, 300, 500 };
-    double    fps_res[5] = {};
+    // ---- Phase 3: Canvas render FPS with synthetic pages --------------------
+    printf("\n--- Phase 3: Canvas render FPS (vsync OFF) ---\n");
+    printf("%-10s  %8s  %8s  %8s\n", "N pages", "min FPS", "avg FPS", "max FPS");
 
-    for (int ni = 0; ni < 5; ++ni) {
-        int N = ns[ni];
-        char prog[128];
-        snprintf(prog, sizeof(prog),
-                 "Benchmark (2/2) — Canvas FPS: N=%d pages (2 s run)…", N);
-        show_status(prog);
+    glfwSwapInterval(0);  // disable vsync
 
-        const float PAGE_W = 612.0f;
-        const float PAGE_H = 792.0f;
-        const float GAP    = 40.0f;
-        const int   COLS   = 8;
-        int rows = (N + COLS - 1) / COLS;
+    // 16-texture thumb pool (unique grey shades)
+    constexpr int POOL = 16;
+    constexpr int THW  = 600, THH = 850;
+    GLuint pool_tex[POOL] = {};
+    glGenTextures(POOL, pool_tex);
+    for (int i = 0; i < POOL; ++i) {
+        uint8_t grey = (uint8_t)(40 + i * 13);
+        std::vector<uint8_t> px((size_t)THW * THH * 4, grey);
+        glBindTexture(GL_TEXTURE_2D, pool_tex[i]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, THW, THH, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+    }
 
-        std::vector<Document> docs;
-        docs.reserve(N);
+    int fb_w, fb_h;
+    glfwGetFramebufferSize(window, &fb_w, &fb_h);
+
+    // Synthetic docs — we'll temporarily populate g_documents with dummy pages
+    // and feed them through the real renderer.draw() path.
+    static const int N_VALS[] = { 10, 50, 100, 300, 500 };
+    for (int N : N_VALS) {
+        // Build synthetic documents (each 1 page)
+        g_documents.clear();
+        g_loaders.clear();
+        constexpr float PAGE_W = 612.0f, PAGE_H = 792.0f;
+        constexpr int   COLS   = 5;
         for (int i = 0; i < N; ++i) {
-            Document doc;
-            doc.hue_r = 0.3f; doc.hue_g = 0.5f; doc.hue_b = 0.8f;
-            Page pg;
-            pg.page_index = 0;
             int col = i % COLS, row = i / COLS;
-            pg.world_pos  = { static_cast<float>(col) * (PAGE_W + GAP),
-                              static_cast<float>(row) * (PAGE_H + GAP) };
-            pg.world_w    = PAGE_W;
-            pg.world_h    = PAGE_H;
-            pg.tex_thumb  = thumb_pool[i % THUMB_POOL];
-            doc.pages.push_back(pg);
-            docs.push_back(std::move(doc));
+            Document doc;
+            doc.path   = "bench_" + std::to_string(i);
+            doc.hue_r  = 0.5f; doc.hue_g = 0.5f; doc.hue_b = 0.5f;
+            Page pg;
+            pg.page_index  = 0;
+            pg.world_pos   = { static_cast<float>(col) * (PAGE_W + 20.0f),
+                                static_cast<float>(row) * (PAGE_H + 20.0f) };
+            pg.world_w     = PAGE_W;
+            pg.world_h     = PAGE_H;
+            pg.tex_thumb   = pool_tex[i % POOL];
+            g_documents.push_back(doc);
+            g_documents.back().pages.push_back(pg);
+            g_loaders.push_back(nullptr);
         }
 
-        float total_w = COLS * (PAGE_W + GAP);
-        float total_h = rows * (PAGE_H + GAP);
-        float zoom = std::min(static_cast<float>(win_w) / total_w,
-                              static_cast<float>(win_h) / total_h) * 0.9f;
-        g_canvas.set_zoom(zoom);
-        g_canvas.set_offset({ total_w * 0.5f, total_h * 0.5f });
+        // Fit all pages in view
+        g_canvas.set_zoom(1.0f);
+        g_canvas.set_offset({(float)(COLS / 2) * (PAGE_W + 20.0f),
+                              (float)(N / COLS / 2) * (PAGE_H + 20.0f)});
 
-        double loop_start = glfwGetTime();
-        int    frames     = 0;
-        while (glfwGetTime() - loop_start < 2.0) {
+        // Render for 2 seconds, collect FPS samples
+        constexpr double RUN_S = 2.0;
+        double t_end = glfwGetTime() + RUN_S;
+        double t_prev = glfwGetTime();
+        double fps_min = 1e9, fps_max = 0.0, fps_sum = 0.0;
+        int    fps_n = 0;
+
+        while (glfwGetTime() < t_end) {
             glfwPollEvents();
-            glClearColor(0.12f, 0.12f, 0.15f, 1.0f);
-            glClear(GL_COLOR_BUFFER_BIT);
-            renderer.draw(g_canvas, docs, {});
-            glfwSwapBuffers(w);
-            ++frames;
+            glViewport(0, 0, fb_w, fb_h);
+            ImGui_ImplOpenGL3_NewFrame();
+            ImGui_ImplGlfw_NewFrame();
+            ImGui::NewFrame();
+
+            DrawHints hints;
+            hints.selected_doc    = nullptr;
+            hints.hovered_page    = nullptr;
+            hints.dragged_page    = nullptr;
+            hints.selection       = nullptr;
+            hints.box_selecting   = false;
+            hints.grid_mode       = GridMode::Off;
+            hints.dark_mode       = true;
+            hints.draw_time       = (float)glfwGetTime();
+            hints.tile_cache      = &g_tile_cache;
+            hints.content_scale   = g_content_scale;
+            renderer.draw(g_canvas, g_documents, hints);
+
+            ImGui::Render();
+            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+            glfwSwapBuffers(window);
+
+            double now = glfwGetTime();
+            double dt  = now - t_prev;
+            t_prev = now;
+            if (dt > 0.0) {
+                double fps = 1.0 / dt;
+                fps_min = std::min(fps_min, fps);
+                fps_max = std::max(fps_max, fps);
+                fps_sum += fps;
+                ++fps_n;
+            }
         }
-        double elapsed = glfwGetTime() - loop_start;
-        fps_res[ni] = elapsed > 0.0 ? frames / elapsed : 0.0;
+
+        double fps_avg = fps_n > 0 ? fps_sum / fps_n : 0.0;
+        printf("%-10d  %8.1f  %8.1f  %8.1f\n", N, fps_min, fps_avg, fps_max);
     }
 
+    // Restore vsync and clear synthetic docs
+    g_documents.clear();
+    g_loaders.clear();
     glfwSwapInterval(1);
-    glDeleteTextures(THUMB_POOL, thumb_pool);
+    glDeleteTextures(POOL, pool_tex);
 
-    // Phase 3: Real PDF rasterization timing -----------------------------
-    // Only runs when a PDF path is passed: --benchmark /path/to/file.pdf
-    // Measures actual MuPDF rasterize_to_buffer() time — wall-clock CPU
-    // work per page per tier — which synthetic Phase 1 cannot capture.
-    struct RastPhase3 {
-        bool    ran       = false;
-        bool    load_ok   = false;
-        int     page_count = 0;
-        int     pages_tested = 0;   // min(page_count, 3)
-        struct TierResult {
-            double p50_ms = 0, max_ms = 0;
-            int    w = 0, h = 0;
-            float  mb = 0.0f;
-            bool   ok = false;
-        } tiers[3];
-    } phase3;
-
-    if (pdf_path) {
-        phase3.ran = true;
-        show_status("Benchmark (3/3) — loading PDF for real rasterization timing…");
-        PdfLoader p3_loader;
-        p3_loader.set_content_scale(g_content_scale);
-        Document  p3_doc;
-        phase3.load_ok = p3_loader.load(pdf_path, p3_doc, {});
-        if (phase3.load_ok) {
-            phase3.page_count  = static_cast<int>(p3_doc.pages.size());
-            phase3.pages_tested = std::min(phase3.page_count, 3);
-
-            const LodTier TIERS[3] = { LodTier::Thumb, LodTier::Low, LodTier::High };
-            const char*   TNAMES[3] = { "thumb", "low", "high" };
-            for (int ti = 0; ti < 3; ++ti) {
-                char prog[256];
-                snprintf(prog, sizeof(prog),
-                         "Benchmark (3/3) — MuPDF rasterize: %s tier, %d pages…",
-                         TNAMES[ti], phase3.pages_tested);
-                show_status(prog);
-
-                std::vector<double> times;
-                times.reserve(phase3.pages_tested);
-                for (int pi = 0; pi < phase3.pages_tested; ++pi) {
-                    auto t0  = std::chrono::steady_clock::now();
-                    auto buf = p3_loader.rasterize_to_buffer(pi, TIERS[ti]);
-                    auto t1  = std::chrono::steady_clock::now();
-                    if (!buf.ok) continue;
-                    times.push_back(
-                        std::chrono::duration<double, std::milli>(t1 - t0).count());
-                    if (pi == 0) {   // record dimensions from the first page
-                        phase3.tiers[ti].w  = buf.width;
-                        phase3.tiers[ti].h  = buf.height;
-                        phase3.tiers[ti].mb = static_cast<float>(
-                            (size_t)buf.width * buf.height * 4) / (1024.0f * 1024.0f);
-                    }
-                }
-                if (!times.empty()) {
-                    std::sort(times.begin(), times.end());
-                    phase3.tiers[ti].p50_ms = times[times.size() / 2];
-                    phase3.tiers[ti].max_ms  = times.back();
-                    phase3.tiers[ti].ok      = true;
-                }
-            }
-        }
+    // ---- Write JSON to Desktop ----------------------------------------------
+    char ts_buf[32];
+    {
+        auto t   = std::chrono::system_clock::now();
+        auto now = std::chrono::system_clock::to_time_t(t);
+        std::strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", std::localtime(&now));
     }
-
-    // Build JSON output --------------------------------------------------
-    std::string json;
-    json.reserve(1024);
-    char buf[512];
-    json += "{\n";
-    snprintf(buf, sizeof(buf), "  \"scholion_diag\": 1,\n");             json += buf;
-    snprintf(buf, sizeof(buf), "  \"timestamp\": \"%s\",\n", ts);        json += buf;
-    snprintf(buf, sizeof(buf), "  \"platform\": \"%s\",\n", platform);   json += buf;
-    snprintf(buf, sizeof(buf), "  \"gl_renderer\": \"%s\",\n",
-             gl_renderer ? gl_renderer : "unknown");                      json += buf;
-    snprintf(buf, sizeof(buf), "  \"gl_vendor\": \"%s\",\n",
-             gl_vendor   ? gl_vendor   : "unknown");                      json += buf;
-    snprintf(buf, sizeof(buf), "  \"gl_version\": \"%s\",\n",
-             gl_version  ? gl_version  : "unknown");                      json += buf;
-    snprintf(buf, sizeof(buf), "  \"ram_mb\": %lld,\n", ram_mb);         json += buf;
-    json += "  \"upload_ms\": {\n";
-    const char* tier_names[3] = { "thumb", "low", "high" };
-    for (int i = 0; i < 3; ++i) {
-        snprintf(buf, sizeof(buf),
-                 "    \"%s\": { \"p50\": %.3f, \"p95\": %.3f, \"max\": %.3f }%s\n",
-                 tier_names[i],
-                 upload[i].p50, upload[i].p95, upload[i].max_ms,
-                 i < 2 ? "," : "");
-        json += buf;
+    std::string desktop;
+#ifdef __APPLE__
+    const char* home = std::getenv("HOME");
+    desktop = home ? std::string(home) + "/Desktop" : ".";
+#elif defined(_WIN32)
+    wchar_t* dp = nullptr;
+    if (SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &dp) == S_OK) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, dp, -1, nullptr, 0, nullptr, nullptr);
+        desktop.resize(len - 1);
+        WideCharToMultiByte(CP_UTF8, 0, dp, -1, &desktop[0], len, nullptr, nullptr);
+        CoTaskMemFree(dp);
     }
-    json += "  },\n";
-    json += "  \"render_fps\": {\n";
-    for (int i = 0; i < 5; ++i) {
-        snprintf(buf, sizeof(buf), "    \"n%d\": %.1f%s\n",
-                 ns[i], fps_res[i], i < 4 ? "," : "");
-        json += buf;
-    }
-    json += "  },\n";
-
-    // Phase 3 — real PDF rasterization (present only when --benchmark <pdf> was used)
-    json += "  \"rast_real\": {\n";
-    if (!phase3.ran) {
-        json += "    \"skipped\": \"no PDF provided (usage: --benchmark /path/to/file.pdf)\"\n";
-    } else if (!phase3.load_ok) {
-        snprintf(buf, sizeof(buf), "    \"error\": \"could not open %s\"\n",
-                 pdf_path ? pdf_path : "");
-        json += buf;
-    } else {
-        snprintf(buf, sizeof(buf), "    \"pdf\": \"%s\",\n", pdf_path);      json += buf;
-        snprintf(buf, sizeof(buf), "    \"page_count\": %d,\n",
-                 phase3.page_count);                                          json += buf;
-        snprintf(buf, sizeof(buf), "    \"pages_tested\": %d,\n",
-                 phase3.pages_tested);                                        json += buf;
-        snprintf(buf, sizeof(buf), "    \"content_scale\": %.2f,\n",
-                 g_content_scale);                                            json += buf;
-        const char* tn[3] = { "thumb", "low", "high" };
-        json += "    \"tiers\": {\n";
-        for (int i = 0; i < 3; ++i) {
-            const auto& tr = phase3.tiers[i];
-            if (tr.ok) {
-                snprintf(buf, sizeof(buf),
-                    "      \"%s\": { \"p50_ms\": %.1f, \"max_ms\": %.1f,"
-                    " \"w\": %d, \"h\": %d, \"mb\": %.2f }%s\n",
-                    tn[i], tr.p50_ms, tr.max_ms,
-                    tr.w, tr.h, tr.mb,
-                    i < 2 ? "," : "");
-            } else {
-                snprintf(buf, sizeof(buf),
-                    "      \"%s\": { \"error\": \"rasterization failed\" }%s\n",
-                    tn[i], i < 2 ? "," : "");
-            }
-            json += buf;
-        }
-        json += "    }\n";
-    }
-    json += "  }\n}\n";
-
-    // Write to Desktop ---------------------------------------------------
-    char out_path[512];
-#ifdef _WIN32
-    char desktop[MAX_PATH] = {};
-    SHGetFolderPathA(nullptr, CSIDL_DESKTOP, nullptr, 0, desktop);
-    snprintf(out_path, sizeof(out_path),
-             "%s\\scholion_diag_%s.json", desktop, fn_ts);
 #else
-    const char* home_dir = getenv("HOME");
-    snprintf(out_path, sizeof(out_path),
-             "%s/Desktop/scholion_diag_%s.json",
-             home_dir ? home_dir : ".", fn_ts);
+    desktop = ".";
 #endif
+    std::string json_path = desktop + "/scholion_bench_" + ts_buf + ".json";
 
-    if (write_json_file(json, std::string(out_path))) {
-        char done_msg[640];
-        snprintf(done_msg, sizeof(done_msg),
-                 "Done! Diagnostic written to:\n%s\n\nClosing in 3 seconds…", out_path);
-        show_status(done_msg);
-        printf("[benchmark] wrote %s\n", out_path);
-    } else {
-        show_status("Benchmark complete — ERROR: could not write output file.");
+    FILE* f = fopen(json_path.c_str(), "w");
+    if (f) {
+        fprintf(f, "{\n");
+        fprintf(f, "  \"platform\": \"%s\",\n", platform);
+        fprintf(f, "  \"gpu\": \"%s\",\n", gl_renderer);
+        fprintf(f, "  \"gl_version\": \"%s\",\n", gl_version);
+        fprintf(f, "  \"ram_gb\": %.1f,\n", ram_gb);
+        fprintf(f, "  \"tile_px\": %d\n", TILE_PX);
+        fprintf(f, "}\n");
+        fclose(f);
+        printf("\nJSON written: %s\n", json_path.c_str());
     }
-    glfwWaitEventsTimeout(3.0);
+
+    printf("\n=== Benchmark complete ===\n");
 }
 #endif // SCHOLION_DEV
 
@@ -4609,6 +3280,10 @@ int main(int argc, char* argv[]) {
         glfwGetWindowContentScale(window, &sx, &sy);
         g_content_scale = sx;
     }
+
+#ifdef __APPLE__
+    scholion_prewarm_dialogs();  // pre-init NSOpenPanel before first user action
+#endif
 
 #ifdef _WIN32
     // Load all OpenGL 3.3 core function pointers via GLAD.
@@ -4688,13 +3363,10 @@ int main(int argc, char* argv[]) {
     }
 
 #ifdef SCHOLION_DEV
-    // --benchmark [pdf]: run diagnostic and exit. Optional PDF path enables Phase 3
-    // (real MuPDF rasterization timing). Example:
-    //   ./Scholion --benchmark /path/to/paper.pdf
     for (int i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--benchmark") == 0) {
-            const char* bench_pdf = (i + 1 < argc && argv[i+1][0] != '-') ? argv[i+1] : nullptr;
-            run_benchmark(window, renderer, bench_pdf);
+            run_benchmark(window, renderer);
+            renderer.shutdown();
             ImGui_ImplOpenGL3_Shutdown();
             ImGui_ImplGlfw_Shutdown();
             ImGui::DestroyContext();
@@ -4703,7 +3375,7 @@ int main(int argc, char* argv[]) {
             return 0;
         }
     }
-#endif // SCHOLION_DEV
+#endif
 
     // Bake an elliptical vignette gradient texture (256×256, single upload).
     // Stretched to the full viewport each frame: the circle in texture-space
@@ -4756,8 +3428,8 @@ int main(int argc, char* argv[]) {
   printf("  Right-click empty canvas — save project\n");
 
     try { load_recents(); } catch (...) {}   // guard against filesystem exceptions on second run
-    s_panel_w = g_settings.panel_w;
-    g_rast_thread = std::thread(rast_worker);
+    g_panel_w = g_settings.panel_w;
+    rast_init();
 
 #ifndef __APPLE__
     // On macOS a file argument is delivered via the open-document Apple event
@@ -4839,10 +3511,7 @@ int main(int argc, char* argv[]) {
         float  delta_t = static_cast<float>(now_t - last_frame_time);
         last_frame_time = now_t;
         overlay.update(delta_t);
-        { float ms = delta_t * 1000.0f; if (ms > g_bench_frame_ms_max) g_bench_frame_ms_max = ms; }
-#ifdef SCHOLION_DEV
-        if (g_settings.developer_mode) bench_open();
-#endif
+
         if (g_input.consume_overlay_toggle()) overlay.toggle();
 
         g_input.update(window);
@@ -4969,6 +3638,7 @@ int main(int argc, char* argv[]) {
 
         draw_cursor_tool_icon();
         draw_canvas_text_boxes();
+        update_canvas_annotations();
 
         // Double-click on a page -> open panel scrolled to that page
         if (!ImGui::GetIO().WantCaptureMouse && g_hovered_box < 0
@@ -5053,9 +3723,6 @@ int main(int argc, char* argv[]) {
                     if (is_page_visible(pg)) ++visible_pages;
                 }
             overlay.set_page_count(visible_pages, total_pages);
-#ifdef SCHOLION_DEV
-            bench_write(overlay.fps(), delta_t * 1000.0f, total_pages, visible_pages);
-#endif
         }
 
         // Render save feedback (temporary "Saved!" message)
@@ -5137,7 +3804,7 @@ int main(int argc, char* argv[]) {
         // is blocked on a slow disk or network-backed path (e.g. Dropbox).
         {
             auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
-            while (g_autosave_running.load() &&
+            while (autosave_running() &&
                    std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
@@ -5148,10 +3815,9 @@ int main(int argc, char* argv[]) {
     // Stop background workers before cleaning up shared state.
     if (g_dl_state.load() == 1) cancel_download();
     if (g_dl_thread.joinable()) g_dl_thread.join();
+    if (g_search_thread.joinable()) g_search_thread.join();
 
-    g_rast_stop.store(true);
-    g_rast_cv.notify_one();
-    if (g_rast_thread.joinable()) g_rast_thread.join();
+    rast_shutdown();
 
     if (g_vignette_tex) { glDeleteTextures(1, &g_vignette_tex); g_vignette_tex = 0; }
     if (g_cursor_hand)  { glfwDestroyCursor(g_cursor_hand);  g_cursor_hand  = nullptr; }
