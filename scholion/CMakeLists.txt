@@ -47,6 +47,9 @@ target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 
 add_executable(scholion
     src/main.cpp
+    src/rast_pipeline.cpp
+    src/canvas_annot.cpp
+    src/project_io.cpp
     src/canvas.cpp
     src/input.cpp
     src/renderer.cpp
@@ -74,6 +77,7 @@ if(APPLE)
         "-framework Cocoa"
         "-framework IOKit"
         "-framework CoreVideo"
+        "-framework UniformTypeIdentifiers"
     )
 endif()
 

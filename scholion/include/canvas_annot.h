@@ -1,0 +1,28 @@
+#pragma once
+#include "canvas.h"
+#include "document.h"
+#include <string>
+#include <vector>
+
+enum class AnnotTool { None, Pen, Highlight, Note, Eraser };
+
+struct RefNote { int after_idx; std::string text; };
+
+// Annotation input state — defined in canvas_annot.cpp
+extern AnnotTool   g_annot_tool;
+extern bool        g_ann_drawing;
+extern float       g_pen_r, g_pen_g, g_pen_b;
+extern int         g_ann_doc_idx;
+extern int         g_ann_page_idx;
+extern AnnotStroke g_ann_cur_stroke;
+extern Vec2        g_ann_hl_start;
+extern Vec2        g_ann_cur_norm;
+extern int         g_next_note_idx;
+extern std::vector<RefNote> g_ref_notes;
+
+std::string note_label(int idx);
+Page*       hit_test_page(float sx, float sy, int* out_doc_idx = nullptr);
+Vec2        screen_to_page_norm(const Page& page, float sx, float sy);
+void        finalize_annotation();
+void        draw_canvas_annotation_preview();
+void        update_canvas_annotations();

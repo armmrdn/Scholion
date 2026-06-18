@@ -105,6 +105,9 @@ set(WIN_RC "${CMAKE_SOURCE_DIR}/resources/scholion.rc")
 add_executable(Scholion WIN32
     # ---- Shared source (cross-platform, lives in ../scholion/src/) ----------
     ${SHARED_SRC}/main.cpp
+    ${SHARED_SRC}/rast_pipeline.cpp
+    ${SHARED_SRC}/canvas_annot.cpp
+    ${SHARED_SRC}/project_io.cpp
     ${SHARED_SRC}/canvas.cpp
     ${SHARED_SRC}/input.cpp
     ${SHARED_SRC}/renderer.cpp
@@ -141,7 +144,6 @@ target_link_libraries(Scholion PRIVATE
     gdi32     # GDI (GLFW dependency)
     user32    # Windows messaging (GLFW dependency)
     dwmapi    # DwmSetWindowAttribute — dark title bar
-    psapi     # GetProcessMemoryInfo — RAM working set (benchmark logger)
 )
 
 if(SCHOLION_WITH_MUPDF)

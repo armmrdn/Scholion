@@ -129,4 +129,98 @@ void scholion_activate_app(void) {
     [NSApp activateIgnoringOtherApps:YES];
 }
 
+// Pre-warm NSOpenPanel by creating and immediately discarding one. This
+// forces Cocoa to initialize the panel framework on a frame where the user
+// isn't waiting, so the first real dialog appears instantly.
+void scholion_prewarm_dialogs(void) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        NSOpenPanel* p = [NSOpenPanel openPanel];
+        (void)p;
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Native file-dialog replacements — use NSOpenPanel/NSSavePanel instead of
+// tinyfiledialogs's osascript path, which has a 1-3 s cold-start latency and
+// cannot enforce application-modal focus.
+// Each function returns a pointer to a static buffer valid until the next call.
+// NULL is returned when the user cancels.
+
+static std::string s_dialog_result;
+
+// ext_patterns: array of "*.ext" strings (same format tinyfd uses).
+// Returns an array of UTTypes for allowedContentTypes (macOS 11+).
+#import <UniformTypeIdentifiers/UTType.h>
+static NSArray<UTType*>* build_content_types(const char** ext_patterns, int n) {
+    NSMutableArray<UTType*>* arr = [NSMutableArray array];
+    for (int i = 0; i < n; ++i) {
+        const char* p = ext_patterns[i];
+        while (*p == '*' || *p == '.') ++p;  // strip "*." prefix
+        if (!*p) continue;
+        NSString* ext = [NSString stringWithUTF8String:p];
+        UTType* type = [UTType typeWithFilenameExtension:ext];
+        if (type) [arr addObject:type];
+    }
+    return arr.count ? arr : nil;
+}
+
+const char* scholion_open_file(const char* title,
+                                const char** ext_patterns, int n_ext,
+                                int allow_multi) {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.title = [NSString stringWithUTF8String:title ? title : "Open"];
+    panel.canChooseFiles = YES;
+    panel.canChooseDirectories = NO;
+    panel.allowsMultipleSelection = (allow_multi != 0);
+    if (ext_patterns && n_ext > 0) {
+        NSArray<UTType*>* types = build_content_types(ext_patterns, n_ext);
+        if (types) panel.allowedContentTypes = types;
+    }
+
+    if ([panel runModal] != NSModalResponseOK) return nullptr;
+
+    if (!allow_multi) {
+        s_dialog_result = panel.URL.path.UTF8String;
+    } else {
+        std::string joined;
+        for (NSURL* url in panel.URLs) {
+            if (!joined.empty()) joined += '|';
+            joined += url.path.UTF8String;
+        }
+        s_dialog_result = std::move(joined);
+    }
+    return s_dialog_result.c_str();
+}
+
+const char* scholion_save_file(const char* title, const char* default_name,
+                                const char** ext_patterns, int n_ext) {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSSavePanel* panel = [NSSavePanel savePanel];
+    panel.title = [NSString stringWithUTF8String:title ? title : "Save"];
+    if (default_name && *default_name)
+        panel.nameFieldStringValue = [NSString stringWithUTF8String:default_name];
+    if (ext_patterns && n_ext > 0) {
+        NSArray<UTType*>* types = build_content_types(ext_patterns, n_ext);
+        if (types) panel.allowedContentTypes = types;
+    }
+
+    if ([panel runModal] != NSModalResponseOK) return nullptr;
+    s_dialog_result = panel.URL.path.UTF8String;
+    return s_dialog_result.c_str();
+}
+
+const char* scholion_select_folder(const char* title) {
+    [NSApp activateIgnoringOtherApps:YES];
+    NSOpenPanel* panel = [NSOpenPanel openPanel];
+    panel.title = [NSString stringWithUTF8String:title ? title : "Select Folder"];
+    panel.canChooseFiles = NO;
+    panel.canChooseDirectories = YES;
+    panel.allowsMultipleSelection = NO;
+
+    if ([panel runModal] != NSModalResponseOK) return nullptr;
+    s_dialog_result = panel.URL.path.UTF8String;
+    return s_dialog_result.c_str();
+}
+
 } // extern "C"

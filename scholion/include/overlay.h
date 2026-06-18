@@ -17,7 +17,7 @@ public:
     void toggle()        { m_visible = !m_visible; }
     bool visible() const { return m_visible; }
 
-    // Placeholder for milestone 2 page tracking; defaults to 0/0.
+    // Page count tracking; defaults to 0/0.
     void set_page_count(int shown, int total) { m_pages_shown = shown; m_pages_total = total; }
 
     float fps() const { return m_fps; }

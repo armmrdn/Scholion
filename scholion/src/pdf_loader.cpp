@@ -67,7 +67,7 @@ bool PdfLoader::load(const std::string& path, Document& doc, Vec2 world_origin) 
 
         // Fan: page i offset diagonally so all pages overlap with a peek strip.
         // Page n-1 sits at the front (highest fan index, drawn last = on top).
-        float fan = static_cast<float>(i) * DocumentStack::FAN_OFFSET;
+        float fan = static_cast<float>(i) * PAGE_FAN_OFFSET;
         Page page;
         page.page_index = i;
         page.world_pos  = {world_origin.x + fan, world_origin.y + fan};

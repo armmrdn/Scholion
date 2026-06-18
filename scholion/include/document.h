@@ -8,9 +8,10 @@
 // --- Tile rendering ---------------------------------------------------------
 
 /// Native pixel size of one High-tier tile.
-/// 512 px keeps each tile under 1 MB (512×512×4 = 1 MB RGBA) and gives 9–35
-/// tiles per A4/Letter page at 300 DPI, so only the visible portion is rasterized.
-inline constexpr int TILE_PX = 512;
+/// 256 px keeps each tile under 256 KB (256×256×4 = 256 KB RGBA), giving 140
+/// tiles per A4/Letter page at 300 DPI. Smaller tiles mean each visible "patch"
+/// that streams in is less visually jarring than a 512 px coarse tile.
+inline constexpr int TILE_PX = 256;
 
 /// Key for g_tile_cache (main.cpp) and the rasterizer inflight set.
 /// Null-byte separators prevent path characters from colliding with field delimiters.
@@ -146,11 +147,14 @@ struct Document {
     bool missing = false;
 };
 
-/// Visual stack of pages on the canvas.  In milestone 3 this grows to support
-/// partial fans, reordering, and detached loose pages.
-struct DocumentStack {
-    Document* doc      = nullptr;
-    Vec2      world_pos = {0.0f, 0.0f};
+inline constexpr float PAGE_FAN_OFFSET = 20.0f;  // world-unit diagonal offset per page in a fan
 
-    static constexpr float FAN_OFFSET = 20.0f;  // world-unit diagonal offset per page in a fan
+// Color palette cycled per document (hue stripe, selection tint, etc.)
+inline constexpr float DOC_PALETTE[5][3] = {
+    {0.30f, 0.55f, 0.85f},
+    {0.85f, 0.40f, 0.35f},
+    {0.35f, 0.75f, 0.45f},
+    {0.80f, 0.70f, 0.30f},
+    {0.65f, 0.35f, 0.75f},
 };
+inline constexpr int PALETTE_SIZE = 5;
