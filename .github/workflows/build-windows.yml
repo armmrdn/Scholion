@@ -23,7 +23,7 @@ jobs:
         uses: msys2/setup-msys2@v2
         with:
           msystem: MINGW64
-          update: true
+          update: false
           path-type: minimal
           install: >-
             mingw-w64-x86_64-toolchain
@@ -112,7 +112,7 @@ jobs:
         with:
           name: Scholion-Windows-${{ github.ref_name }}
           path: Scholion-Windows/
-          retention-days: 30
+          retention-days: 5
 
       # ------------------------------------------------------------------
       # Publish to GitHub Releases on version tags (e.g. v0.6.0)
