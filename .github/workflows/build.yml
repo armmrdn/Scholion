@@ -128,7 +128,7 @@ jobs:
             --draft \
             --prerelease \
             --title "Scholion ${{ github.ref_name }}" \
-            --generate-notes \
+            --notes-file RELEASE_NOTES.md \
             scholion/build/Scholion.dmg
 
   # ============================================================
