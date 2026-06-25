@@ -20,14 +20,17 @@ pages max on canvas simultaneously). Solo-use, local-first, project-file based.
 
 ## Repository Layout
 ```
-~/Dropbox/Scholion/scholion/
-  ├── include/          — public headers
-  ├── src/              — implementation files
-  ├── resources/        — AppIcon.icns, Info.plist
-  ├── third_party/      — imgui, mupdf, tinyfiledialogs
-  ├── scripts/          — make_icon.py
-  ├── build/            — CMake build output; Scholion.app lives here
-  └── CLAUDE.md
+~/Desktop/Scholion/
+  ├── scholion/              — macOS build + all shared cross-platform source
+  │   ├── include/           — public headers
+  │   ├── src/               — implementation files (main.cpp, renderer.cpp, …)
+  │   ├── resources/         — AppIcon.icns, Info.plist
+  │   ├── third_party/       — imgui, mupdf, tinyfiledialogs
+  │   ├── scripts/           — make_icon.py
+  │   └── build/             — CMake output; Scholion.app lives here
+  ├── scholion-win/          — Windows CMake overlay + platform stubs
+  ├── .github/workflows/     — CI/CD (build.yml)
+  └── RELEASE_NOTES.md       — release notes embedded into each CI release
 ```
 
 ## Architecture (Three Layers)
@@ -153,63 +156,11 @@ Recent projects persisted to `~/.scholion_recents` (10 entries).
     Windows machine: MuPDF `.lib` files.
 
 ## Restore Points
-No git in this tree — snapshots are source-only tarballs in `~/Dropbox/Scholion/`.
-- `scholion-m1.tar.gz` — milestone 1 baseline.
-- `scholion-recovery-textbox-fixes.tar.gz` — text-tool ESC/color work complete,
-  **before** the Zoom Reference & Performance Overlay milestone.
-- `scholion-m16-textbox-overhaul.tar.gz` — milestones 15–16 (status overlay +
-  Cmd+S save; full text-box overhaul).
-- `scholion-m17-saveload-fixes.tar.gz` — milestone 17: save/load fixes, startup
-  chooser, missing-PDF placeholders.
-- `scholion-m18-audit-hardening.tar.gz` — milestone 18: viewport-restore, single-load,
-  dead-code removal, debug-gated logs, per-page w/h, relink, hardened parser.
-- `scholion-m19-selection-visuals.tar.gz` — milestone 19: double-click text-box edit
-  fix, dotted offset selection borders, fainter threads, live page counter.
-- `scholion-m20-unified-selection.tar.gz` — milestone 20 (2026-05-27): unified text-box
-  selection (Cmd+click toggle, delete all), save feedback UI (Saved!/saved toast with fade),
-  dotted offset selection borders on all selected items, thread opacity reduction, live page
-  counter, viewport/autosave/relink/text-edit fixes.
-- `scholion-m21-multibox-drag.tar.gz` — milestone 21 (2026-05-27): polished multi-box
-  dragging (rigid group movement with grab-point-relative delta, all selected boxes move
-  together maintaining relative offsets, undo per-box). Rubber-band text-box select +
-  modifier-click pages still pending (see docs/TODO.md).
-- `scholion-m22-cmd-click-pages.tar.gz` — milestone 22 (2026-05-27): Cmd/Ctrl+click
-  individual pages (toggle in/out of unified selection); Cmd+click on empty canvas starts
-  rubber-band without clearing selection.
-- `scholion-m23-rubber-band-textboxes.tar.gz` — milestone 23 (2026-05-27): rubber-band
-  select now includes text boxes (boxes whose world rect falls inside the band are added to
-  the unified selection on LMB release, additive in Cmd+drag mode).
-- `scholion-m24-crash-fixes.tar.gz` — milestone 24 (2026-05-27): three resilience
-  fixes — (1) `remove_document()` purges dangling `Page*` from undo records and drag
-  snapshots; (2) `load_project_from_path` rejects files > 20 MB; (3) `draw_rect_dashed`
-  pre-reserves 512 floats to eliminate per-frame heap churn.
-- `scholion-m28-win-port-phase1.tar.gz` — **current** snapshot (2026-05-28): Windows port
-  Phase 1 complete. Shared source is now fully cross-platform: `#ifdef _WIN32` guards in
-  `main.cpp` for Windows includes (GLAD before GLFW), `download_dir()`, `recents_file_path()`
-  (`%APPDATA%\Scholion\recents`), `reveal_in_file_manager()` (`ShellExecuteW`/explorer), and
-  GLAD loader init after `glfwMakeContextCurrent`. `renderer.cpp` + `texture_cache.cpp` use
-  `<glad/glad.h>` on non-Apple. Also fixes: space key-up was swallowed by `key_callback`'s
-  early `action != GLFW_PRESS` return — `m_space_held` never cleared, causing all left-drags
-  to pan instead of move; fixed by calling `g_input.on_key()` before the PRESS-only guard.
-  `glfwSetWindowFocusCallback` added to clear held-key state on focus loss. macOS build
-  verified clean. See `../scholion-win/` for the Windows-specific build tree.
-- `scholion-m27-panel-interaction.tar.gz` — milestone 27 (2026-05-28): panel interaction
-  redesign (single-click selects page, double-click opens panel, Space tap toggles panel) +
-  text-box ForegroundDrawList clip fix.
-- `scholion-m26-polish.tar.gz` — milestone 26 (2026-05-28): pre-port polish — `note_idx`
-  saved in project file; `Reveal in Finder` via `fork/execl`; `g_selected_box` auto-sync.
-- `scholion-m25-documentation.tar.gz` — documentation
-  pass — targeted WHY comments in `main.cpp` (rasterization pipeline, drag state machine,
-  undo stack, save/load parser, LOD budget, autosave timer, startup chooser), `input.h/cpp`
-  (selection state machine), `renderer.cpp` (coordinate systems), `pdf_loader.cpp` (LOD
-  tiers), `texture_cache.cpp` (eviction policy); new `docs/ARCHITECTURE.md` covering the
-  three-layer model, coordinate systems, threading, project file format, LOD strategy, undo
-  stack design, and selection model.
 
-All snapshots capture `src/`, `include/`, `CMakeLists.txt`, `CLAUDE.md`,
-`README.md`, `resources/`, `scripts/`, `docs/` (no `build/`, `.cache/`, or
-`third_party/`). Restore with, e.g.:
-`tar -xzf scholion-m16-textbox-overhaul.tar.gz -C scholion`
+The project is now on GitHub (`armmrdn/Scholion`, private). Use `git log` and `git checkout` for history. A source tarball is kept alongside the repo at `~/Desktop/Scholion/Scholion-source.tar.gz` (excludes `build/` and `.git`).
+
+Legacy pre-git tarballs (in `~/Dropbox/Scholion/` on the original machine):
+- `scholion-m1.tar.gz` through `scholion-m28-win-port-phase1.tar.gz` — milestones 1–28 before git was introduced. See old CLAUDE.md for individual descriptions.
 
 ## LOD / VRAM Strategy
 Zoom level drives which raster tier is loaded by the background worker (see `include/document.h`):
@@ -223,30 +174,54 @@ Off-screen High tiers are evicted unconditionally; Low tiers are evicted when
 VRAM exceeds 350 MB. `TextureCache` tracks per-texture byte counts accurately.
 
 ## Build Instructions
+
 ```bash
-# macOS — install dependencies (one-time)
+# macOS — one-time dependency
 brew install glfw
 # MuPDF is bundled in third_party/mupdf — no Homebrew install needed
 
-# Configure + build
-cd ~/Dropbox/Scholion/scholion
-mkdir -p build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Debug -DSCHOLION_WITH_MUPDF=ON
-make -j$(sysctl -n hw.ncpu)
+# Configure + build (from repo root)
+cmake -S scholion -B scholion/build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DSCHOLION_WITH_MUPDF=ON
+cmake --build scholion/build -j$(sysctl -n hw.ncpu)
 
-# Run as app bundle (recommended)
-open Scholion.app
-
-# Or run the binary directly
-./Scholion.app/Contents/MacOS/Scholion
+open scholion/build/Scholion.app
 ```
 
-### Distribution signing
-The build automatically ad-hoc signs the bundle (`codesign -s -`), which is
-sufficient for running on your own machine. To distribute:
-1. Replace `-` in the CMakeLists.txt `codesign` line with your
-   `"Developer ID Application: Name (TEAMID)"` certificate.
-2. Run `xcrun notarytool submit` after building.
+Ad-hoc signing (`codesign -s -`) is applied automatically at build time — sufficient for local use. For notarized distribution, replace `-` in CMakeLists.txt with a Developer ID certificate and run `xcrun notarytool submit`.
+
+## CI/CD Workflow
+
+Single workflow: `.github/workflows/build.yml`
+
+**Triggers:**
+- Push to `main` or `develop` → both platform builds run as a compile check; no release
+- Push of a `v*` tag → full build + release
+
+**Release sequence (sequential, no artifact storage):**
+1. `build-macos` runs, produces `Scholion.dmg`, creates a GitHub draft release tagged with the version, attaches the DMG, and embeds `RELEASE_NOTES.md` as the release body
+2. `build-windows` runs after macOS (`needs: build-macos`), produces `Scholion-Windows.zip`, and uploads it to the existing draft release via `gh release upload`
+3. `publish` runs after Windows (`needs: build-windows`), sets `draft=false` to make the release live
+
+No `actions/upload-artifact` is used — artifacts go directly to the GitHub release draft, avoiding the storage quota entirely.
+
+**Cutting a release:**
+```bash
+# 1. Update RELEASE_NOTES.md, commit, push to main
+git push origin main
+
+# 2. Create a version tag via the GitHub API
+#    (direct tag push is blocked by branch protection rules)
+gh api repos/armmrdn/Scholion/git/refs \
+  --method POST \
+  --field ref="refs/tags/vX.Y" \
+  --field sha="$(gh api repos/armmrdn/Scholion/git/refs/heads/main --jq '.object.sha')"
+```
+
+CI handles everything after step 2. Do not publish a manual GitHub release before CI runs — GitHub does not allow uploading assets to a published release, and there is no way to convert a published release back to draft.
+
+**Tag immutability:** once a tag name (e.g. `v1.0`) has been used with a published release, GitHub permanently locks that name — even after deleting both the release and the tag ref. Always increment to a new tag name for each release.
 
 ## Code Conventions
 - Use `snake_case` for functions and variables

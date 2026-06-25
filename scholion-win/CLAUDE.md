@@ -129,17 +129,16 @@ When modifying the application:
 
 ---
 
+## CI Build
+
+The Windows build runs in CI via `.github/workflows/build.yml` using an MSYS2/MinGW64 environment on `windows-2022`. MuPDF is built from source during CI (cached by `actions/cache`). GLFW is installed via MSYS2 packages. The final artifact is `Scholion-Windows.zip` — `Scholion.exe` bundled with all required MinGW DLLs.
+
+The Windows build job runs after `build-macos` completes (`needs: build-macos`) so the draft release already exists when Windows uploads its zip.
+
 ## Restore Points
 
-Windows port snapshots are tarballs of `scholion-win/` in `~/Dropbox/Scholion/`.
-- `scholion-win-phase1.tar.gz` — Phase 1 complete (2026-05-28)
-- **Current state** (2026-05-31): Settings pane bug fix synced from macOS.
-  CMakeLists.txt referencing shared `../scholion/src/`; GLAD 3.3 Core generated in
-  `third_party/glad/`; AppIcon.ico converted from macOS ICNS (16/32/48/64/128/256 px);
-  DPI-awareness manifest (`Scholion.manifest`); Windows resource file (`scholion.rc`);
-  `setup_windows.ps1` one-script MSYS2 + dependency bootstrap; `src/platform_win.cpp` stub.
-  Shared source in `../scholion/src/` carries all `#ifdef _WIN32` guards.
-  **Next step:** Fresh complete rebuild on Windows machine with MuPDF `.lib` files.
+The project is on GitHub (`armmrdn/Scholion`, private). Legacy pre-git tarballs:
+- `scholion-win-phase1.tar.gz` — Phase 1 complete (2026-05-28): CMakeLists.txt, GLAD 3.3 Core, AppIcon.ico, DPI manifest, scholion.rc, setup_windows.ps1, platform_win.cpp stub.
 
   ## Honesty rules (read every turn)
 
