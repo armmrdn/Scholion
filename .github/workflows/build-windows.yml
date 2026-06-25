@@ -93,11 +93,11 @@ jobs:
         run: cmake --build scholion-win/build
 
       # ------------------------------------------------------------------
-      # Bundle: exe + all MinGW DLLs, then zip.
+      # Bundle: exe + all MinGW DLLs it depends on.
       # ldd filters to /mingw64 paths; Windows system DLLs are excluded.
       # The result is a self-contained folder — extract and run.
       # ------------------------------------------------------------------
-      - name: Bundle and zip
+      - name: Bundle
         shell: msys2 {0}
         run: |
           mkdir -p Scholion-Windows
@@ -108,7 +108,11 @@ jobs:
             | xargs -I{} cp {} Scholion-Windows/
           echo "--- Bundle contents ---"
           ls -lh Scholion-Windows/
-          cd Scholion-Windows && zip -r ../Scholion-Windows.zip .
+
+      # Compress-Archive is built into PowerShell on all Windows runners.
+      - name: Zip bundle
+        shell: pwsh
+        run: Compress-Archive -Path Scholion-Windows\* -DestinationPath Scholion-Windows.zip
 
       # ------------------------------------------------------------------
       # Rolling "latest build" release on main/develop.
