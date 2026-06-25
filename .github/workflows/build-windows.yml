@@ -115,30 +115,24 @@ jobs:
         run: Compress-Archive -Path Scholion-Windows\* -DestinationPath Scholion-Windows.zip
 
       # ------------------------------------------------------------------
-      # Rolling "latest build" release on main/develop.
-      # The tag and release are pre-created once manually; CI only replaces
-      # the asset. Tag creation is not attempted (blocked by repo ruleset).
+      # Upload artifact — delete any previous same-named artifact first so
+      # storage never accumulates. 1-day retention as a safety net.
       # ------------------------------------------------------------------
-      - name: Publish rolling build release
+      - name: Delete previous artifact
         if: "!startsWith(github.ref, 'refs/tags/')"
         shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload Win-exe Scholion-Windows.zip --clobber
+          for id in $(gh api "repos/armmrdn/Scholion/actions/artifacts?name=Scholion-Windows-main&per_page=100" \
+              --jq '.artifacts[].id' 2>/dev/null); do
+            gh api --method DELETE "repos/armmrdn/Scholion/actions/artifacts/$id" 2>/dev/null || true
+          done
 
-      # ------------------------------------------------------------------
-      # Versioned release on tags (e.g. v0.6.0) — creates or adds assets
-      # to an existing release for that tag (e.g. if macOS uploads first).
-      # ------------------------------------------------------------------
-      - name: Publish version release
-        if: startsWith(github.ref, 'refs/tags/')
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --title "Scholion ${{ github.ref_name }}" \
-            --generate-notes \
-            Scholion-Windows.zip \
-          || gh release upload "${{ github.ref_name }}" Scholion-Windows.zip --clobber
+      - name: Upload artifact
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scholion-Windows-main
+          path: Scholion-Windows.zip
+          retention-days: 1
