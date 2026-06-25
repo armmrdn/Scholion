@@ -126,7 +126,7 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="build-windows-${{ github.ref_name }}"
-          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
           gh release create "$TAG" \
             --target "${{ github.sha }}" \
             --prerelease \
