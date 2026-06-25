@@ -48,6 +48,7 @@ extern "C" const char* scholion_select_folder(const char* title);
 #include <GLFW/glfw3native.h>   // glfwGetWin32Window
 #endif
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -107,7 +108,9 @@ static QuitState g_quit_state = QuitState::None;
 
 // --- Panel width (shared between panel and resize handle) -------------------
 float g_panel_w = 360.0f;   // also exposed as extern in app_state.h
-static int s_panel_nav_page = 0;    // current page index in open panel (0-based)
+static int  s_panel_nav_page    = 0;     // current page index in open panel (0-based)
+static int  s_last_panel_doc    = 0;     // last doc shown in panel — used by edge tabs to reopen
+static bool g_panel_open_to_refs = false; // true = next panel open should land on References tab
 static Page* g_nav_focus = nullptr; // focused page for arrow navigation (when panel closed)
 
 // --- Canvas text boxes -------------------------------------------------------
@@ -191,6 +194,14 @@ static void undo_last() {
         case UndoRecord::Type::PageResize:
             for (auto& pm : r.page_moves)
                 if (pm.page) { pm.page->world_w = pm.old_w; pm.page->world_h = pm.old_h; }
+            break;
+        case UndoRecord::Type::PageRotate:
+            for (auto& pr : r.page_rots)
+                if (pr.page) {
+                    pr.page->rotation = pr.old_rot;
+                    pr.page->world_w  = pr.old_w;
+                    pr.page->world_h  = pr.old_h;
+                }
             break;
         case UndoRecord::Type::TextBoxCreate:
             g_text_boxes.erase(
@@ -302,20 +313,31 @@ static std::string      g_dl_error;
 static std::thread      g_dl_thread;
 
 // --- Search state -----------------------------------------------------------
+static bool s_panel_ann_active = false;  // true while annotating from the sidebar panel
 static bool g_search_open    = false;
-static bool g_search_running = false;  // true while background search thread is active
+static std::atomic<bool> g_search_running{false};
 static char g_search_buf[256] = {};
 struct SearchResult {
     int         doc_idx;
     int         page_idx;
     std::string excerpt;
     std::string doc_name;
+    std::vector<std::array<float,4>> hit_rects;  // normalized [0,1] quads from MuPDF
 };
 static std::vector<SearchResult> g_search_results;
 static std::mutex                g_search_results_mutex;
 static std::thread               g_search_thread;
-static int g_highlighted_search_result = -1;  // index of the currently highlighted search result
-static std::string g_last_search_term;         // track if search term changed to clear highlight
+static int g_highlighted_search_result = -1;
+static std::string g_last_search_term;
+
+// Transient canvas highlight for the currently selected search result.
+struct SearchHighlight {
+    int doc_idx  = -1;
+    int page_idx = -1;
+    std::vector<std::array<float,4>> rects;
+    bool active() const { return doc_idx >= 0 && !rects.empty(); }
+};
+static SearchHighlight g_search_highlight;
 
 // --- Helpers ----------------------------------------------------------------
 
@@ -789,7 +811,7 @@ static void cursor_pos_callback(GLFWwindow* w, double x, double y) {
     if (ImGui::GetIO().WantCaptureMouse) { g_input.clear_hover(); return; }
     g_input.on_cursor_move(w, x, y);
     // Accumulate pen points at mouse-move rate (more points per frame = smoother stroke).
-    if (g_ann_drawing && g_annot_tool == AnnotTool::Pen
+    if (g_ann_drawing && !s_panel_ann_active && g_annot_tool == AnnotTool::Pen
             && g_ann_doc_idx >= 0 && g_ann_doc_idx < (int)g_documents.size()
             && g_ann_page_idx >= 0) {
         const Document& doc = g_documents[g_ann_doc_idx];
@@ -828,9 +850,10 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
         // Cmd+0 / Ctrl+0: zoom-to-fit regardless of active tool or text editing state.
         if (key == GLFW_KEY_0 && (super || ctrl)) { zoom_to_fit(); return; }
 
-        // Tool keys always work regardless of panel focus.
+        // Tool keys: suppressed while any ImGui widget has keyboard focus (text input, etc.)
         bool cmd = super || ctrl;
-        if (!cmd && !g_search_open && g_editing_box < 0) {
+        if (!cmd && !g_search_open && g_editing_box < 0
+                && !ImGui::GetIO().WantCaptureKeyboard) {
             if (key == GLFW_KEY_P) {
                 bool was_pen = (g_annot_tool == AnnotTool::Pen);
                 g_annot_tool = was_pen ? AnnotTool::None : AnnotTool::Pen;
@@ -1585,6 +1608,15 @@ static void reveal_in_file_manager(const std::string& path) {
 //
 // --- Context menu -----------------------------------------------------------
 
+static void apply_page_rotation(Page* page, int delta_cw) {
+    UndoRecord r;
+    r.type = UndoRecord::Type::PageRotate;
+    r.page_rots.push_back({page, page->rotation, page->world_w, page->world_h});
+    push_undo(r);
+    page->rotation = (page->rotation + delta_cw) % 360;
+    std::swap(page->world_w, page->world_h);
+}
+
 static void draw_context_menu() {
     static ImVec2 s_popup_pos;
 
@@ -1623,7 +1655,7 @@ static void draw_context_menu() {
                 }
                 ImGui::Separator();
             }
-            if (ImGui::MenuItem("Return to stack")) {
+            if (ImGui::MenuItem("Return to Stack")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
                 r.page_moves.push_back({page, page->world_pos});
@@ -1633,7 +1665,7 @@ static void draw_context_menu() {
                     doc->stack_origin.y + page->page_index * PAGE_FAN_OFFSET
                 };
             }
-            if (ImGui::MenuItem("View in panel")) {
+            if (ImGui::MenuItem("View in Sidebar Viewer")) {
                 for (int i = 0; i < static_cast<int>(g_documents.size()); ++i) {
                     if (&g_documents[i] == doc) {
                         g_input.open_panel(i, page->page_index);
@@ -1642,7 +1674,10 @@ static void draw_context_menu() {
                 }
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Fan pages vertically")) {
+            if (ImGui::MenuItem("Rotate CW"))  { apply_page_rotation(page, 90);  ImGui::CloseCurrentPopup(); }
+            if (ImGui::MenuItem("Rotate CCW")) { apply_page_rotation(page, 270); ImGui::CloseCurrentPopup(); }
+            ImGui::Separator();
+            if (ImGui::MenuItem("Fan Pages Vertically")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
                 for (auto& p : doc->pages) r.page_moves.push_back({&p, p.world_pos});
@@ -1650,7 +1685,7 @@ static void draw_context_menu() {
                 float y = doc->stack_origin.y;
                 for (auto& p : doc->pages) { p.world_pos = {doc->stack_origin.x, y}; y += p.world_h + 20.0f; }
             }
-            if (ImGui::MenuItem("Fan pages horizontally")) {
+            if (ImGui::MenuItem("Fan Pages Horizontally")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
                 for (auto& p : doc->pages) r.page_moves.push_back({&p, p.world_pos});
@@ -1658,7 +1693,7 @@ static void draw_context_menu() {
                 float x = doc->stack_origin.x;
                 for (auto& p : doc->pages) { p.world_pos = {x, doc->stack_origin.y}; x += p.world_w + 20.0f; }
             }
-            if (ImGui::MenuItem("Stack pages")) {
+            if (ImGui::MenuItem("Stack Pages")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
                 for (auto& p : doc->pages) r.page_moves.push_back({&p, p.world_pos});
@@ -1828,7 +1863,7 @@ static void draw_startup_chooser() {
             if (d) load_pdfs_from_folder(d);
         }
         ImGui::Separator();
-        if (ImGui::Button("Start with blank canvas", bsz)) {
+        if (ImGui::Button("Start with Blank Canvas", bsz)) {
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -1871,7 +1906,7 @@ static void draw_settings_popup() {
         save_prefs();
     }
     bool prev_vignette = g_settings.vignette_on;
-    ImGui::Checkbox("Canvas vignette", &g_settings.vignette_on);
+    ImGui::Checkbox("Canvas Vignette", &g_settings.vignette_on);
     if (g_settings.vignette_on != prev_vignette)
         save_prefs();
 
@@ -1879,8 +1914,8 @@ static void draw_settings_popup() {
     ImGui::SeparatorText("Canvas Grid");
     GridMode prev_grid = g_settings.grid_mode;
     ImGui::RadioButton("Off",        (int*)&g_settings.grid_mode, (int)GridMode::Off);
-    ImGui::RadioButton("Line grid",  (int*)&g_settings.grid_mode, (int)GridMode::Lines);
-    ImGui::RadioButton("Dot matrix", (int*)&g_settings.grid_mode, (int)GridMode::Dots);
+    ImGui::RadioButton("Line Grid",  (int*)&g_settings.grid_mode, (int)GridMode::Lines);
+    ImGui::RadioButton("Dot Matrix", (int*)&g_settings.grid_mode, (int)GridMode::Dots);
     if (g_settings.grid_mode != prev_grid) {
         save_prefs();
     }
@@ -1888,7 +1923,7 @@ static void draw_settings_popup() {
     // --- Compatibility Mode ---
     ImGui::SeparatorText("Performance");
     bool prev_compat = g_settings.compat_mode;
-    ImGui::Checkbox("Compatibility mode", &g_settings.compat_mode);
+    ImGui::Checkbox("Compatibility Mode", &g_settings.compat_mode);
     ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + 340.0f);
     ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
     ImGui::TextWrapped("Caps PDF rendering at Low quality when zoomed out, "
@@ -1923,29 +1958,29 @@ static void draw_settings_popup() {
             ImGui::TextDisabled("%s", key);
         };
 
-        row("Pan",                         "Middle-drag / Space+drag");
-        row("Zoom",                        "Scroll wheel");
-        row("Zoom to Fit",                 MODK "+0 / Middle double-click");
-        row("Toggle status overlay",       "F3");
-        row("Full-text search",            MODK "+F");
-        row("Select page",                 "Click");
-        row("Open panel",                  "Double-click");
-        row("Toggle panel",                "Space (tap)");
-        row("Move page",                   "Drag");
-        row("Toggle whole document select", "Shift+click");
-        row("Toggle item in selection",    MODK "+click");
-        row("Select all",                  MODK "+A");
-        row("Rubber-band select",          "Drag empty canvas");
-        row("Clear selection / close panel","Escape");
-        row("Text tool",                   "T");
-        row("Pen tool (+ open panel)",     "P");
-        row("Highlight tool",              "H");
-        row("Create text box",             "Drag (T active)");
-        row("Edit text box",               "Double-click box");
-        row("Duplicate text box",          MODK "+C, " MODK "+V");
-        row("Delete text box",             "Delete / Backspace");
-        row("Undo",                        MODK "+Z");
-        row("Save",                        MODK "+S");
+        row("Pan",                              "Middle-drag / Space+drag");
+        row("Zoom",                             "Scroll wheel");
+        row("Zoom to Fit",                      MODK "+0 / Middle double-click");
+        row("Toggle Status Overlay",            "F3");
+        row("Full-Text Search",                 MODK "+F");
+        row("Select Page",                      "Click");
+        row("Open Sidebar Viewer",              "Double-click");
+        row("Toggle Sidebar Viewer",            "Space (tap)");
+        row("Move Page",                        "Drag");
+        row("Toggle Whole-Document Selection",  "Shift+click");
+        row("Toggle Item in Selection",         MODK "+click");
+        row("Select All",                       MODK "+A");
+        row("Rubber-Band Select",               "Drag empty canvas");
+        row("Clear Selection / Close Sidebar Viewer", "Escape");
+        row("Text Tool",                        "T");
+        row("Pen Tool",                         "P");
+        row("Highlight Tool",                   "H");
+        row("Create Text Box",                  "Drag (T active)");
+        row("Edit Text Box",                    "Double-click box");
+        row("Duplicate Text Box",               MODK "+C, " MODK "+V");
+        row("Delete Text Box",                  "Delete / Backspace");
+        row("Undo",                             MODK "+Z");
+        row("Save",                             MODK "+S");
         ImGui::EndTable();
 #undef MODK
     }
@@ -2046,7 +2081,7 @@ static void draw_canvas_context_menu() {
         // Project operations
         if (ImGui::MenuItem("New Project"))
             new_project();
-        if (ImGui::MenuItem("Open project..."))
+        if (ImGui::MenuItem("Open Project..."))
             load_project();
         if (!g_recents.empty()) {
             if (ImGui::BeginMenu("Open Recent")) {
@@ -2078,7 +2113,7 @@ static void draw_canvas_context_menu() {
 #endif
             if (r) load_pdfs_from_selection(r);
         }
-        if (ImGui::MenuItem("Add folder...")) {
+        if (ImGui::MenuItem("Add Folder...")) {
 #ifdef __APPLE__
             const char* r = scholion_select_folder("Select PDF folder");
 #else
@@ -2201,8 +2236,8 @@ static void draw_references_tab() {
         ImGui::PushStyleColor(ImGuiCol_Text, {0.5f, 0.5f, 0.5f, 1.0f});
         ImGui::TextWrapped(
             "No text highlights yet.\n\n"
-            "Select the Highlight tool, then drag across text on a page "
-            "— it will appear here with the filename and page number.");
+            "Select the Highlight tool, then drag across text on any page "
+            "\xe2\x80\x94 it will appear here with the filename and page number.");
         ImGui::PopStyleColor();
         return;
     }
@@ -2250,7 +2285,11 @@ static void draw_references_tab() {
 
             if (note_slot >= 0 && s_editing_ref_note == gi) {
                 // ---- Editing: text box inset inside border, X top-right ----
-                const float kTextH = 76.0f;
+                // Height fits the current content — minimum one line.
+                float wrap_w_ht = avail - kXW - kSpc - kPad * 2.0f;
+                ImVec2 content_sz = ImGui::CalcTextSize(s_ref_note_buf, nullptr, false, wrap_w_ht);
+                float kTextH = std::max(content_sz.y, ImGui::GetTextLineHeight())
+                               + ImGui::GetStyle().FramePadding.y * 2.0f + 2.0f;
                 const float box_h  = kPad * 2.0f + kTextH;
 
                 // Inset cursor so text box sits inside the border with kPad margin
@@ -2362,6 +2401,68 @@ static void draw_references_tab() {
         ImGui::PopStyleColor();
         ImGui::Spacing();
     }
+
+    // ---- Open Documents --------------------------------------------------------
+    if (g_documents.empty()) return;
+
+    ImGui::Spacing();
+    ImGui::PushStyleColor(ImGuiCol_Text, {0.55f, 0.55f, 0.62f, 1.0f});
+    ImGui::SeparatorText("Open Documents");
+    ImGui::PopStyleColor();
+    ImGui::Spacing();
+
+    float avail_d = ImGui::GetContentRegionAvail().x;
+    for (int di = 0; di < (int)g_documents.size(); ++di) {
+        Document& doc = g_documents[di];
+        bool offline  = doc.missing;
+
+        ImGui::PushID(di);
+
+        // Filename row — selectable, toggles show_threads
+        ImVec4 name_col = offline
+            ? ImVec4(0.80f, 0.22f, 0.22f, 1.0f)
+            : ImVec4(doc.hue_r, doc.hue_g, doc.hue_b, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_Text, name_col);
+        ImGui::PushStyleColor(ImGuiCol_HeaderHovered,
+            ImVec4(doc.hue_r * 0.25f, doc.hue_g * 0.25f, doc.hue_b * 0.25f, 0.55f));
+        ImGui::PushStyleColor(ImGuiCol_Header,
+            ImVec4(doc.hue_r * 0.25f, doc.hue_g * 0.25f, doc.hue_b * 0.25f, 0.35f));
+
+        std::string fname = fs::path(doc.path).filename().string();
+        if (ImGui::Selectable(fname.c_str(), doc.show_threads,
+                              ImGuiSelectableFlags_None, {avail_d, 0.0f}))
+            doc.show_threads = !doc.show_threads;
+        ImGui::SetItemTooltip(doc.show_threads
+            ? "Click to hide connection threads"
+            : "Click to show connection threads");
+
+        ImGui::PopStyleColor(3);
+
+        // Filepath: abbreviated to last two directory components + filename
+        {
+            namespace fs2 = std::filesystem;
+            fs2::path p(doc.path);
+            fs2::path par  = p.parent_path();
+            fs2::path gpar = par.parent_path();
+            std::string short_path;
+            if (!gpar.empty() && !gpar.filename().empty())
+                short_path = ".../" + par.parent_path().filename().string()
+                           + "/" + par.filename().string() + "/" + p.filename().string();
+            else
+                short_path = doc.path;
+
+            ImGui::PushStyleColor(ImGuiCol_Text,
+                offline ? ImVec4(0.70f, 0.28f, 0.28f, 0.80f)
+                        : ImVec4(0.45f, 0.45f, 0.50f, 0.85f));
+            ImGui::PushTextWrapPos(0.0f);
+            ImGui::TextUnformatted(short_path.c_str());
+            ImGui::PopTextWrapPos();
+            ImGui::PopStyleColor();
+        }
+
+        ImGui::PopID();
+        ImGui::Spacing();
+    }
 }
 
 // --- Panel viewer -----------------------------------------------------------
@@ -2376,6 +2477,7 @@ static void draw_panel_ui() {
     }
 
     Document& doc = g_documents[doc_idx];
+    s_last_panel_doc = doc_idx;  // remember for edge-tab re-open
     ImVec2 vp = ImGui::GetMainViewport()->Size;
 
     ImGui::SetNextWindowPos({vp.x - g_panel_w, 0.0f}, ImGuiCond_Always);
@@ -2394,15 +2496,6 @@ static void draw_panel_ui() {
     ImGui::Begin("##panel", nullptr, kFlags);
     ImGui::PopStyleVar();
 
-    // Subtle visual indicator on the left edge showing the resize handle
-    {
-        ImVec2 wp = ImGui::GetWindowPos();
-        float  wh = ImGui::GetWindowHeight();
-        ImGui::GetWindowDrawList()->AddRectFilled(
-            {wp.x, wp.y}, {wp.x + 3.0f, wp.y + wh},
-            IM_COL32(90, 90, 100, 140));
-    }
-
     // Track the "active" page for nav and copy (updated on scroll-to events)
     int scroll_to_peek = g_input.panel_scroll_page();  // read before clear
     if (ImGui::IsWindowAppearing()) s_panel_nav_page = std::max(0, scroll_to_peek);
@@ -2415,12 +2508,11 @@ static void draw_panel_ui() {
     ImGui::TextUnformatted(fname.c_str());
     ImGui::PopStyleColor();
 
-    if (ImGui::SmallButton("Close##panel")) {
+    if (ImGui::SmallButton("Close Sidebar Viewer  [Space]##panel")) {
         g_input.close_panel();
         ImGui::End();
         return;
     }
-    ImGui::SetItemTooltip("Close this document panel");
     ImGui::SameLine();
 
     // Page navigation  < p.N/Total >
@@ -2442,9 +2534,17 @@ static void draw_panel_ui() {
     }
 
     // Tab bar: "Document" shows the PDF viewer; "References" lists all text highlights.
+    // On the frame the window first appears, honour g_panel_open_to_refs.
+    bool just_appeared = ImGui::IsWindowAppearing();
+    ImGuiTabItemFlags doc_flags = (just_appeared && !g_panel_open_to_refs)
+                                  ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags ref_flags = (just_appeared &&  g_panel_open_to_refs)
+                                  ? ImGuiTabItemFlags_SetSelected : 0;
+    if (just_appeared) g_panel_open_to_refs = false;  // consume the one-shot request
+
     ImGui::BeginTabBar("##panel_tabs");
 
-    if (ImGui::BeginTabItem("Document")) {
+    if (ImGui::BeginTabItem("Document", nullptr, doc_flags)) {
     // Child window fills the remaining panel height and is the only scrollable region.
     // The toolbar above stays pinned regardless of scroll position.
     ImGui::BeginChild("##panel_scroll", {0.0f, 0.0f}, false, ImGuiWindowFlags_None);
@@ -2492,6 +2592,107 @@ static void draw_panel_ui() {
         if (is_highlighted) {
             dl->AddRect(img_pos, {img_pos.x + img_w, img_pos.y + img_h},
                        IM_COL32(100, 150, 255, 200), 0.0f, 0, 4.0f);
+        }
+
+        // Draw orange search hit rects (text-level, from g_search_highlight)
+        if (g_search_highlight.active() &&
+            g_search_highlight.doc_idx == doc_idx &&
+            g_search_highlight.page_idx == pi) {
+            for (const auto& r : g_search_highlight.rects) {
+                ImVec2 tl = {img_pos.x + r[0] * img_w, img_pos.y + r[1] * img_h};
+                ImVec2 br = {img_pos.x + r[2] * img_w, img_pos.y + r[3] * img_h};
+                dl->AddRectFilled(tl, br, IM_COL32(255, 128, 0, 130));
+            }
+        }
+
+        // Annotation tool interaction in panel
+        {
+            ImVec2 mouse  = ImGui::GetMousePos();
+            float  nx     = std::clamp((mouse.x - img_pos.x) / img_w, 0.0f, 1.0f);
+            float  ny     = std::clamp((mouse.y - img_pos.y) / img_h, 0.0f, 1.0f);
+            Vec2   pnorm  = {nx, ny};
+            bool   hov    = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
+
+            if (g_annot_tool == AnnotTool::Note && hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                int snap = g_next_note_idx;
+                page.annots.notes.push_back({note_label(g_next_note_idx++)});
+                UndoRecord r; r.type = UndoRecord::Type::Note;
+                r.doc_idx = doc_idx; r.page_idx = pi; r.note_idx_before = snap;
+                push_undo(r);
+            }
+
+            if ((g_annot_tool == AnnotTool::Highlight || g_annot_tool == AnnotTool::Pen)
+                    && !g_ann_drawing && hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                g_ann_drawing      = true;
+                g_ann_doc_idx      = doc_idx;
+                g_ann_page_idx     = pi;
+                s_panel_ann_active = true;
+                if (g_annot_tool == AnnotTool::Pen) {
+                    g_ann_cur_stroke   = {};
+                    g_ann_cur_stroke.r = g_pen_r;
+                    g_ann_cur_stroke.g = g_pen_g;
+                    g_ann_cur_stroke.b = g_pen_b;
+                    g_ann_cur_stroke.pts.push_back(pnorm);
+                } else {
+                    g_ann_hl_start = pnorm;
+                    g_ann_cur_norm = pnorm;
+                }
+            }
+
+            if (g_ann_drawing && s_panel_ann_active &&
+                    g_ann_doc_idx == doc_idx && g_ann_page_idx == pi) {
+                if (g_annot_tool == AnnotTool::Pen && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                    g_ann_cur_stroke.pts.push_back(pnorm);
+                    const auto& pts = g_ann_cur_stroke.pts;
+                    for (int si = 1; si < (int)pts.size(); ++si) {
+                        ImVec2 a = {img_pos.x + pts[si-1].x * img_w, img_pos.y + pts[si-1].y * img_h};
+                        ImVec2 b = {img_pos.x + pts[si  ].x * img_w, img_pos.y + pts[si  ].y * img_h};
+                        dl->AddLine(a, b,
+                            IM_COL32((int)(g_pen_r*255),(int)(g_pen_g*255),(int)(g_pen_b*255),220), 2.0f);
+                    }
+                } else if (g_annot_tool == AnnotTool::Highlight) {
+                    g_ann_cur_norm = pnorm;
+                    float x0 = std::min(g_ann_hl_start.x, pnorm.x);
+                    float y0 = std::min(g_ann_hl_start.y, pnorm.y);
+                    float x1 = std::max(g_ann_hl_start.x, pnorm.x);
+                    float y1 = std::max(g_ann_hl_start.y, pnorm.y);
+                    dl->AddRectFilled(
+                        {img_pos.x + x0 * img_w, img_pos.y + y0 * img_h},
+                        {img_pos.x + x1 * img_w, img_pos.y + y1 * img_h},
+                        IM_COL32(255, 224, 0, 80));
+                }
+                if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
+                    s_panel_ann_active = false;
+                    // finalize_annotation() is called by the main draw loop
+            }
+
+            if (g_annot_tool == AnnotTool::Eraser && hov && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                constexpr float ER = 0.025f;
+                for (int hi = (int)page.annots.highlights.size() - 1; hi >= 0; --hi) {
+                    const auto& hl = page.annots.highlights[hi];
+                    float cx = std::clamp(nx, hl.x0, hl.x1), cy = std::clamp(ny, hl.y0, hl.y1);
+                    if ((nx-cx)*(nx-cx) + (ny-cy)*(ny-cy) <= ER*ER) {
+                        UndoRecord r; r.type = UndoRecord::Type::ErasedHighlight;
+                        r.doc_idx = doc_idx; r.page_idx = pi; r.erased_highlight = hl;
+                        push_undo(r);
+                        page.annots.highlights.erase(page.annots.highlights.begin() + hi);
+                    }
+                }
+                for (int si = (int)page.annots.strokes.size() - 1; si >= 0; --si) {
+                    bool hit = false;
+                    for (const auto& pt : page.annots.strokes[si].pts) {
+                        float dx = nx - pt.x, dy = ny - pt.y;
+                        if (dx*dx + dy*dy <= ER*ER) { hit = true; break; }
+                    }
+                    if (hit) {
+                        UndoRecord r; r.type = UndoRecord::Type::ErasedStroke;
+                        r.doc_idx = doc_idx; r.page_idx = pi;
+                        r.erased_stroke = page.annots.strokes[si];
+                        push_undo(r);
+                        page.annots.strokes.erase(page.annots.strokes.begin() + si);
+                    }
+                }
+            }
         }
 
         // Draw saved annotations on top of page
@@ -2542,7 +2743,7 @@ static void draw_panel_ui() {
     ImGui::EndTabItem();
     } // Document tab
 
-    if (ImGui::BeginTabItem("References")) {
+    if (ImGui::BeginTabItem("References", nullptr, ref_flags)) {
         ImGui::BeginChild("##panel_ref_scroll", {0.0f, 0.0f}, false, ImGuiWindowFlags_None);
         ImGui::Spacing();
         draw_references_tab();
@@ -2595,7 +2796,7 @@ static void draw_panel_resize_handle() {
     if (!g_input.panel_open()) return;
 
     ImVec2 vp = ImGui::GetMainViewport()->Size;
-    constexpr float STRIP_W = 8.0f;
+    constexpr float STRIP_W = 12.0f;
 
     ImGui::SetNextWindowPos({vp.x - g_panel_w - STRIP_W * 0.5f, 0.0f}, ImGuiCond_Always);
     ImGui::SetNextWindowSize({STRIP_W, vp.y}, ImGuiCond_Always);
@@ -2615,17 +2816,123 @@ static void draw_panel_resize_handle() {
     ImGui::Begin("##panel_resize", nullptr, kRFlags);
     ImGui::PopStyleVar(2);
 
+    ImVec2 wp = ImGui::GetWindowPos();
     ImGui::InvisibleButton("##drag", {STRIP_W, vp.y});
-    bool was_dragging = ImGui::IsItemActive();
-    if (was_dragging) {
+    bool is_active  = ImGui::IsItemActive();
+    bool is_hovered = ImGui::IsItemHovered();
+
+    if (is_active) {
         g_panel_w -= ImGui::GetIO().MouseDelta.x;
         g_panel_w  = std::clamp(g_panel_w, 180.0f, vp.x - 30.0f);
     } else if (ImGui::IsItemDeactivated()) {
         g_settings.panel_w = g_panel_w;
         save_prefs();
     }
-    if (ImGui::IsItemHovered() || ImGui::IsItemActive())
+    if (is_hovered || is_active)
         ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
+
+    // Blue divider line — brighter when hovered/dragged
+    float cx = wp.x + STRIP_W * 0.5f;
+    ImU32 line_col = is_active  ? IM_COL32(110, 165, 255, 230)
+                   : is_hovered ? IM_COL32(80, 140, 230, 200)
+                   :              IM_COL32(55, 108, 190, 150);
+    ImGui::GetWindowDrawList()->AddLine({cx, wp.y}, {cx, wp.y + vp.y}, line_col, 2.5f);
+
+    ImGui::End();
+}
+
+// --- Panel edge tabs (shown on right edge when sidebar is closed) -----------
+// Two vertical tab handles sitting flush on the right edge — characters are
+// rendered stacked top-to-bottom so the label reads downward without rotation.
+// They disappear once the sidebar is open.
+
+static void draw_vert_label(ImDrawList* dl, const char* text,
+                             float cx, float y_start, ImU32 col)
+{
+    float lh = ImGui::GetTextLineHeight();
+    for (const char* c = text; *c; ++c) {
+        char buf[2] = {*c, '\0'};
+        float w = ImGui::CalcTextSize(buf).x;
+        dl->AddText({cx - w * 0.5f, y_start}, col, buf);
+        y_start += lh + 1.0f;
+    }
+}
+
+static void draw_panel_edge_tabs() {
+    if (g_input.panel_open()) return;
+    if (g_documents.empty()) return;
+
+    ImVec2 vp = ImGui::GetMainViewport()->Size;
+    constexpr float STRIP_W  = 18.0f;
+    constexpr float PAD_V    = 8.0f;   // vertical padding inside each tab
+    constexpr float TAB_GAP  = 6.0f;
+
+    float lh         = ImGui::GetTextLineHeight() + 1.0f;
+    float viewer_h   = static_cast<float>(strlen("Viewer"))     * lh + PAD_V * 2.0f;
+    float refs_h     = static_cast<float>(strlen("References")) * lh + PAD_V * 2.0f;
+    float total_h    = viewer_h + TAB_GAP + refs_h;
+    float origin_y   = (vp.y - total_h) * 0.38f;
+
+    ImGui::SetNextWindowPos({vp.x - STRIP_W, origin_y}, ImGuiCond_Always);
+    ImGui::SetNextWindowSize({STRIP_W, total_h}, ImGuiCond_Always);
+    ImGui::SetNextWindowBgAlpha(0.0f);
+
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0.0f, 0.0f});
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, {1.0f, 1.0f});
+    constexpr ImGuiWindowFlags kFlags =
+        ImGuiWindowFlags_NoTitleBar          |
+        ImGuiWindowFlags_NoResize            |
+        ImGuiWindowFlags_NoMove              |
+        ImGuiWindowFlags_NoScrollbar         |
+        ImGuiWindowFlags_NoSavedSettings     |
+        ImGuiWindowFlags_NoBackground        |
+        ImGuiWindowFlags_NoFocusOnAppearing  |
+        ImGuiWindowFlags_NoBringToFrontOnFocus;
+    ImGui::Begin("##edge_tabs", nullptr, kFlags);
+    ImGui::PopStyleVar(2);
+
+    ImDrawList* dl = ImGui::GetWindowDrawList();
+    ImVec2      wp = ImGui::GetWindowPos();
+
+    // --- "Viewer" tab ---
+    ImGui::InvisibleButton("##etab_viewer", {STRIP_W, viewer_h});
+    bool v_hov = ImGui::IsItemHovered();
+    bool v_act = ImGui::IsItemActive();
+    if (ImGui::IsItemClicked()) {
+        int di = (s_last_panel_doc >= 0 && s_last_panel_doc < (int)g_documents.size())
+                 ? s_last_panel_doc : 0;
+        g_panel_open_to_refs = false;
+        g_input.open_panel(di, -1);
+    }
+    ImU32 v_bg = v_act  ? IM_COL32(70, 130, 225, 240)
+               : v_hov  ? IM_COL32(50, 108, 200, 220)
+               :          IM_COL32(35,  85, 165, 190);
+    dl->AddRectFilled({wp.x, wp.y}, {wp.x + STRIP_W, wp.y + viewer_h},
+                      v_bg, 5.0f, ImDrawFlags_RoundCornersLeft);
+    draw_vert_label(dl, "Viewer", wp.x + STRIP_W * 0.5f,
+                    wp.y + PAD_V, IM_COL32(210, 225, 255, 245));
+
+    // Gap between tabs
+    ImGui::Dummy({STRIP_W, TAB_GAP});
+
+    // --- "References" tab ---
+    float refs_y = wp.y + viewer_h + TAB_GAP;
+    ImGui::InvisibleButton("##etab_refs", {STRIP_W, refs_h});
+    bool r_hov = ImGui::IsItemHovered();
+    bool r_act = ImGui::IsItemActive();
+    if (ImGui::IsItemClicked()) {
+        int di = (s_last_panel_doc >= 0 && s_last_panel_doc < (int)g_documents.size())
+                 ? s_last_panel_doc : 0;
+        g_panel_open_to_refs = true;
+        g_input.open_panel(di, -1);
+    }
+    ImU32 r_bg = r_act  ? IM_COL32(70, 130, 225, 240)
+               : r_hov  ? IM_COL32(50, 108, 200, 220)
+               :          IM_COL32(35,  85, 165, 190);
+    dl->AddRectFilled({wp.x, refs_y}, {wp.x + STRIP_W, refs_y + refs_h},
+                      r_bg, 5.0f, ImDrawFlags_RoundCornersLeft);
+    draw_vert_label(dl, "References", wp.x + STRIP_W * 0.5f,
+                    refs_y + PAD_V, IM_COL32(210, 225, 255, 245));
 
     ImGui::End();
 }
@@ -2702,7 +3009,8 @@ static void run_search() {
             if (!tmp.load(d.path, dummy)) continue;
             auto hits = tmp.search_text(q, 50);
             for (auto& h : hits)
-                results.push_back({d.idx, h.page_index, std::move(h.excerpt), d.name});
+                results.push_back({d.idx, h.page_index, std::move(h.excerpt), d.name,
+                                   std::move(h.hit_rects)});
         }
         {
             std::lock_guard<std::mutex> lk(g_search_results_mutex);
@@ -2714,7 +3022,10 @@ static void run_search() {
 }
 
 static void draw_search_panel() {
-    if (!g_search_open) return;
+    if (!g_search_open) {
+        if (g_search_highlight.active()) g_search_highlight = {};
+        return;
+    }
 
     ImVec2 vp = ImGui::GetMainViewport()->Size;
     ImGui::SetNextWindowPos({vp.x * 0.5f - 260.0f, 50.0f}, ImGuiCond_Appearing);
@@ -2729,17 +3040,21 @@ static void draw_search_panel() {
 
     if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
 
-    // Disable input field and button while search is running
-    if (g_search_running) ImGui::BeginDisabled();
+    // Snapshot before any ImGui calls so Begin/EndDisabled are always paired.
+    // run_search() sets g_search_running = true mid-frame, so reading it twice
+    // would call EndDisabled without a matching BeginDisabled and crash ImGui.
+    bool was_running = g_search_running.load();
+    if (was_running) ImGui::BeginDisabled();
     bool enter = ImGui::InputText("##sq", g_search_buf, sizeof(g_search_buf),
                                   ImGuiInputTextFlags_EnterReturnsTrue);
     if (g_last_search_term != std::string(g_search_buf)) {
         g_highlighted_search_result = -1;
         g_last_search_term = std::string(g_search_buf);
+        g_search_highlight = {};
     }
     ImGui::SameLine();
     if (ImGui::Button("Search") || enter) run_search();
-    if (g_search_running) ImGui::EndDisabled();
+    if (was_running) ImGui::EndDisabled();
 
     // Result count / loading indicator
     ImGui::SameLine();
@@ -2818,8 +3133,11 @@ static void draw_search_panel() {
                 zoom_to_rect(pg.world_pos.x, pg.world_pos.y,
                              pg.world_pos.x + pg.world_w,
                              pg.world_pos.y + pg.world_h);
-                g_input.open_panel(hit.doc_idx, hit.page_idx);
+                // Navigate within panel if already open — never force-open it.
+                if (g_input.panel_open())
+                    g_input.open_panel(hit.doc_idx, hit.page_idx);
                 g_highlighted_search_result = i;
+                g_search_highlight = {hit.doc_idx, hit.page_idx, hit.hit_rects};
             }
 
             ImGui::Separator();
@@ -2851,7 +3169,7 @@ static void draw_toolbar_ui() {
     ImGui::PopStyleVar(3);
 
     if (ImGui::Button("+")) ImGui::OpenPopup("add_popup");
-    ImGui::SetItemTooltip("Add PDFs - from folder, file, or URL");
+    ImGui::SetItemTooltip("Add PDFs from folder, file, or URL");
     ImGui::SameLine();
     bool text_was_active = g_text_tool;
     if (text_was_active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.50f, 0.85f, 1.0f));
@@ -2860,7 +3178,7 @@ static void draw_toolbar_ui() {
         g_editing_box  = -1;
     }
     if (text_was_active) ImGui::PopStyleColor();
-    ImGui::SetItemTooltip("Text box tool - click canvas to insert (Escape to cancel)");
+    ImGui::SetItemTooltip("Insert a floating text box (T)");
     ImGui::SameLine();
 
     // Annotation tools
@@ -2874,33 +3192,33 @@ static void draw_toolbar_ui() {
         if (pen_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.08f, 0.08f, 1.0f));
         if (ImGui::Button("Pen")) { g_annot_tool = pen_was ? AnnotTool::None : AnnotTool::Pen; g_ann_drawing = false; }
         if (pen_was) ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Freehand pen — draw on pages (P)");
+        ImGui::SetItemTooltip("Freehand pen: draw on any page (P)");
 
         if (pen_was) {
             ImGui::SameLine();
             float pcol[3] = {g_pen_r, g_pen_g, g_pen_b};
             if (ImGui::ColorEdit3("##pencolor", pcol, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
                 { g_pen_r = pcol[0]; g_pen_g = pcol[1]; g_pen_b = pcol[2]; }
-            ImGui::SetItemTooltip("Pen color");
+            ImGui::SetItemTooltip("Change the pen color");
         }
         ImGui::SameLine();
 
         if (hl_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.60f, 0.55f, 0.0f, 1.0f));
         if (ImGui::Button("HL")) { g_annot_tool = hl_was ? AnnotTool::None : AnnotTool::Highlight; g_ann_drawing = false; }
         if (hl_was) ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Highlight — drag across text on a page (H)");
+        ImGui::SetItemTooltip("Highlight text: drag to select (H)");
         ImGui::SameLine();
 
         if (note_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.40f, 0.70f, 1.0f));
         if (ImGui::Button("Flag")) { g_annot_tool = note_was ? AnnotTool::None : AnnotTool::Note; g_ann_drawing = false; }
         if (note_was) ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Flag — stamp a note marker on a page (F)");
+        ImGui::SetItemTooltip("Place a note marker on any page (F)");
         ImGui::SameLine();
 
         if (eraser_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.30f, 0.30f, 1.0f));
         if (ImGui::Button("Erase")) { g_annot_tool = eraser_was ? AnnotTool::None : AnnotTool::Eraser; g_ann_drawing = false; }
         if (eraser_was) ImGui::PopStyleColor();
-        ImGui::SetItemTooltip("Eraser — drag over annotations to remove them");
+        ImGui::SetItemTooltip("Erase annotations by dragging over them");
     }
 
     if (g_text_tool || g_selected_box >= 0) {
@@ -2912,14 +3230,14 @@ static void draw_toolbar_ui() {
             for (auto& b : g_text_boxes)
                 if (b.id == g_selected_box) { b.r = tcol[0]; b.g = tcol[1]; b.b = tcol[2]; break; }
         }
-        ImGui::SetItemTooltip("Text color");
+        ImGui::SetItemTooltip("Change the text box color");
         ImGui::SameLine();
         ImGui::SetNextItemWidth(52.0f);
         if (ImGui::DragFloat("##tboxsz", &g_tbox_font_size, 0.5f, 10.0f, 48.0f, "%.0fpt")) {
             for (auto& b : g_text_boxes)
                 if (b.id == g_selected_box) { b.font_size = g_tbox_font_size; break; }
         }
-        ImGui::SetItemTooltip("Font size (drag to adjust)");
+        ImGui::SetItemTooltip("Adjust font size");
     }
 
     static bool open_url_modal = false;
@@ -3696,6 +4014,7 @@ int main(int argc, char* argv[]) {
         draw_startup_chooser();
         draw_panel_ui();
         draw_panel_resize_handle();   // rendered after panel so it sits on top
+        draw_panel_edge_tabs();       // visible only when panel is closed
         draw_page_tooltip();
         draw_search_panel();
 
@@ -3712,6 +4031,11 @@ int main(int argc, char* argv[]) {
         hints.draw_time      = (float)glfwGetTime();
         hints.tile_cache     = &g_tile_cache;
         hints.content_scale  = g_content_scale;
+        if (g_search_highlight.active()) {
+            hints.search_hit_doc   = g_search_highlight.doc_idx;
+            hints.search_hit_page  = g_search_highlight.page_idx;
+            hints.search_hit_rects = &g_search_highlight.rects;
+        }
         renderer.draw(g_canvas, g_documents, hints);
 
         // Page counter: visible pages / total pages across all documents.
