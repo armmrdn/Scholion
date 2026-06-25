@@ -3,10 +3,13 @@ name: Build Windows
 on:
   push:
     branches: [main, develop]
+    tags:     ['v*']
 
 jobs:
   build-windows:
     runs-on: windows-2022
+    permissions:
+      contents: write   # needed to create/update GitHub Releases
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -17,7 +20,6 @@ jobs:
       # ------------------------------------------------------------------
       # MSYS2 / MinGW-w64 toolchain
       # All compilation steps use  shell: msys2 {0}  below.
-      # JavaScript actions (cache, upload-artifact) are unaffected.
       # ------------------------------------------------------------------
       - name: Setup MSYS2
         uses: msys2/setup-msys2@v2
@@ -56,8 +58,8 @@ jobs:
           tar xzf mupdf-source.tar.gz || true
           [ -f mupdf-1.24.11-source/Makefile ] || { echo "Extraction failed"; exit 1; }
           cd mupdf-1.24.11-source
-          # XCFLAGS: GCC 14 (shipped by current MSYS2) promotes -Wincompatible-pointer-types
-          # to a hard error; MuPDF 1.24.11 has a _wstat/_stat64i32 mismatch on Windows.
+          # XCFLAGS: GCC 14 promotes -Wincompatible-pointer-types to a hard error;
+          # MuPDF 1.24.11 has a _wstat/_stat64i32 mismatch on Windows.
           make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs -j4 \
                XCFLAGS="-Wno-incompatible-pointer-types"
           mkdir -p ../mupdf-libs-windows
@@ -91,11 +93,11 @@ jobs:
         run: cmake --build scholion-win/build
 
       # ------------------------------------------------------------------
-      # Bundle: exe + all MinGW DLLs it depends on
+      # Bundle: exe + all MinGW DLLs, then zip.
       # ldd filters to /mingw64 paths; Windows system DLLs are excluded.
       # The result is a self-contained folder — extract and run.
       # ------------------------------------------------------------------
-      - name: Bundle release
+      - name: Bundle and zip
         shell: msys2 {0}
         run: |
           mkdir -p Scholion-Windows
@@ -104,34 +106,44 @@ jobs:
             | grep '/mingw64' \
             | awk '{print $3}' \
             | xargs -I{} cp {} Scholion-Windows/
-          echo "--- Release contents ---"
+          echo "--- Bundle contents ---"
           ls -lh Scholion-Windows/
-
-      - name: Upload artifact
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: Scholion-Windows-${{ github.ref_name }}
-          path: Scholion-Windows/
-          retention-days: 5
+          cd Scholion-Windows && zip -r ../Scholion-Windows.zip .
 
       # ------------------------------------------------------------------
-      # Publish to GitHub Releases on version tags (e.g. v0.6.0)
-      # Zip the full bundle (exe + all MinGW DLLs) so users can run the
-      # app without installing anything extra.
+      # Rolling "latest build" release on main/develop.
+      # Uses gh CLI (no Node.js) — release storage doesn't count against
+      # the Actions artifact quota. Delete+create is the reliable upsert.
       # ------------------------------------------------------------------
-      - name: Zip Windows bundle
-        if: startsWith(github.ref, 'refs/tags/v')
-        shell: msys2 {0}
-        run: |
-          cd Scholion-Windows
-          zip -r ../Scholion-Windows.zip .
-
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: |
-            Scholion-Windows.zip
+      - name: Publish rolling build release
+        if: "!startsWith(github.ref, 'refs/tags/')"
+        shell: bash
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="build-windows-${{ github.ref_name }}"
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --prerelease \
+            --title "Windows build (${{ github.ref_name }})" \
+            --notes "Automated build from \`${{ github.ref_name }}\` — commit \`${{ github.sha }}\`.
+
+          Extract the zip and run \`Scholion.exe\` — all required DLLs are included." \
+            Scholion-Windows.zip
+
+      # ------------------------------------------------------------------
+      # Versioned release on tags (e.g. v0.6.0) — creates or adds assets
+      # to an existing release for that tag (e.g. if macOS uploads first).
+      # ------------------------------------------------------------------
+      - name: Publish version release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Scholion ${{ github.ref_name }}" \
+            --generate-notes \
+            Scholion-Windows.zip \
+          || gh release upload "${{ github.ref_name }}" Scholion-Windows.zip --clobber

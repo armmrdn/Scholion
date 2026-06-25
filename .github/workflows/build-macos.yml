@@ -3,10 +3,13 @@ name: Build macOS
 on:
   push:
     branches: [main, develop]
+    tags:     ['v*']
 
 jobs:
   build-macos:
     runs-on: macos-14   # Apple Silicon runner; produces universal arm64+x86_64 binary
+    permissions:
+      contents: write   # needed to create/update GitHub Releases
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -49,7 +52,6 @@ jobs:
       # ------------------------------------------------------------------
       # MuPDF 1.24.11 — built from source for both arm64 and x86_64, then
       # combined with lipo into universal static libraries.
-      # Cache key updated to reflect universal+deployment-target change.
       # ------------------------------------------------------------------
       - name: Cache MuPDF
         id: mupdf-cache
@@ -141,21 +143,38 @@ jobs:
             -ov -format UDZO \
             scholion/build/Scholion.dmg
 
-      - name: Upload DMG
-        continue-on-error: true
-        uses: actions/upload-artifact@v4
-        with:
-          name: Scholion-macOS-universal-${{ github.ref_name }}
-          path: scholion/build/Scholion.dmg
-          retention-days: 5
-
       # ------------------------------------------------------------------
-      # Publish to GitHub Releases on version tags (e.g. v0.6.0)
+      # Rolling "latest build" release on main/develop.
+      # Uses gh CLI (no Node.js) — release storage doesn't count against
+      # the Actions artifact quota. Delete+create is the reliable upsert.
       # ------------------------------------------------------------------
-      - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v1
-        with:
-          files: scholion/build/Scholion.dmg
+      - name: Publish rolling build release
+        if: "!startsWith(github.ref, 'refs/tags/')"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="build-macos-${{ github.ref_name }}"
+          gh release delete "$TAG" --yes 2>/dev/null || true
+          gh release create "$TAG" \
+            --target "${{ github.sha }}" \
+            --prerelease \
+            --title "macOS build (${{ github.ref_name }})" \
+            --notes "Automated build from \`${{ github.ref_name }}\` — commit \`${{ github.sha }}\`.
+
+          Open the DMG and drag Scholion.app to Applications. Requires macOS 12 Monterey or later." \
+            scholion/build/Scholion.dmg
+
+      # ------------------------------------------------------------------
+      # Versioned release on tags (e.g. v0.6.0) — creates or adds assets
+      # to an existing release for that tag (e.g. if Windows uploads first).
+      # ------------------------------------------------------------------
+      - name: Publish version release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --title "Scholion ${{ github.ref_name }}" \
+            --generate-notes \
+            scholion/build/Scholion.dmg \
+          || gh release upload "${{ github.ref_name }}" scholion/build/Scholion.dmg --clobber
