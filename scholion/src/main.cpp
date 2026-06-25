@@ -109,8 +109,9 @@ static QuitState g_quit_state = QuitState::None;
 // --- Panel width (shared between panel and resize handle) -------------------
 float g_panel_w = 360.0f;   // also exposed as extern in app_state.h
 static int  s_panel_nav_page    = 0;     // current page index in open panel (0-based)
-static int  s_last_panel_doc    = 0;     // last doc shown in panel — used by edge tabs to reopen
-static bool g_panel_open_to_refs = false; // true = next panel open should land on References tab
+static int   s_last_panel_doc    = 0;      // last doc shown in panel — used by edge tabs to reopen
+static bool  g_panel_open_to_refs = false; // true = next panel open should land on References tab
+static float s_toolbar_bottom     = 51.0f; // measured each frame by draw_toolbar_ui()
 static Page* g_nav_focus = nullptr; // focused page for arrow navigation (when panel closed)
 
 // --- Canvas text boxes -------------------------------------------------------
@@ -2429,12 +2430,42 @@ static void draw_references_tab() {
             ImVec4(doc.hue_r * 0.25f, doc.hue_g * 0.25f, doc.hue_b * 0.25f, 0.35f));
 
         std::string fname = fs::path(doc.path).filename().string();
-        if (ImGui::Selectable(fname.c_str(), doc.show_threads,
-                              ImGuiSelectableFlags_None, {avail_d, 0.0f}))
+        ImGui::Selectable(fname.c_str(), doc.show_threads,
+                          ImGuiSelectableFlags_AllowDoubleClick, {avail_d, 0.0f});
+        if (ImGui::IsItemClicked() && !ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left))
             doc.show_threads = !doc.show_threads;
-        ImGui::SetItemTooltip(doc.show_threads
-            ? "Click to hide connection threads"
-            : "Click to show connection threads");
+        if (ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+            if (offline) {
+                const char* pats[] = {"*.pdf", "*.PDF"};
+#ifdef __APPLE__
+                const char* picked = scholion_open_file("Locate the missing PDF", pats, 2, 0);
+#else
+                before_file_dialog();
+                const char* picked = tinyfd_openFileDialog(
+                    "Locate the missing PDF", doc.path.c_str(), 2, pats, "PDF Documents", 0);
+                after_file_dialog();
+#endif
+                if (picked) {
+                    relink_document(di, picked);
+                    ImGui::PopStyleColor(3);
+                    ImGui::PopID();
+                    break;  // doc reference is now invalid
+                }
+            } else {
+                reveal_in_file_manager(doc.path);
+            }
+        }
+        {
+            const char* tt_line2 = offline
+                ? "Double-click to relink this document"
+                : "Double-click to reveal in Finder";
+            const char* tt_line1 = doc.show_threads
+                ? "Click to hide connection threads"
+                : "Click to show connection threads";
+            char tt[128];
+            snprintf(tt, sizeof(tt), "%s\n%s", tt_line1, tt_line2);
+            ImGui::SetItemTooltip("%s", tt);
+        }
 
         ImGui::PopStyleColor(3);
 
@@ -2501,52 +2532,51 @@ static void draw_panel_ui() {
     if (ImGui::IsWindowAppearing()) s_panel_nav_page = std::max(0, scroll_to_peek);
     else if (scroll_to_peek >= 0)  s_panel_nav_page = scroll_to_peek;
 
-    // Header: colored filename + close button
+    // Tab bar — "Viewer" / "References" — blue-themed, pinned at the top of the panel.
+    // On first appearance, honour g_panel_open_to_refs to select the right tab.
     namespace fs = std::filesystem;
-    std::string fname = fs::path(doc.path).filename().string();
-    ImGui::PushStyleColor(ImGuiCol_Text, {doc.hue_r, doc.hue_g, doc.hue_b, 1.0f});
-    ImGui::TextUnformatted(fname.c_str());
-    ImGui::PopStyleColor();
-
-    if (ImGui::SmallButton("Close Sidebar Viewer  [Space]##panel")) {
-        g_input.close_panel();
-        ImGui::End();
-        return;
-    }
-    ImGui::SameLine();
-
-    // Page navigation  < p.N/Total >
-    {
-        int total = (int)doc.pages.size();
-        if (ImGui::SmallButton("<") && s_panel_nav_page > 0) {
-            s_panel_nav_page--;
-            g_input.open_panel(doc_idx, s_panel_nav_page);
-        }
-        ImGui::SetItemTooltip("Previous page");
-        ImGui::SameLine();
-        ImGui::Text("p.%d/%d", s_panel_nav_page + 1, total);
-        ImGui::SameLine();
-        if (ImGui::SmallButton(">") && s_panel_nav_page < total - 1) {
-            s_panel_nav_page++;
-            g_input.open_panel(doc_idx, s_panel_nav_page);
-        }
-        ImGui::SetItemTooltip("Next page");
-    }
-
-    // Tab bar: "Document" shows the PDF viewer; "References" lists all text highlights.
-    // On the frame the window first appears, honour g_panel_open_to_refs.
     bool just_appeared = ImGui::IsWindowAppearing();
-    ImGuiTabItemFlags doc_flags = (just_appeared && !g_panel_open_to_refs)
-                                  ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags ref_flags = (just_appeared &&  g_panel_open_to_refs)
-                                  ? ImGuiTabItemFlags_SetSelected : 0;
-    if (just_appeared) g_panel_open_to_refs = false;  // consume the one-shot request
+    ImGuiTabItemFlags viewer_flags = (just_appeared && !g_panel_open_to_refs)
+                                     ? ImGuiTabItemFlags_SetSelected : 0;
+    ImGuiTabItemFlags ref_flags    = (just_appeared &&  g_panel_open_to_refs)
+                                     ? ImGuiTabItemFlags_SetSelected : 0;
+    if (just_appeared) g_panel_open_to_refs = false;
 
+    ImGui::PushStyleColor(ImGuiCol_Tab,                 ImVec4(0.14f, 0.33f, 0.65f, 0.85f));
+    ImGui::PushStyleColor(ImGuiCol_TabHovered,          ImVec4(0.20f, 0.42f, 0.78f, 0.96f));
+    ImGui::PushStyleColor(ImGuiCol_TabSelected,         ImVec4(0.27f, 0.51f, 0.88f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_TabSelectedOverline, ImVec4(0.50f, 0.75f, 1.00f, 1.00f));
+    ImGui::PushStyleColor(ImGuiCol_TabDimmed,           ImVec4(0.10f, 0.24f, 0.50f, 0.70f));
+    ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected,   ImVec4(0.18f, 0.40f, 0.72f, 0.90f));
     ImGui::BeginTabBar("##panel_tabs");
+    ImGui::PopStyleColor(6);
 
-    if (ImGui::BeginTabItem("Document", nullptr, doc_flags)) {
+    if (ImGui::BeginTabItem("Viewer", nullptr, viewer_flags)) {
+        // Document name below tab bar
+        std::string fname = fs::path(doc.path).filename().string();
+        ImGui::PushStyleColor(ImGuiCol_Text, {doc.hue_r, doc.hue_g, doc.hue_b, 1.0f});
+        ImGui::TextUnformatted(fname.c_str());
+        ImGui::PopStyleColor();
+
+        // Page navigation  < p.N/Total >
+        {
+            int total = (int)doc.pages.size();
+            if (ImGui::SmallButton("<") && s_panel_nav_page > 0) {
+                s_panel_nav_page--;
+                g_input.open_panel(doc_idx, s_panel_nav_page);
+            }
+            ImGui::SetItemTooltip("Previous page");
+            ImGui::SameLine();
+            ImGui::Text("p.%d/%d", s_panel_nav_page + 1, total);
+            ImGui::SameLine();
+            if (ImGui::SmallButton(">") && s_panel_nav_page < total - 1) {
+                s_panel_nav_page++;
+                g_input.open_panel(doc_idx, s_panel_nav_page);
+            }
+            ImGui::SetItemTooltip("Next page");
+        }
+
     // Child window fills the remaining panel height and is the only scrollable region.
-    // The toolbar above stays pinned regardless of scroll position.
     ImGui::BeginChild("##panel_scroll", {0.0f, 0.0f}, false, ImGuiWindowFlags_None);
     ImGui::Spacing();
 
@@ -2741,11 +2771,10 @@ static void draw_panel_ui() {
 
     ImGui::EndChild();
     ImGui::EndTabItem();
-    } // Document tab
+    } // Viewer tab
 
     if (ImGui::BeginTabItem("References", nullptr, ref_flags)) {
         ImGui::BeginChild("##panel_ref_scroll", {0.0f, 0.0f}, false, ImGuiWindowFlags_None);
-        ImGui::Spacing();
         draw_references_tab();
         ImGui::EndChild();
         ImGui::EndTabItem();
@@ -2846,15 +2875,35 @@ static void draw_panel_resize_handle() {
 // rendered stacked top-to-bottom so the label reads downward without rotation.
 // They disappear once the sidebar is open.
 
-static void draw_vert_label(ImDrawList* dl, const char* text,
-                             float cx, float y_start, ImU32 col)
+// Render text rotated 90° CCW, centered on 'center', using glyph quads so
+// the result is crisp at any size.  Reading direction: bottom → top.
+static void draw_text_ccw(ImDrawList* dl, ImVec2 center, const char* text, ImU32 col)
 {
-    float lh = ImGui::GetTextLineHeight();
-    for (const char* c = text; *c; ++c) {
-        char buf[2] = {*c, '\0'};
-        float w = ImGui::CalcTextSize(buf).x;
-        dl->AddText({cx - w * 0.5f, y_start}, col, buf);
-        y_start += lh + 1.0f;
+    ImFont*  font  = ImGui::GetFont();
+    float    scale = ImGui::GetFontSize() / font->FontSize;
+    ImVec2   tsz   = ImGui::CalcTextSize(text);
+    float    cx    = tsz.x * 0.5f;   // half text-width  → vertical offset
+    float    cy    = tsz.y * 0.5f;   // half text-height → horizontal offset
+
+    float cur_x = 0.0f;
+    for (const char* s = text; *s; ++s) {
+        const ImFontGlyph* g = font->FindGlyph((ImWchar)(unsigned char)*s);
+        if (!g) continue;
+        if (g->Visible) {
+            float x0 = cur_x + g->X0 * scale,  y0 = g->Y0 * scale;
+            float x1 = cur_x + g->X1 * scale,  y1 = g->Y1 * scale;
+            // 90° CCW in screen-space: (lx,ly) → (+ly - cy, cx - lx) + center
+            ImVec2 p1 = { center.x + y0 - cy, center.y + cx - x0 };
+            ImVec2 p2 = { center.x + y0 - cy, center.y + cx - x1 };
+            ImVec2 p3 = { center.x + y1 - cy, center.y + cx - x1 };
+            ImVec2 p4 = { center.x + y1 - cy, center.y + cx - x0 };
+            dl->AddImageQuad(ImGui::GetIO().Fonts->TexID,
+                p1, p2, p3, p4,
+                { g->U0, g->V0 }, { g->U1, g->V0 },
+                { g->U1, g->V1 }, { g->U0, g->V1 },
+                col);
+        }
+        cur_x += g->AdvanceX * scale;
     }
 }
 
@@ -2862,16 +2911,18 @@ static void draw_panel_edge_tabs() {
     if (g_input.panel_open()) return;
     if (g_documents.empty()) return;
 
-    ImVec2 vp = ImGui::GetMainViewport()->Size;
-    constexpr float STRIP_W  = 18.0f;
-    constexpr float PAD_V    = 8.0f;   // vertical padding inside each tab
-    constexpr float TAB_GAP  = 6.0f;
-
-    float lh         = ImGui::GetTextLineHeight() + 1.0f;
-    float viewer_h   = static_cast<float>(strlen("Viewer"))     * lh + PAD_V * 2.0f;
-    float refs_h     = static_cast<float>(strlen("References")) * lh + PAD_V * 2.0f;
-    float total_h    = viewer_h + TAB_GAP + refs_h;
-    float origin_y   = (vp.y - total_h) * 0.38f;
+    ImVec2 vp      = ImGui::GetMainViewport()->Size;
+    float  lh      = ImGui::GetTextLineHeight();
+    // When rotated 90°, text width becomes the tab height and text height
+    // becomes the tab width.  Add padding in both axes.
+    const float PAD_H   = 10.0f;   // left/right padding → adds to STRIP_W
+    const float PAD_V   = 16.0f;   // top/bottom padding → adds to tab height
+    const float TAB_GAP =  6.0f;
+    float STRIP_W  = lh + PAD_H * 2.0f;
+    float viewer_h = ImGui::CalcTextSize("Viewer").x     + PAD_V * 2.0f;
+    float refs_h   = ImGui::CalcTextSize("References").x + PAD_V * 2.0f;
+    float total_h  = viewer_h + TAB_GAP + refs_h;
+    float origin_y = s_toolbar_bottom + 4.0f;
 
     ImGui::SetNextWindowPos({vp.x - STRIP_W, origin_y}, ImGuiCond_Always);
     ImGui::SetNextWindowSize({STRIP_W, total_h}, ImGuiCond_Always);
@@ -2909,8 +2960,8 @@ static void draw_panel_edge_tabs() {
                :          IM_COL32(35,  85, 165, 190);
     dl->AddRectFilled({wp.x, wp.y}, {wp.x + STRIP_W, wp.y + viewer_h},
                       v_bg, 5.0f, ImDrawFlags_RoundCornersLeft);
-    draw_vert_label(dl, "Viewer", wp.x + STRIP_W * 0.5f,
-                    wp.y + PAD_V, IM_COL32(210, 225, 255, 245));
+    draw_text_ccw(dl, {wp.x + STRIP_W * 0.5f, wp.y + viewer_h * 0.5f},
+                  "Viewer", IM_COL32(210, 225, 255, 245));
 
     // Gap between tabs
     ImGui::Dummy({STRIP_W, TAB_GAP});
@@ -2931,8 +2982,8 @@ static void draw_panel_edge_tabs() {
                :          IM_COL32(35,  85, 165, 190);
     dl->AddRectFilled({wp.x, refs_y}, {wp.x + STRIP_W, refs_y + refs_h},
                       r_bg, 5.0f, ImDrawFlags_RoundCornersLeft);
-    draw_vert_label(dl, "References", wp.x + STRIP_W * 0.5f,
-                    refs_y + PAD_V, IM_COL32(210, 225, 255, 245));
+    draw_text_ccw(dl, {wp.x + STRIP_W * 0.5f, refs_y + refs_h * 0.5f},
+                  "References", IM_COL32(210, 225, 255, 245));
 
     ImGui::End();
 }
@@ -3283,6 +3334,7 @@ static void draw_toolbar_ui() {
     }
     draw_url_modal();
 
+    s_toolbar_bottom = ImGui::GetWindowPos().y + ImGui::GetWindowSize().y;
     ImGui::End();
 }
 

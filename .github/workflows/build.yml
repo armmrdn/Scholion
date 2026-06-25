@@ -12,8 +12,6 @@ jobs:
   # ============================================================
   build-windows:
     runs-on: windows-2022
-    permissions:
-      contents: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -97,31 +95,19 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path Scholion-Windows\* -DestinationPath Scholion-Windows.zip
 
-      # On version tags: create a draft release (first job wins) or upload
-      # to the draft the other job already created.
-      - name: Attach to draft release
+      - name: Store artifact for release job
         if: startsWith(github.ref, 'refs/tags/v')
-        shell: bash
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --draft \
-            --title "Scholion ${{ github.ref_name }}" \
-            --generate-notes \
-            Scholion-Windows.zip \
-          || gh release upload "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            Scholion-Windows.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-zip
+          path: Scholion-Windows.zip
+          retention-days: 1
 
   # ============================================================
   # macOS — build universal Scholion.app + DMG
   # ============================================================
   build-macos:
     runs-on: macos-14
-    permissions:
-      contents: write
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -228,35 +214,45 @@ jobs:
             -ov -format UDZO \
             scholion/build/Scholion.dmg
 
-      - name: Attach to draft release
+      - name: Store artifact for release job
         if: startsWith(github.ref, 'refs/tags/v')
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release create "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            --draft \
-            --title "Scholion ${{ github.ref_name }}" \
-            --generate-notes \
-            scholion/build/Scholion.dmg \
-          || gh release upload "${{ github.ref_name }}" \
-            --repo "${{ github.repository }}" \
-            scholion/build/Scholion.dmg
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: scholion/build/Scholion.dmg
+          retention-days: 1
 
   # ============================================================
-  # Publish — waits for both builds, then makes the draft public
+  # Release — runs after both builds, creates a single release
+  # with both platform artifacts attached before publishing.
   # ============================================================
-  publish:
+  release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: [build-windows, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
     steps:
-      - name: Publish release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-zip
+
+      - name: Download macOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: macos-dmg
+
+      - name: Create release
         run: |
-          gh release edit "${{ github.ref_name }}" \
+          gh release create "${{ github.ref_name }}" \
             --repo "${{ github.repository }}" \
-            --draft=false
+            --prerelease \
+            --title "Scholion ${{ github.ref_name }}" \
+            --generate-notes \
+            Scholion-Windows.zip \
+            Scholion.dmg
