@@ -1,0 +1,262 @@
+name: Build
+
+on:
+  push:
+    branches: [main, develop]
+    tags:     ['v*']
+
+jobs:
+
+  # ============================================================
+  # Windows — build Scholion.exe + MinGW DLL bundle
+  # ============================================================
+  build-windows:
+    runs-on: windows-2022
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          path-type: minimal
+          install: >-
+            mingw-w64-x86_64-toolchain
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-glfw
+            mingw-w64-x86_64-curl
+            mingw-w64-x86_64-pkg-config
+            make
+
+      - name: Cache MuPDF
+        id: mupdf-cache
+        uses: actions/cache@v4
+        with:
+          path: mupdf-libs-windows
+          key: mupdf-1.24.11-windows-mingw64-v1
+
+      - name: Build MuPDF from source
+        if: steps.mupdf-cache.outputs.cache-hit != 'true'
+        shell: msys2 {0}
+        run: |
+          curl -L -o mupdf-source.tar.gz \
+            https://mupdf.com/downloads/archive/mupdf-1.24.11-source.tar.gz
+          tar xzf mupdf-source.tar.gz || true
+          [ -f mupdf-1.24.11-source/Makefile ] || { echo "Extraction failed"; exit 1; }
+          cd mupdf-1.24.11-source
+          make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs -j4 \
+               XCFLAGS="-Wno-incompatible-pointer-types"
+          mkdir -p ../mupdf-libs-windows
+          cp build/release/libmupdf.a build/release/libmupdf-third.a \
+             ../mupdf-libs-windows/
+
+      - name: Install MuPDF libs
+        shell: msys2 {0}
+        run: |
+          cp mupdf-libs-windows/libmupdf.a mupdf-libs-windows/libmupdf-third.a \
+             scholion-win/third_party/mupdf/lib/
+
+      - name: Configure
+        shell: msys2 {0}
+        run: |
+          SCHOLION_DEV_FLAG=""
+          if [ "${{ github.ref_name }}" = "develop" ]; then
+            SCHOLION_DEV_FLAG="-DSCHOLION_DEV=ON"
+          fi
+          cmake -S scholion-win -B scholion-win/build \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSCHOLION_WITH_MUPDF=ON \
+            $SCHOLION_DEV_FLAG
+
+      - name: Build
+        shell: msys2 {0}
+        run: cmake --build scholion-win/build
+
+      - name: Bundle
+        shell: msys2 {0}
+        run: |
+          mkdir -p Scholion-Windows
+          cp scholion-win/build/Scholion.exe Scholion-Windows/
+          ldd scholion-win/build/Scholion.exe \
+            | grep '/mingw64' \
+            | awk '{print $3}' \
+            | xargs -I{} cp {} Scholion-Windows/
+          echo "--- Bundle contents ---"
+          ls -lh Scholion-Windows/
+
+      - name: Zip bundle
+        shell: pwsh
+        run: Compress-Archive -Path Scholion-Windows\* -DestinationPath Scholion-Windows.zip
+
+      # On version tags: create a draft release (first job wins) or upload
+      # to the draft the other job already created.
+      - name: Attach to draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft \
+            --title "Scholion ${{ github.ref_name }}" \
+            --generate-notes \
+            Scholion-Windows.zip \
+          || gh release upload "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            Scholion-Windows.zip
+
+  # ============================================================
+  # macOS — build universal Scholion.app + DMG
+  # ============================================================
+  build-macos:
+    runs-on: macos-14
+    permissions:
+      contents: write
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache GLFW
+        id: glfw-cache
+        uses: actions/cache@v4
+        with:
+          path: glfw-install
+          key: glfw-3.4-macos-universal-12.0-v1
+
+      - name: Build GLFW from source
+        if: steps.glfw-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o glfw.tar.gz \
+            https://github.com/glfw/glfw/archive/refs/tags/3.4.tar.gz
+          tar xzf glfw.tar.gz
+          cmake -S glfw-3.4 -B glfw-3.4/build \
+            -DGLFW_BUILD_DOCS=OFF \
+            -DGLFW_BUILD_TESTS=OFF \
+            -DGLFW_BUILD_EXAMPLES=OFF \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/glfw-install
+          cmake --build glfw-3.4/build -j$(sysctl -n hw.ncpu)
+          cmake --install glfw-3.4/build
+
+      - name: Cache MuPDF
+        id: mupdf-cache
+        uses: actions/cache@v4
+        with:
+          path: mupdf-libs-macos
+          key: mupdf-1.24.11-macos-universal-12.0-v1
+
+      - name: Build MuPDF from source
+        if: steps.mupdf-cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L -o mupdf-source.tar.gz \
+            https://mupdf.com/downloads/archive/mupdf-1.24.11-source.tar.gz
+          tar xzf mupdf-source.tar.gz
+          cd mupdf-1.24.11-source
+          make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs \
+               -j$(sysctl -n hw.ncpu) \
+               XCFLAGS="-arch arm64 -mmacosx-version-min=12.0"
+          mkdir -p ../mupdf-arm64
+          cp build/release/libmupdf.a build/release/libmupdf-third.a \
+             ../mupdf-arm64/
+          rm -rf build
+          make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs \
+               -j$(sysctl -n hw.ncpu) \
+               XCFLAGS="-arch x86_64 -mmacosx-version-min=12.0"
+          mkdir -p ../mupdf-x86_64
+          cp build/release/libmupdf.a build/release/libmupdf-third.a \
+             ../mupdf-x86_64/
+          mkdir -p ../mupdf-libs-macos
+          lipo -create ../mupdf-arm64/libmupdf.a ../mupdf-x86_64/libmupdf.a \
+               -output ../mupdf-libs-macos/libmupdf.a
+          lipo -create ../mupdf-arm64/libmupdf-third.a ../mupdf-x86_64/libmupdf-third.a \
+               -output ../mupdf-libs-macos/libmupdf-third.a
+
+      - name: Install MuPDF libs
+        run: |
+          mkdir -p scholion/third_party/mupdf/lib
+          cp mupdf-libs-macos/libmupdf.a mupdf-libs-macos/libmupdf-third.a \
+             scholion/third_party/mupdf/lib/
+
+      - name: Configure
+        run: |
+          SCHOLION_DEV_FLAG=""
+          if [ "${{ github.ref_name }}" = "develop" ]; then
+            SCHOLION_DEV_FLAG="-DSCHOLION_DEV=ON"
+          fi
+          cmake -S scholion -B scholion/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSCHOLION_WITH_MUPDF=ON \
+            $SCHOLION_DEV_FLAG \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=12.0 \
+            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_PREFIX_PATH=$GITHUB_WORKSPACE/glfw-install
+
+      - name: Build
+        run: cmake --build scholion/build -j$(sysctl -n hw.ncpu)
+
+      - name: Verify universal binary
+        run: |
+          lipo -info scholion/build/Scholion.app/Contents/MacOS/Scholion
+          echo "Deployment target:"
+          otool -l scholion/build/Scholion.app/Contents/MacOS/Scholion \
+            | grep -A3 'LC_BUILD_VERSION' | head -12
+
+      - name: Create DMG
+        run: |
+          mkdir -p scholion/build/dmg_stage
+          cp -r scholion/build/Scholion.app scholion/build/dmg_stage/
+          ln -s /Applications scholion/build/dmg_stage/Applications
+          hdiutil create \
+            -volname "Scholion" \
+            -srcfolder scholion/build/dmg_stage \
+            -ov -format UDZO \
+            scholion/build/Scholion.dmg
+
+      - name: Attach to draft release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft \
+            --title "Scholion ${{ github.ref_name }}" \
+            --generate-notes \
+            scholion/build/Scholion.dmg \
+          || gh release upload "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            scholion/build/Scholion.dmg
+
+  # ============================================================
+  # Publish — waits for both builds, then makes the draft public
+  # ============================================================
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-windows, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release edit "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --draft=false
