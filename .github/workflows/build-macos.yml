@@ -145,24 +145,15 @@ jobs:
 
       # ------------------------------------------------------------------
       # Rolling "latest build" release on main/develop.
-      # Uses gh CLI (no Node.js) — release storage doesn't count against
-      # the Actions artifact quota. Delete+create is the reliable upsert.
+      # The tag and release are pre-created once manually; CI only replaces
+      # the asset. Tag creation is not attempted (blocked by repo ruleset).
       # ------------------------------------------------------------------
       - name: Publish rolling build release
         if: "!startsWith(github.ref, 'refs/tags/')"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="build-macos-${{ github.ref_name }}"
-          gh release delete "$TAG" --yes --cleanup-tag 2>/dev/null || true
-          gh release create "$TAG" \
-            --target "${{ github.sha }}" \
-            --prerelease \
-            --title "macOS build (${{ github.ref_name }})" \
-            --notes "Automated build from \`${{ github.ref_name }}\` — commit \`${{ github.sha }}\`.
-
-          Open the DMG and drag Scholion.app to Applications. Requires macOS 12 Monterey or later." \
-            scholion/build/Scholion.dmg
+          gh release upload Win-exe scholion/build/Scholion.dmg --clobber
 
       # ------------------------------------------------------------------
       # Versioned release on tags (e.g. v0.6.0) — creates or adds assets
