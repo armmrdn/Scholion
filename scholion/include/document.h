@@ -91,6 +91,7 @@ struct Page {
     Vec2  world_pos  = {0.0f, 0.0f};
     float world_w    = 0.0f;        // derived from PDF media box (points → world units)
     float world_h    = 0.0f;
+    int   rotation   = 0;           // clockwise degrees: 0, 90, 180, 270
 
     PageAnnotations annots;          // persistent highlights and pen strokes
 
@@ -145,6 +146,9 @@ struct Document {
     // is kept as a placeholder (pages + annotations preserved, no textures) so its
     // reference and annotations survive a re-save and indices stay aligned.
     bool missing = false;
+
+    // Thread visibility: toggled from the Open Documents list in the References tab.
+    bool show_threads = false;
 };
 
 inline constexpr float PAGE_FAN_OFFSET = 20.0f;  // world-unit diagonal offset per page in a fan

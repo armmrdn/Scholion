@@ -195,7 +195,29 @@ void InputHandler::on_key(GLFWwindow* /*window*/, int key, int /*scancode*/, int
     }
 }
 
-void InputHandler::update(GLFWwindow* /*window*/) {}
+void InputHandler::update(GLFWwindow* window) {
+    // Poll physical button state to recover from missed RELEASE events.
+    // ImGui occasionally consumes a mouse button release before GLFW delivers
+    // it here, leaving drag or pan state permanently latched. Polling once per
+    // frame gives us a guaranteed exit path: if no button is held, no drag or
+    // pan should be active.
+    bool lmb = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_LEFT)   == GLFW_PRESS;
+    bool mmb = glfwGetMouseButton(window, GLFW_MOUSE_BUTTON_MIDDLE) == GLFW_PRESS;
+
+    if (!lmb) {
+        if (m_drag_active || m_drag_pending_page || m_multi_drag_active || m_box_selecting) {
+            m_dragged_page      = nullptr;
+            m_drag_active       = false;
+            m_drag_pending_page = nullptr;
+            m_drag_pending_doc  = nullptr;
+            m_multi_drag_active = false;
+            m_drag_origins.clear();
+            m_box_selecting     = false;
+        }
+        if (m_panning && !mmb && !m_space_held)
+            m_panning = false;
+    }
+}
 
 InputHandler::HitResult InputHandler::hit_test(Vec2 screen_pos) const {
     if (!m_documents) return {nullptr, nullptr};

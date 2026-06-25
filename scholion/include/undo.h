@@ -10,7 +10,7 @@
 struct UndoRecord {
     enum class Type {
         PenStroke, Highlight, Note,
-        PageMove, PageResize,
+        PageMove, PageResize, PageRotate,
         TextBoxCreate, TextBoxMove, TextBoxDelete,
         TextBoxEdit, TextBoxStyle,
         ErasedStroke, ErasedHighlight,
@@ -25,6 +25,9 @@ struct UndoRecord {
 
     struct PagePos { Page* page; Vec2 old_pos; float old_w = 0.0f; float old_h = 0.0f; };
     std::vector<PagePos> page_moves;
+
+    struct PageRot { Page* page; int old_rot; float old_w; float old_h; };
+    std::vector<PageRot> page_rots;
 
     int           box_id      = -1;
     Vec2          old_box_pos = {};

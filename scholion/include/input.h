@@ -22,9 +22,16 @@ public:
     // Called when the window loses focus so key-up events that were missed (e.g.
     // space released while cmd-tabbing away) don't leave m_space_held stuck true.
     void clear_held_keys() {
-        m_space_held    = false;
-        m_space_dragged = false;
-        m_panning       = false;
+        m_space_held        = false;
+        m_space_dragged     = false;
+        m_panning           = false;
+        m_dragged_page      = nullptr;
+        m_drag_active       = false;
+        m_drag_pending_page = nullptr;
+        m_drag_pending_doc  = nullptr;
+        m_multi_drag_active = false;
+        m_drag_origins.clear();
+        m_box_selecting     = false;
     }
 
     bool is_panning()       const { return m_panning; }

@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 
 #include "canvas.h"
 #include "document.h"
@@ -37,6 +38,12 @@ struct DrawHints {
     // Display content scale from glfwGetWindowContentScale, used to convert
     // TILE_PX to world-space tile width for tile quad positioning.
     float content_scale = 1.0f;
+
+    // Transient search hit highlights — set when user clicks a search result.
+    // Cleared when the search panel closes or the query changes.
+    int                                          search_hit_doc   = -1;
+    int                                          search_hit_page  = -1;
+    const std::vector<std::array<float,4>>*      search_hit_rects = nullptr;
 };
 
 /// Handles all OpenGL drawing using a GL 3.3 core profile pipeline.
@@ -78,7 +85,8 @@ private:
     void draw_pdf_tile_quad(const Canvas& canvas, float wx, float wy, float ww, float wh,
                             uint32_t tex);
     void draw_threads(const Canvas& canvas, const Document& doc);
-    void draw_page_annotations(const Canvas& canvas, const Page& page);
+    void draw_page_annotations(const Canvas& canvas, const Page& page,
+                               const DrawHints& hints, int doc_idx);
 
     void set_projection(float vw, float vh);
 

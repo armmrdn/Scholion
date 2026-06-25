@@ -316,6 +316,38 @@ std::vector<PdfLoader::SearchHit> PdfLoader::search_text(const std::string& quer
         std::string tl = text;
         for (char& c : tl) c = (char)std::tolower((unsigned char)c);
 
+        if (tl.find(ql) == std::string::npos) continue;
+
+        // Get MuPDF hit quads for every occurrence on this page and normalize to [0,1].
+        std::vector<std::array<float,4>> page_rects;
+        fz_page* pg = nullptr;
+        fz_try(m_ctx) { pg = fz_load_page(m_ctx, m_doc, pi); } fz_catch(m_ctx) {}
+        if (pg) {
+            fz_rect bounds = fz_bound_page(m_ctx, pg);
+            float pw = bounds.x1 - bounds.x0;
+            float ph = bounds.y1 - bounds.y0;
+            if (pw > 0.0f && ph > 0.0f) {
+                static constexpr int MAX_QUADS = 256;
+                fz_quad quads[MAX_QUADS];
+                int     marks[MAX_QUADS];
+                int nq = 0;
+                fz_try(m_ctx) {
+                    nq = fz_search_page(m_ctx, pg, query.c_str(), marks, quads, MAX_QUADS);
+                } fz_catch(m_ctx) { nq = 0; }
+                page_rects.reserve(nq);
+                for (int h = 0; h < nq; ++h) {
+                    fz_rect r = fz_rect_from_quad(quads[h]);
+                    page_rects.push_back({
+                        (r.x0 - bounds.x0) / pw,
+                        (r.y0 - bounds.y0) / ph,
+                        (r.x1 - bounds.x0) / pw,
+                        (r.y1 - bounds.y0) / ph
+                    });
+                }
+            }
+            fz_drop_page(m_ctx, pg);
+        }
+
         size_t pos = 0;
         while (pos < tl.size() && (int)hits.size() < max_hits) {
             size_t found = tl.find(ql, pos);
@@ -331,7 +363,7 @@ std::vector<PdfLoader::SearchHit> PdfLoader::search_text(const std::string& quer
             if (beg > 0)           excerpt = "..." + excerpt;
             if (end < text.size()) excerpt += "...";
 
-            hits.push_back({pi, std::move(excerpt)});
+            hits.push_back({pi, std::move(excerpt), page_rects});
             pos = found + ql.size();
         }
     }

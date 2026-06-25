@@ -2,6 +2,7 @@
 
 #include "document.h"
 #include "texture_cache.h"
+#include <array>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -72,6 +73,8 @@ public:
     struct SearchHit {
         int         page_index;
         std::string excerpt;    // ~100-char context around the first match on the page
+        // All match bounding boxes on this page, normalized to [0,1].
+        std::vector<std::array<float,4>> hit_rects;  // {x0,y0,x1,y1} per quad
     };
     std::vector<SearchHit> search_text(const std::string& query, int max_hits = 200);
 

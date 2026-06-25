@@ -39,9 +39,9 @@ static std::atomic<bool>       g_rast_stop{false};
 static std::thread             g_rast_thread;
 
 // Backpressure cap: worker pauses once this many completed tiles are queued.
-// 256 px tiles are small (256 KB each), so allowing 2 ready at once lets the
-// main thread upload a small batch per frame without causing noticeable stall.
-static constexpr int RAST_READY_MAX = 2;
+// 16 tiles * 256 KB = 4 MB max in the ready queue; uploading that per frame
+// is negligible on modern GL drivers and cuts fill time by ~8x vs the old cap of 2.
+static constexpr int RAST_READY_MAX = 16;
 
 static constexpr size_t VRAM_BUDGET = 350ULL * 1024 * 1024;
 static constexpr size_t TILE_BUDGET = 200ULL * 1024 * 1024;
@@ -118,6 +118,10 @@ static void enqueue_tile_rast(const std::string& doc_path,
 static void enqueue_visible_high_tiles(const Document& doc,
                                         const std::shared_ptr<PdfLoader>& loader,
                                         const Page& page, Vec2 vp_center) {
+    // Tile col/row indices are in original PDF pixel space; they don't map
+    // correctly to a rotated quad, so fall back to Low/Thumb for rotated pages.
+    if (page.rotation != 0) return;
+
     float px_per_wu = dpi_for_lod(LodTier::High) * g_content_scale / 72.0f;
     float tile_wu   = static_cast<float>(TILE_PX) / px_per_wu;
     int   n_cols    = static_cast<int>(std::ceil(page.world_w / tile_wu));

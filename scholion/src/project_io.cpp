@@ -252,9 +252,9 @@ static std::string build_project_json() {
         for (int pi = 0; pi < (int)doc.pages.size(); ++pi) {
             const Page& page = doc.pages[pi];
             snprintf(b, sizeof(b),
-                     "        { \"index\": %d, \"x\": %.4f, \"y\": %.4f, \"w\": %.2f, \"h\": %.2f }%s\n",
+                     "        { \"index\": %d, \"x\": %.4f, \"y\": %.4f, \"w\": %.2f, \"h\": %.2f, \"rot\": %d }%s\n",
                      page.page_index, page.world_pos.x, page.world_pos.y,
-                     page.world_w, page.world_h,
+                     page.world_w, page.world_h, page.rotation,
                      pi + 1 < (int)doc.pages.size() ? "," : "");
             out += b;
         }
@@ -446,7 +446,7 @@ void load_project_from_path(const std::string& path) {
     FILE* f = fopen(path.c_str(), "r");
     if (!f) { fprintf(stderr, "load_project: cannot open %s\n", path.c_str()); return; }
 
-    struct SavedPage { int idx; float x, y; float w = 0.0f, h = 0.0f; };
+    struct SavedPage { int idx; float x, y; float w = 0.0f, h = 0.0f; int rot = 0; };
     struct SavedDoc  { std::string path; float sox, soy; std::vector<SavedPage> pages; };
 
     struct SavedHL     { int doc, page; AnnotHighlight hl; };
@@ -561,10 +561,10 @@ void load_project_from_path(const std::string& path) {
                 break;
             case T_INDEX:
                 if (sec == Section::Docs && cur >= 0) {
-                    float pw = 0.0f, ph = 0.0f;
-                    int np = sscanf(at, "\"index\": %d, \"x\": %f, \"y\": %f, \"w\": %f, \"h\": %f",
-                                    &n, &a, &b, &pw, &ph);
-                    if (np >= 3) saved[cur].pages.push_back({n, a, b, pw, ph});
+                    float pw = 0.0f, ph = 0.0f; int prot = 0;
+                    int np = sscanf(at, "\"index\": %d, \"x\": %f, \"y\": %f, \"w\": %f, \"h\": %f, \"rot\": %d",
+                                    &n, &a, &b, &pw, &ph, &prot);
+                    if (np >= 3) saved[cur].pages.push_back({n, a, b, pw, ph, prot});
                 }
                 break;
             case T_ID:
@@ -685,6 +685,7 @@ void load_project_from_path(const std::string& path) {
                 p.world_pos  = {sp.x, sp.y};
                 p.world_w    = sp.w > 0.0f ? sp.w : PLACEHOLDER_PAGE_W;
                 p.world_h    = sp.h > 0.0f ? sp.h : PLACEHOLDER_PAGE_H;
+                p.rotation   = sp.rot;
                 d.pages.push_back(p);
             }
             doc_map[si] = (int)g_documents.size();
@@ -702,7 +703,15 @@ void load_project_from_path(const std::string& path) {
         doc.stack_origin = {sd.sox, sd.soy};
         for (const auto& sp : sd.pages) {
             for (auto& pg : doc.pages) {
-                if (pg.page_index == sp.idx) { pg.world_pos = {sp.x, sp.y}; break; }
+                if (pg.page_index == sp.idx) {
+                    pg.world_pos = {sp.x, sp.y};
+                    if (sp.rot != 0) {
+                        pg.rotation = sp.rot;
+                        pg.world_w  = sp.w;
+                        pg.world_h  = sp.h;
+                    }
+                    break;
+                }
             }
         }
     }

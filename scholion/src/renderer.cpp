@@ -188,6 +188,9 @@ void Renderer::draw(const Canvas& canvas, const std::vector<Document>& docs,
     } else {
         draw_pdf_pages(canvas, docs, hints);
         if (hints.selected_doc) draw_threads(canvas, *hints.selected_doc);
+        for (const auto& doc : docs)
+            if (&doc != hints.selected_doc && doc.show_threads)
+                draw_threads(canvas, doc);
 
         // Rubber-band box selection overlay
         if (hints.box_selecting) {
@@ -382,15 +385,29 @@ void Renderer::draw_pdf_page_quad(const Canvas& canvas, const Page& page,
     Vec2 br = canvas.world_to_screen({page.world_pos.x + page.world_w,
                                       page.world_pos.y + page.world_h});
 
-    // MuPDF row 0 = top of page. glTexImage2D stores data[0] at v=0 (GL bottom).
-    // So v=0 in GL texture == page top. Map screen-top to v=0, screen-bottom to v=1.
+    // UV layout rotated so content appears at the requested clockwise angle.
+    // Positions are always the AABB corners; only UV coordinates change.
+    // Derivation: for CW rotation R, screen_norm → uv maps as:
+    //   0°:   uv=(nx,ny)    90°:  uv=(ny,1-nx)
+    //   180°: uv=(1-nx,1-ny) 270°: uv=(1-ny,nx)
+    float u00, v00,  u10, v10,  u11, v11,  u01, v01; // TL TR BR BL
+    switch (page.rotation) {
+        case 90:
+            u00=0,v00=1; u10=0,v10=0; u11=1,v11=0; u01=1,v01=1; break;
+        case 180:
+            u00=1,v00=1; u10=0,v10=1; u11=0,v11=0; u01=1,v01=0; break;
+        case 270:
+            u00=1,v00=0; u10=1,v10=1; u11=0,v11=1; u01=0,v01=0; break;
+        default:
+            u00=0,v00=0; u10=1,v10=0; u11=1,v11=1; u01=0,v01=1; break;
+    }
     float verts[] = {
-        tl.x, tl.y,  0.0f, 0.0f,   // TL
-        br.x, tl.y,  1.0f, 0.0f,   // TR
-        br.x, br.y,  1.0f, 1.0f,   // BR — triangle 1
-        tl.x, tl.y,  0.0f, 0.0f,   // TL
-        br.x, br.y,  1.0f, 1.0f,   // BR
-        tl.x, br.y,  0.0f, 1.0f,   // BL — triangle 2
+        tl.x, tl.y,  u00, v00,   // TL
+        br.x, tl.y,  u10, v10,   // TR
+        br.x, br.y,  u11, v11,   // BR — triangle 1
+        tl.x, tl.y,  u00, v00,   // TL
+        br.x, br.y,  u11, v11,   // BR
+        tl.x, br.y,  u01, v01,   // BL — triangle 2
     };
 
     glUseProgram(m_tex_prog);
@@ -482,7 +499,8 @@ void Renderer::draw_pdf_pages(const Canvas& canvas, const std::vector<Document>&
 
             static constexpr float STRIPE_H = 10.0f;
 
-            if (lod == LodTier::High && hints.tile_cache && hints.content_scale > 0.0f) {
+            if (lod == LodTier::High && hints.tile_cache && hints.content_scale > 0.0f
+                && page.rotation == 0) {
                 // Tile-based High rendering: Low/Thumb fallback underneath, tiles on top.
                 // This lets the page appear immediately at moderate quality while high-res
                 // tiles stream in one-by-one from the background rasterizer.
@@ -550,8 +568,11 @@ void Renderer::draw_pdf_pages(const Canvas& canvas, const std::vector<Document>&
             }
 
             // Annotations (highlights + pen strokes) drawn over the page texture
-            if (!page.annots.empty())
-                draw_page_annotations(canvas, page);
+            bool has_search_hit = (hints.search_hit_rects &&
+                                   di == hints.search_hit_doc &&
+                                   page.page_index == hints.search_hit_page);
+            if (!page.annots.empty() || has_search_hit)
+                draw_page_annotations(canvas, page, hints, di);
 
             // Selection outline — thin dotted grey border, offset outside the page,
             // marking items in the selection (also covers a whole document).
@@ -704,17 +725,36 @@ void Renderer::draw_threads(const Canvas& canvas, const Document& doc) {
     }
 }
 
-void Renderer::draw_page_annotations(const Canvas& canvas, const Page& page) {
+void Renderer::draw_page_annotations(const Canvas& canvas, const Page& page,
+                                      const DrawHints& hints, int doc_idx) {
     // color program + m_vao + m_vbo are already active (called from draw_pdf_pages).
+
+    // Map normalized annotation coords (ax, ay) to world space respecting rotation.
+    // For CW rotation R, the inverse mapping from page-UV to screen-norm is:
+    //   0°:   (ax,ay)         90°:  ((1-ay)*W, ax*H)
+    //   180°: ((1-ax)*W,(1-ay)*H)   270°: (ay*W,(1-ax)*H)
+    // where W=world_w, H=world_h (already swapped for 90/270).
+    auto to_world = [&](float ax, float ay) -> Vec2 {
+        switch (page.rotation) {
+            case 90:  return {page.world_pos.x + (1.0f - ay) * page.world_w,
+                              page.world_pos.y + ax * page.world_h};
+            case 180: return {page.world_pos.x + (1.0f - ax) * page.world_w,
+                              page.world_pos.y + (1.0f - ay) * page.world_h};
+            case 270: return {page.world_pos.x + ay * page.world_w,
+                              page.world_pos.y + (1.0f - ax) * page.world_h};
+            default:  return {page.world_pos.x + ax * page.world_w,
+                              page.world_pos.y + ay * page.world_h};
+        }
+    };
 
     // Highlights: semi-transparent yellow rects
     for (const auto& hl : page.annots.highlights) {
-        draw_rect(canvas,
-            page.world_pos.x + hl.x0 * page.world_w,
-            page.world_pos.y + hl.y0 * page.world_h,
-            (hl.x1 - hl.x0) * page.world_w,
-            (hl.y1 - hl.y0) * page.world_h,
-            1.0f, 0.88f, 0.0f, 0.32f);
+        Vec2 p0 = to_world(hl.x0, hl.y0);
+        Vec2 p1 = to_world(hl.x1, hl.y1);
+        float left = std::min(p0.x, p1.x), top = std::min(p0.y, p1.y);
+        draw_rect(canvas, left, top,
+                  std::abs(p1.x - p0.x), std::abs(p1.y - p0.y),
+                  1.0f, 0.88f, 0.0f, 0.32f);
     }
 
     // Pen strokes: thin red triangle strip per stroke
@@ -732,15 +772,9 @@ void Renderer::draw_page_annotations(const Canvas& canvas, const Page& page) {
             int prev = std::max(0, i - 1);
             int next = std::min(n - 1, i + 1);
 
-            Vec2 sp = canvas.world_to_screen({
-                page.world_pos.x + stroke.pts[prev].x * page.world_w,
-                page.world_pos.y + stroke.pts[prev].y * page.world_h});
-            Vec2 sn = canvas.world_to_screen({
-                page.world_pos.x + stroke.pts[next].x * page.world_w,
-                page.world_pos.y + stroke.pts[next].y * page.world_h});
-            Vec2 sc = canvas.world_to_screen({
-                page.world_pos.x + stroke.pts[i].x * page.world_w,
-                page.world_pos.y + stroke.pts[i].y * page.world_h});
+            Vec2 sp = canvas.world_to_screen(to_world(stroke.pts[prev].x, stroke.pts[prev].y));
+            Vec2 sn = canvas.world_to_screen(to_world(stroke.pts[next].x, stroke.pts[next].y));
+            Vec2 sc = canvas.world_to_screen(to_world(stroke.pts[i].x,    stroke.pts[i].y));
 
             float dx = sn.x - sp.x, dy = sn.y - sp.y;
             float l = std::sqrt(dx*dx + dy*dy);
@@ -757,6 +791,20 @@ void Renderer::draw_page_annotations(const Canvas& canvas, const Page& page) {
                      static_cast<GLsizeiptr>(strip.size() * sizeof(float)),
                      strip.data(), GL_STREAM_DRAW);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, static_cast<GLsizei>(strip.size() / 2));
+    }
+
+    // Transient search match highlights — orange rects over matched text.
+    if (hints.search_hit_rects &&
+        doc_idx == hints.search_hit_doc &&
+        page.page_index == hints.search_hit_page) {
+        for (const auto& r : *hints.search_hit_rects) {
+            Vec2 p0 = to_world(r[0], r[1]);
+            Vec2 p1 = to_world(r[2], r[3]);
+            float left = std::min(p0.x, p1.x), top = std::min(p0.y, p1.y);
+            draw_rect(canvas, left, top,
+                      std::abs(p1.x - p0.x), std::abs(p1.y - p0.y),
+                      1.0f, 0.50f, 0.0f, 0.50f);
+        }
     }
 }
 
