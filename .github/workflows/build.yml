@@ -173,6 +173,7 @@ jobs:
             -DGLFW_BUILD_DOCS=OFF \
             -DGLFW_BUILD_TESTS=OFF \
             -DGLFW_BUILD_EXAMPLES=OFF \
+            -DGLFW_BUILD_WAYLAND=OFF \
             -DBUILD_SHARED_LIBS=OFF \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_INSTALL_PREFIX=$GITHUB_WORKSPACE/glfw-install
@@ -234,6 +235,13 @@ jobs:
 
       - name: Zip bundle
         run: zip -r Scholion-Linux.zip Scholion-Linux/
+
+      - name: Upload artifact for testing
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scholion-Linux
+          path: Scholion-Linux.zip
+          retention-days: 7
 
       - name: Upload Linux zip to draft release
         if: startsWith(github.ref, 'refs/tags/v')
