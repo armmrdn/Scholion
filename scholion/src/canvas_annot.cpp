@@ -55,10 +55,16 @@ Page* hit_test_page(float sx, float sy, int* out_doc_idx) {
 
 Vec2 screen_to_page_norm(const Page& page, float sx, float sy) {
     Vec2 w = g_canvas.screen_to_world({sx, sy});
-    return {
-        std::clamp((w.x - page.world_pos.x) / page.world_w, 0.0f, 1.0f),
-        std::clamp((w.y - page.world_pos.y) / page.world_h, 0.0f, 1.0f)
-    };
+    float nx = std::clamp((w.x - page.world_pos.x) / page.world_w, 0.0f, 1.0f);
+    float ny = std::clamp((w.y - page.world_pos.y) / page.world_h, 0.0f, 1.0f);
+    // Invert the rotation applied by renderer's to_world() so stored annotation
+    // coords are always in PDF-native normalized space, not screen-fraction space.
+    switch (page.rotation) {
+        case 90:  return {ny,        1.0f - nx};
+        case 180: return {1.0f - nx, 1.0f - ny};
+        case 270: return {1.0f - ny, nx       };
+        default:  return {nx,        ny       };
+    }
 }
 
 // --- Annotation finalization -------------------------------------------------

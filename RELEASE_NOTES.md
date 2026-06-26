@@ -1,5 +1,19 @@
-### First Release of Scholion PDF viewer.
-Updates from previous pre-release: 
+## Scholion v1.1
+
+### //Linux
+-Scholion is now available as a native Linux build (x86_64).
+-Distributed as Scholion-Linux.zip; requires libcurl4 and libGL at runtime.
+-File open/save dialogs use the system file manager (zenity/kdialog).
+-Reveal in File Manager opens the containing folder via xdg-open.
+
+### //Bug Fixes
+-Fixed pen strokes, highlights, and eraser becoming misaligned on rotated pages. Annotations now stick exactly where placed regardless of page rotation and can be erased from the correct position.
+-Fixed the highlighter failing to collect text glyphs on rotated pages, restoring the ability for highlighted text to appear in the References sidebar tab.
+-Fixed a delay on quit when many pages were queued for background rasterization; the app now exits immediately after the final save.
+
+---
+
+## Scholion v1.0
 
 ### //Canvas Viewer Behavior
 -All tools (Text box, pen, highlight, flags, search, rotate) all work in the canvas space.

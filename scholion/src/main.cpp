@@ -4207,6 +4207,7 @@ int main(int argc, char* argv[]) {
     if (g_dl_thread.joinable()) g_dl_thread.join();
     if (g_search_thread.joinable()) g_search_thread.join();
 
+    rast_cancel_all();   // drain queue so rast_shutdown() join returns immediately
     rast_shutdown();
 
     if (g_vignette_tex) { glDeleteTextures(1, &g_vignette_tex); g_vignette_tex = 0; }
