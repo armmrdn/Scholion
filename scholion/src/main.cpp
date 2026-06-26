@@ -38,6 +38,12 @@ extern "C" const char* scholion_select_folder(const char* title);
 #include <dwmapi.h>     // DwmSetWindowAttribute — dark title bar
 #define GLFW_INCLUDE_NONE
 #include <glad/glad.h>
+#else
+// Linux: GLAD provides OpenGL function pointers (same as Windows).
+// GLFW_INCLUDE_NONE prevents GLFW from pulling in its own GL headers.
+#define GLFW_INCLUDE_NONE
+#include <glad/glad.h>
+#include <unistd.h>   // fork / execl / _exit
 #endif
 
 #include <GLFW/glfw3.h>
@@ -1595,7 +1601,15 @@ static void reveal_in_file_manager(const std::string& path) {
     std::wstring args = L"/select,\"" + wpath + L"\"";
     ShellExecuteW(nullptr, L"open", L"explorer.exe", args.c_str(), nullptr, SW_SHOW);
 #else
-    (void)path;  // Linux: xdg-open stub — implement when porting to Linux
+    {
+        // Open the file's parent directory in the system file manager via xdg-open.
+        std::string parent = std::filesystem::path(path).parent_path().string();
+        pid_t pid = fork();
+        if (pid == 0) {
+            execl("/usr/bin/xdg-open", "xdg-open", parent.c_str(), (char*)nullptr);
+            _exit(127);
+        }
+    }
 #endif
 }
 
@@ -3655,8 +3669,8 @@ int main(int argc, char* argv[]) {
     scholion_prewarm_dialogs();  // pre-init NSOpenPanel before first user action
 #endif
 
-#ifdef _WIN32
-    // Load all OpenGL 3.3 core function pointers via GLAD.
+#ifndef __APPLE__
+    // Load all OpenGL 3.3 core function pointers via GLAD (Windows and Linux).
     // Must happen after a GL context is made current; before any GL calls.
     if (!gladLoadGLLoader((GLADloadproc)glfwGetProcAddress)) {
         fprintf(stderr, "Failed to initialise GLAD OpenGL loader\n");

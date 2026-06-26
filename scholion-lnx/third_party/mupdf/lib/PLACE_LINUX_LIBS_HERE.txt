@@ -1,0 +1,17 @@
+Place MuPDF Linux static libraries here:
+
+  libmupdf.a
+  libmupdf-third.a
+
+Build from source (MuPDF 1.24.11):
+
+  curl -L -o mupdf-source.tar.gz \
+    https://mupdf.com/downloads/archive/mupdf-1.24.11-source.tar.gz
+  tar xzf mupdf-source.tar.gz
+  cd mupdf-1.24.11-source
+  make HAVE_X11=no HAVE_GLUT=no HAVE_CURL=no build=release libs -j$(nproc)
+  cp build/release/libmupdf.a build/release/libmupdf-third.a \
+     /path/to/Scholion/scholion-lnx/third_party/mupdf/lib/
+
+In CI these are built automatically by the Linux job in build.yml
+and cached between runs.
