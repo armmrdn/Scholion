@@ -1,5 +1,6 @@
 #include "app_settings.h"
 #include "app_state.h"
+#include "version.h"
 #include "canvas.h"
 #include "canvas_annot.h"
 #include "canvas_text_box.h"
@@ -865,18 +866,35 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
                 bool was_pen = (g_annot_tool == AnnotTool::Pen);
                 g_annot_tool = was_pen ? AnnotTool::None : AnnotTool::Pen;
                 g_ann_drawing = false;
+                if (!was_pen) { g_text_tool = false; g_editing_box = -1; }
                 return;
             }
             if (key == GLFW_KEY_H) {
                 bool was_hl = (g_annot_tool == AnnotTool::Highlight);
                 g_annot_tool = was_hl ? AnnotTool::None : AnnotTool::Highlight;
                 g_ann_drawing = false;
+                if (!was_hl) { g_text_tool = false; g_editing_box = -1; }
                 return;
             }
             if (key == GLFW_KEY_F && !super && !ctrl) {
                 bool was_note = (g_annot_tool == AnnotTool::Note);
                 g_annot_tool = was_note ? AnnotTool::None : AnnotTool::Note;
                 g_ann_drawing = false;
+                if (!was_note) { g_text_tool = false; g_editing_box = -1; }
+                return;
+            }
+            if (key == GLFW_KEY_E) {
+                bool was_eraser = (g_annot_tool == AnnotTool::Eraser);
+                g_annot_tool = was_eraser ? AnnotTool::None : AnnotTool::Eraser;
+                g_ann_drawing = false;
+                if (!was_eraser) { g_text_tool = false; g_editing_box = -1; }
+                return;
+            }
+            if (key == GLFW_KEY_T) {
+                bool was_text = g_text_tool;
+                g_text_tool   = !g_text_tool;
+                g_editing_box = -1;
+                if (!was_text) { g_annot_tool = AnnotTool::None; g_ann_drawing = false; }
                 return;
             }
             // ESC: deactivate active tool even when panel has keyboard focus.
@@ -968,14 +986,7 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
 
     if (action != GLFW_PRESS) return;
 
-    // Tool shortcuts (no modifier) — T for text tool only; P/H/F handled above
     bool cmd = super || ctrl;
-    if (!cmd) {
-        if (key == GLFW_KEY_T) {
-            g_text_tool = !g_text_tool;
-            g_editing_box = -1;
-        }
-    }
 
     // Text-box entity copy/paste. Only reachable when no ImGui text field has
     // focus (guarded above), so copy/paste inside an open box goes to the text
@@ -1177,7 +1188,6 @@ static void draw_canvas_text_boxes() {
     // boxes through the overlay anyway.
     if (g_settings_open) return;
     if (g_search_open) return;
-    if (ImGui::IsPopupOpen("", ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel)) return;
 
     ImDrawList* dl    = ImGui::GetForegroundDrawList();
     ImFont*     font  = ImGui::GetFont();
@@ -1846,6 +1856,18 @@ static void draw_startup_chooser() {
     if (ImGui::BeginPopupModal("##startup", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoTitleBar)) {
+        const float btn_w = 260.0f;
+        ImGui::SetWindowFontScale(1.5f);
+        const char* app_title = "Scholion " SCHOLION_VERSION;
+        float title_w = ImGui::CalcTextSize(app_title).x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (btn_w - title_w) * 0.5f));
+        ImGui::TextUnformatted(app_title);
+        ImGui::SetWindowFontScale(1.0f);
+        ImGui::Spacing();
+        {
+            float sub_w = ImGui::CalcTextSize("Open a project or add PDFs to begin").x;
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (btn_w - sub_w) * 0.5f));
+        }
         ImGui::TextUnformatted("Open a project or add PDFs to begin");
         ImGui::Spacing();
         const ImVec2 bsz = {260.0f, 0.0f};
@@ -2019,6 +2041,15 @@ static void draw_settings_popup() {
     center_line("handwritten into the margin of a manuscript");
     center_line("by its previous scholars and readers");
 
+    ImGui::Spacing();
+    {
+        const char* ver = "v" SCHOLION_VERSION;
+        float ver_w = ImGui::CalcTextSize(ver).x;
+        float avail  = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, avail - ver_w));
+        ImGui::TextDisabled("%s", ver);
+    }
+
     ImGui::PopStyleColor();
 
     ImGui::End();
@@ -2159,6 +2190,7 @@ struct RefEntry { int di, pi, hi; };  // indices into g_documents[di].pages[pi].
 
 static void draw_references_tab() {
     namespace fs = std::filesystem;
+    static int s_prev_editing_ref = -1;
 
     // Build a flat sorted list of all text highlights across all documents.
     // Sorted by document order then page order (stable presentation).
@@ -2300,21 +2332,40 @@ static void draw_references_tab() {
 
             if (note_slot >= 0 && s_editing_ref_note == gi) {
                 // ---- Editing: text box inset inside border, X top-right ----
-                // Height fits the current content — minimum one line.
-                float wrap_w_ht = avail - kXW - kSpc - kPad * 2.0f;
-                ImVec2 content_sz = ImGui::CalcTextSize(s_ref_note_buf, nullptr, false, wrap_w_ht);
+                float txt_w    = avail - kXW - kSpc - kPad * 2.0f;
+                ImVec2 content_sz = ImGui::CalcTextSize(s_ref_note_buf, nullptr, false, txt_w);
                 float kTextH = std::max(content_sz.y, ImGui::GetTextLineHeight())
                                + ImGui::GetStyle().FramePadding.y * 2.0f + 2.0f;
-                const float box_h  = kPad * 2.0f + kTextH;
+                const float box_h = kPad * 2.0f + kTextH;
 
                 // Inset cursor so text box sits inside the border with kPad margin
                 ImGui::SetCursorPos({cb.x + kPad, cb.y + kPad});
                 ImGui::PushStyleColor(ImGuiCol_FrameBg, {0.10f, 0.10f, 0.13f, 0.9f});
-                ImGui::SetNextItemWidth(avail - kXW - kSpc - kPad * 2.0f);
                 char edit_id[32]; snprintf(edit_id, sizeof(edit_id), "##rnedit%d", gi);
+                // Auto-focus input on the first frame it opens
+                if (s_editing_ref_note != s_prev_editing_ref)
+                    ImGui::SetKeyboardFocusHere();
                 ImGui::InputTextMultiline(edit_id, s_ref_note_buf, sizeof(s_ref_note_buf),
-                                          {0.0f, kTextH});
+                                          {txt_w, kTextH});
                 ImGui::PopStyleColor();
+
+                // Save and close on click outside the note box
+                if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    ImVec2 mp = ImGui::GetMousePos();
+                    bool in_box = mp.x >= tl.x && mp.x < tl.x + avail
+                               && mp.y >= tl.y && mp.y < tl.y + box_h;
+                    if (!in_box) {
+                        for (int ni = 0; ni < (int)g_ref_notes.size(); ++ni) {
+                            if (g_ref_notes[ni].after_idx == gi) {
+                                g_ref_notes[ni].text = s_ref_note_buf;
+                                if (g_ref_notes[ni].text.empty())
+                                    g_ref_notes.erase(g_ref_notes.begin() + ni);
+                                break;
+                            }
+                        }
+                        s_editing_ref_note = -1;
+                    }
+                }
 
                 // Border drawn after text box (outline only, doesn't obscure content)
                 ImGui::GetWindowDrawList()->AddRect(
@@ -2342,7 +2393,8 @@ static void draw_references_tab() {
                 // InvisibleButton covers the whole box — becomes the re-edit hit target
                 char bg_id[32]; snprintf(bg_id, sizeof(bg_id), "##rna_bg%d", gi);
                 ImGui::InvisibleButton(bg_id, {avail, box_h});
-                bool bg_clicked = ImGui::IsItemClicked();
+                bool bg_clicked = ImGui::IsItemHovered()
+                               && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 
                 // Border
                 ImGui::GetWindowDrawList()->AddRect(
@@ -2383,7 +2435,8 @@ static void draw_references_tab() {
 
                 char bg_id[32]; snprintf(bg_id, sizeof(bg_id), "##rna_bg%d", gi);
                 ImGui::InvisibleButton(bg_id, {avail, box_h});
-                bool activated = ImGui::IsItemClicked();
+                bool activated = ImGui::IsItemHovered()
+                              && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
 
                 // Subtle hover fill
                 if (ImGui::IsItemHovered())
@@ -2416,6 +2469,7 @@ static void draw_references_tab() {
         ImGui::PopStyleColor();
         ImGui::Spacing();
     }
+    s_prev_editing_ref = s_editing_ref_note;
 
     // ---- Open Documents --------------------------------------------------------
     if (g_documents.empty()) return;
@@ -3233,14 +3287,20 @@ static void draw_toolbar_ui() {
     ImGui::Begin("##toolbar", nullptr, kFlags);
     ImGui::PopStyleVar(3);
 
-    if (ImGui::Button("+")) ImGui::OpenPopup("add_popup");
+    if (ImGui::Button("+")) {
+        g_text_tool = false; g_editing_box = -1;
+        g_annot_tool = AnnotTool::None; g_ann_drawing = false;
+        ImGui::OpenPopup("add_popup");
+    }
     ImGui::SetItemTooltip("Add PDFs from folder, file, or URL");
     ImGui::SameLine();
     bool text_was_active = g_text_tool;
     if (text_was_active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.50f, 0.85f, 1.0f));
     if (ImGui::Button("T")) {
+        bool was_text  = g_text_tool;
         g_text_tool    = !g_text_tool;
         g_editing_box  = -1;
+        if (!was_text) { g_annot_tool = AnnotTool::None; g_ann_drawing = false; }
     }
     if (text_was_active) ImGui::PopStyleColor();
     ImGui::SetItemTooltip("Insert a floating text box (T)");
@@ -3255,54 +3315,79 @@ static void draw_toolbar_ui() {
         bool eraser_was = (g_annot_tool == AnnotTool::Eraser);
 
         if (pen_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.08f, 0.08f, 1.0f));
-        if (ImGui::Button("Pen")) { g_annot_tool = pen_was ? AnnotTool::None : AnnotTool::Pen; g_ann_drawing = false; }
+        if (ImGui::Button("Pen")) {
+            g_annot_tool = pen_was ? AnnotTool::None : AnnotTool::Pen;
+            g_ann_drawing = false;
+            if (!pen_was) { g_text_tool = false; g_editing_box = -1; }
+        }
         if (pen_was) ImGui::PopStyleColor();
         ImGui::SetItemTooltip("Freehand pen: draw on any page (P)");
-
-        if (pen_was) {
-            ImGui::SameLine();
-            float pcol[3] = {g_pen_r, g_pen_g, g_pen_b};
-            if (ImGui::ColorEdit3("##pencolor", pcol, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
-                { g_pen_r = pcol[0]; g_pen_g = pcol[1]; g_pen_b = pcol[2]; }
-            ImGui::SetItemTooltip("Change the pen color");
-        }
         ImGui::SameLine();
 
         if (hl_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.60f, 0.55f, 0.0f, 1.0f));
-        if (ImGui::Button("HL")) { g_annot_tool = hl_was ? AnnotTool::None : AnnotTool::Highlight; g_ann_drawing = false; }
+        if (ImGui::Button("HL")) {
+            g_annot_tool = hl_was ? AnnotTool::None : AnnotTool::Highlight;
+            g_ann_drawing = false;
+            if (!hl_was) { g_text_tool = false; g_editing_box = -1; }
+        }
         if (hl_was) ImGui::PopStyleColor();
         ImGui::SetItemTooltip("Highlight text: drag to select (H)");
         ImGui::SameLine();
 
         if (note_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.15f, 0.40f, 0.70f, 1.0f));
-        if (ImGui::Button("Flag")) { g_annot_tool = note_was ? AnnotTool::None : AnnotTool::Note; g_ann_drawing = false; }
+        if (ImGui::Button("Flag")) {
+            g_annot_tool = note_was ? AnnotTool::None : AnnotTool::Note;
+            g_ann_drawing = false;
+            if (!note_was) { g_text_tool = false; g_editing_box = -1; }
+        }
         if (note_was) ImGui::PopStyleColor();
         ImGui::SetItemTooltip("Place a note marker on any page (F)");
         ImGui::SameLine();
 
         if (eraser_was) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.30f, 0.30f, 0.30f, 1.0f));
-        if (ImGui::Button("Erase")) { g_annot_tool = eraser_was ? AnnotTool::None : AnnotTool::Eraser; g_ann_drawing = false; }
+        if (ImGui::Button("Erase")) {
+            g_annot_tool = eraser_was ? AnnotTool::None : AnnotTool::Eraser;
+            g_ann_drawing = false;
+            if (!eraser_was) { g_text_tool = false; g_editing_box = -1; }
+        }
         if (eraser_was) ImGui::PopStyleColor();
         ImGui::SetItemTooltip("Erase annotations by dragging over them");
     }
 
-    if (g_text_tool || g_selected_box >= 0) {
-        ImGui::SameLine();
-        float tcol[3] = {g_tbox_r, g_tbox_g, g_tbox_b};
-        if (ImGui::ColorEdit3("##tboxcolor", tcol, ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) {
-            g_tbox_r = tcol[0]; g_tbox_g = tcol[1]; g_tbox_b = tcol[2];
-            // Apply to the selected box only (covers the editing box too).
-            for (auto& b : g_text_boxes)
-                if (b.id == g_selected_box) { b.r = tcol[0]; b.g = tcol[1]; b.b = tcol[2]; break; }
+    // Tool-property strip — separator then context-sensitive controls, shown to the
+    // right of all tool buttons when a tool with configurable properties is active.
+    {
+        bool show_pen_props  = (g_annot_tool == AnnotTool::Pen);
+        bool show_text_props = (g_text_tool || g_selected_box >= 0);
+        if (show_pen_props || show_text_props) {
+            ImGui::SameLine(0.0f, 10.0f);
+            ImGui::TextDisabled("|");
+            ImGui::SameLine(0.0f, 10.0f);
         }
-        ImGui::SetItemTooltip("Change the text box color");
-        ImGui::SameLine();
-        ImGui::SetNextItemWidth(52.0f);
-        if (ImGui::DragFloat("##tboxsz", &g_tbox_font_size, 0.5f, 10.0f, 48.0f, "%.0fpt")) {
-            for (auto& b : g_text_boxes)
-                if (b.id == g_selected_box) { b.font_size = g_tbox_font_size; break; }
+        if (show_pen_props) {
+            float pcol[3] = {g_pen_r, g_pen_g, g_pen_b};
+            if (ImGui::ColorEdit3("##pencolor", pcol,
+                    ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
+                { g_pen_r = pcol[0]; g_pen_g = pcol[1]; g_pen_b = pcol[2]; }
+            ImGui::SetItemTooltip("Pen color");
         }
-        ImGui::SetItemTooltip("Adjust font size");
+        if (show_text_props) {
+            float tcol[3] = {g_tbox_r, g_tbox_g, g_tbox_b};
+            if (ImGui::ColorEdit3("##tboxcolor", tcol,
+                    ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel)) {
+                g_tbox_r = tcol[0]; g_tbox_g = tcol[1]; g_tbox_b = tcol[2];
+                for (auto& b : g_text_boxes)
+                    if (b.id == g_selected_box) { b.r = tcol[0]; b.g = tcol[1]; b.b = tcol[2]; break; }
+            }
+            ImGui::SetItemTooltip("Text color");
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(52.0f);
+            if (ImGui::DragFloat("##tboxsz", &g_tbox_font_size, 0.5f, 10.0f, 48.0f, "%.0fpt")) {
+                for (auto& b : g_text_boxes)
+                    if (b.id == g_selected_box) { b.font_size = g_tbox_font_size; break; }
+            }
+            ImGui::SetItemTooltip("Font size");
+        }
     }
 
     static bool open_url_modal = false;
@@ -3649,7 +3734,7 @@ int main(int argc, char* argv[]) {
     glfwWindowHint(GLFW_OPENGL_PROFILE, GLFW_OPENGL_CORE_PROFILE);
     glfwWindowHint(GLFW_OPENGL_FORWARD_COMPAT, GLFW_TRUE);
 
-    g_window = glfwCreateWindow(1280, 800, "Scholion", nullptr, nullptr);
+    g_window = glfwCreateWindow(1280, 800, "Scholion " SCHOLION_VERSION, nullptr, nullptr);
     GLFWwindow* window = g_window;
     if (!window) {
         fprintf(stderr, "Failed to create GLFW window\n");
@@ -4004,10 +4089,12 @@ int main(int argc, char* argv[]) {
         try {
 
         // Escape: confirm+close editing → then deactivate text tool → then deactivate annot tool
-        if (!g_search_open && !ImGui::GetIO().WantCaptureKeyboard
-            && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
-            if (g_editing_box >= 0) {
-                g_editing_box = -1;          // confirm text, keep tool active
+        // ESC: tool deactivation always fires regardless of ImGui keyboard focus.
+        // Only the editing-box branch stays gated so ImGui's InputText ESC handling
+        // (revert buffer) can run first.
+        if (!g_search_open && ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            if (g_editing_box >= 0 && !ImGui::GetIO().WantCaptureKeyboard) {
+                g_editing_box = -1;
             } else if (g_text_tool) {
                 g_text_tool = false;
             } else if (g_annot_tool != AnnotTool::None) {

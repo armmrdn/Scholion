@@ -1,3 +1,25 @@
+## Scholion v1.2
+
+### //Tools
+- Tools are now mutually exclusive — activating any tool (pen, highlight, eraser, text) automatically deactivates the previous one. Switching via toolbar button or keyboard shortcut no longer leaves two tools active simultaneously.
+- ESC correctly exits all tool modes regardless of UI focus state. Priority: finish text edit → exit text tool → clear selection → cancel annotation tool.
+- E key activates the eraser tool (was unimplemented).
+- T key is now properly suppressed while typing in any text field.
+- Pen tool color picker added to the toolbar property strip (right of tool buttons).
+- Text color and font size controls moved to the same unified property strip, with a visual separator between tool buttons and their properties.
+
+### //Bug Fixes
+- Canvas text boxes no longer disappear while the color picker popup is open.
+- Reference panel notes now activate on a single click (previously required two clicks to focus the window first).
+- Reference panel notes auto-focus the text cursor immediately on open.
+- Clicking outside a reference note box saves and closes the note without a separate confirmation step.
+- Reference note text wraps correctly to the panel width and no longer bleeds past the right edge.
+
+### //UI
+- Version number now appears in the window title bar, on the startup screen, and in the bottom corner of the Settings window.
+
+---
+
 ## Scholion v1.1
 
 ### //Linux

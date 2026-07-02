@@ -103,8 +103,6 @@ Modifier is Cmd on macOS / Ctrl elsewhere unless noted (Cmd+A is Super-only toda
 
 > Escape priority (top first): finish text edit → exit text tool → clear selection → close panel → cancel annotation tool.
 
-See **docs/TODO.md** for planned selection changes (box-select text boxes, mixed selection, modifier-click multi-select).
-
 ## Project File Model
 ```
 /user-chosen-folder/
@@ -136,9 +134,9 @@ Recent projects persisted to `~/.scholion_recents` (10 entries).
 16. ✅ Text-box overhaul — `CanvasTextBox` gains `w`/`h` (px; 0 = auto); press-drag-release creation sizes the box (drag fixes width, height grows to fit; bare click = default width); default color red `(0.82,0.06,0.06)` like the pen; two-stage ESC (confirm+close, then exit tool); single-click select shows the box's style in the picker and picker edits apply to the selected box only (then inherited by new boxes); Cmd+C/Cmd+V duplicate the selected box (text copy/paste inside the field handled by ImGui); undo extended with `TextBoxEdit` (per edit session) and `TextBoxStyle` (per selection session). `.scholion` text_boxes records gain `w`/`h` (back-compatible: older files omit them → auto-size).
 17. ✅ Save/load fixes — **text boxes were wiped on load** by the post-parse `g_text_boxes.clear()` (parse pushed directly into the live vector); now parsed into a temp and assigned after the reset. **Missing-PDF document-index shift** dropped/misattached annotations on load; load now builds a `doc_map` (saved index → actual index, skipping missing PDFs) and re-keys annotations through it. `.scholion` passed on the CLI (or via Finder) now opens as a project, not a PDF. Bare launch shows an in-app **startup chooser** (Open Project / Add PDF(s) / Add Folder / blank) instead of a single Open dialog. Right-click **Save Project** shows the `Cmd+S` shortcut and updates the existing file (Save-As only if none set). `save_to_path`/`load_project_from_path` print restored/written counts for diagnostics. **Missing-PDF placeholders:** a document whose PDF can't be found at load is kept as a placeholder `Document` (`Document::missing`) in its original slot — pages (saved positions, default Letter size) and annotations preserved, `g_loaders` slot `nullptr` (skipped by `stream_lod`), rendered as a distinct grey page; re-save writes the reference + annotations back so moved/renamed PDFs don't lose data. Only the path is stored, never PDF bytes.
 18. ✅ Code audit & hardening — viewport (zoom/pan) now restored on load (was parsed only inside the docs section, but written before it); macOS `argv` open guarded with `#ifndef __APPLE__` so a CLI/Finder file loads once (the Apple event already delivers it); removed unused `Renderer::m_proj` (`-Wall -Wextra` clean across all TUs); diagnostic load/save counts gated behind `SCHOLION_DEBUG` env; per-page `w`/`h` persisted (placeholders use real size, Letter fallback); `new_project()` clears the text-box clipboard; **relink** — right-click a missing-PDF page → "Relink PDF…" loads the real file into that slot, carrying over positions + annotations; **parser hardened** — `load_project_from_path` is now position/record-based (tolerant of compact/pretty/reordered layouts, CRLF, whitespace) instead of line-based.
-19. ✅ Selection/visual polish — double-click an existing text box now edits it (the just-opened edit window no longer self-closes via a stale `WantCaptureMouse` on its first frame; guarded by `g_prev_editing_box`); selection borders are now **thin dotted grey**, offset in screen-space (`draw_rect_dashed` in the renderer; `imgui_dashed_rect` for text boxes) so they're visible at any zoom and not bold; thread wires reduced to ~40% more transparent (core α `0.42→0.25`, glow `0.07→0.04`); the bottom-left overlay page counter now shows live **visible/total** pages. **Known gap (see docs/TODO.md):** rubber-band select still ignores text boxes, there's no unified pages+text-boxes selection, and no Cmd/Ctrl-click multi-select yet.
+19. ✅ Selection/visual polish — double-click an existing text box now edits it (the just-opened edit window no longer self-closes via a stale `WantCaptureMouse` on its first frame; guarded by `g_prev_editing_box`); selection borders are now **thin dotted grey**, offset in screen-space (`draw_rect_dashed` in the renderer; `imgui_dashed_rect` for text boxes) so they're visible at any zoom and not bold; thread wires reduced to ~40% more transparent (core α `0.42→0.25`, glow `0.07→0.04`); the bottom-left overlay page counter now shows live **visible/total** pages.
 20. ✅ Unified text-box selection + save feedback — **Cmd+click text boxes** now toggle them into the unified selection set (alongside page selection); single-click replaces the selection; delete/backspace removes all selected items (pages + text boxes); dotted borders shown on all selected boxes. **Save feedback:** manual save (Cmd+S, right-click) shows **"Saved!"** in top-right corner, fades over 1 second; autosave shows subtle **"saved"** text, fades over 0.5 seconds.
-21. ✅ Polish multi-box dragging — **rigid group movement:** replaced frame-delta tracking with grab-point-relative delta; store initial positions of all selected boxes at drag start, compute `delta = current_world - grab_point`, apply to all boxes each frame, maintaining relative offsets. Push TextBoxMove undo records for each moved box. **Still refining:** rubber-band select for text boxes, Cmd/Ctrl+click on pages, file explorer multi-select. See docs/TODO.md for detailed task list.
+21. ✅ Polish multi-box dragging — **rigid group movement:** replaced frame-delta tracking with grab-point-relative delta; store initial positions of all selected boxes at drag start, compute `delta = current_world - grab_point`, apply to all boxes each frame, maintaining relative offsets. Push TextBoxMove undo records for each moved box.
 22. ✅ Cmd/Ctrl+click individual pages — **modifier-click multi-select for pages:** `Cmd+click` (macOS) / `Ctrl+click` (other) toggles an individual page in/out of the selection without clearing other selected items. Complements existing `Shift+click` (whole-document toggle). Consistent with Cmd+click for text boxes (M20). After Cmd+clicking, drag is immediately ready if selection is non-empty. Cmd+click on empty canvas starts rubber-band without clearing selection.
 27. ✅ Panel interaction redesign + text-box occlusion fix — **single-click on a page now selects it** (adds to `m_selection`, shows threads + selection border) without opening the panel. **Double-click on a page opens the panel** scrolled to that page. **Space tap** (press+release with no drag) toggles the panel for the selected document (opens scrolled to first selected page; closes if already open). Canvas click still closes the panel (existing). **Text boxes no longer render on top of the panel**: `draw_canvas_text_boxes` wraps all `ForegroundDrawList` calls in a `PushClipRect`/`PopClipRect` pair that excludes the panel region; hit-testing also excludes the panel area so boxes behind it aren't clickable.
 28. ✅ Windows port — Phase 1 (cross-platform source + Windows build tree). **Bug fix:** space
@@ -152,15 +150,14 @@ Recent projects persisted to `~/.scholion_recents` (10 entries).
     `renderer.cpp` + `texture_cache.cpp` use `<glad/glad.h>` on non-Apple. **`../scholion-win/`
     build tree created:** CMakeLists.txt (references shared `../scholion/src/`), GLAD 3.3 Core
     source generated, AppIcon.ico converted (6 sizes), DPI-awareness manifest, Windows resource
-    file, `setup_windows.ps1` one-script environment bootstrap. Only remaining blocker on
-    Windows machine: MuPDF `.lib` files.
+    file, `setup_windows.ps1` one-script environment bootstrap. CI builds MuPDF from source
+    (cached). `Scholion-Windows.zip` ships with all MinGW DLLs bundled.
 
-## Restore Points
+## History
 
-The project is now on GitHub (`armmrdn/Scholion`, private). Use `git log` and `git checkout` for history. A source tarball is kept alongside the repo at `~/Desktop/Scholion/Scholion-source.tar.gz` (excludes `build/` and `.git`).
+The project is on GitHub (`armmrdn/Scholion`, private). Use `git log` and `git checkout` for history.
 
-Legacy pre-git tarballs (in `~/Dropbox/Scholion/` on the original machine):
-- `scholion-m1.tar.gz` through `scholion-m28-win-port-phase1.tar.gz` — milestones 1–28 before git was introduced. See old CLAUDE.md for individual descriptions.
+Full archive of every plan, decision, removal, and idea lives in `../DEVLOG.md` (local-only, never committed).
 
 ## LOD / VRAM Strategy
 Zoom level drives which raster tier is loaded by the background worker (see `include/document.h`):
@@ -201,8 +198,8 @@ Single workflow: `.github/workflows/build.yml`
 
 **Release sequence (sequential, no artifact storage):**
 1. `build-macos` runs, produces `Scholion.dmg`, creates a GitHub draft release tagged with the version, attaches the DMG, and embeds `RELEASE_NOTES.md` as the release body
-2. `build-windows` runs after macOS (`needs: build-macos`), produces `Scholion-Windows.zip`, and uploads it to the existing draft release via `gh release upload`
-3. `publish` runs after Windows (`needs: build-windows`), sets `draft=false` to make the release live
+2. `build-windows` and `build-linux` run in parallel after macOS (`needs: build-macos`), each producing a zip and uploading it to the draft release via `gh release upload`
+3. `publish` runs after both Windows and Linux (`needs: [build-windows, build-linux]`), sets `draft=false` to make the release live
 
 No `actions/upload-artifact` is used — artifacts go directly to the GitHub release draft, avoiding the storage quota entirely.
 

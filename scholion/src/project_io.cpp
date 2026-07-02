@@ -1,5 +1,6 @@
 #include "project_io.h"
 #include "app_state.h"
+#include "version.h"
 #include "canvas_annot.h"
 #include "save_feedback.h"
 
@@ -219,10 +220,10 @@ void apply_theme(bool dark) {
 void update_window_title() {
     if (!g_window) return;
     if (g_project_path.empty()) {
-        glfwSetWindowTitle(g_window, "Scholion");
+        glfwSetWindowTitle(g_window, "Scholion " SCHOLION_VERSION);
     } else {
         std::string name = std::filesystem::path(g_project_path).stem().string();
-        glfwSetWindowTitle(g_window, ("Scholion \xe2\x80\x94 " + name).c_str());
+        glfwSetWindowTitle(g_window, ("Scholion " SCHOLION_VERSION " \xe2\x80\x94 " + name).c_str());
     }
 }
 

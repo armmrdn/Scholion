@@ -10,7 +10,7 @@ resources, and Windows-only third-party libraries.
 **Platform strategy:**
 - `../scholion/`       — macOS build (canonical source, contains all shared `.cpp/.h`)
 - `../scholion-win/`   — Windows build (this directory)
-- `../scholion-linux/` — Linux build (future)
+- `../scholion-lnx/`   — Linux build
 
 All source-level bug fixes and features land in `../scholion/src/`. Platform
 conditionals (`#ifdef __APPLE__` / `#ifdef _WIN32` / `#else`) inside those files
@@ -107,12 +107,13 @@ The output is `build/Release/Scholion.exe` (MSVC) or `build/Scholion.exe` (MinGW
 When modifying the application:
 1. **Bug fixes / new features** → edit `../scholion/src/*.cpp` or `../scholion/include/*.h`.
    The Windows build picks them up automatically (it compiles from that path).
-2. **New source file** → add it to BOTH `../scholion/CMakeLists.txt` (macOS) AND
-   `scholion-win/CMakeLists.txt` (Windows).
+2. **New source file** → add it to `../scholion/CMakeLists.txt` (macOS),
+   `scholion-win/CMakeLists.txt` (Windows), AND `../scholion-lnx/CMakeLists.txt` (Linux).
 3. **Windows-specific code** → use `#ifdef _WIN32` in the shared source file, or
    add to `src/platform_win.cpp` if it's large enough to warrant separation.
 4. **macOS-specific code** → use `#ifdef __APPLE__`.
-5. **Future Linux code** → use `#else` (the fall-through after Apple/Windows guards).
+5. **Linux code** → use `#else` (the fall-through after Apple/Windows guards), or add
+   to `../scholion-lnx/src/platform_linux.cpp`.
 
 ---
 
@@ -121,11 +122,10 @@ When modifying the application:
 - [x] **AppIcon.ico** — generated from macOS ICNS (16/32/48/64/128/256 px, all in one file)
 - [x] **GLAD** — generated for OpenGL 3.3 Core; source in `third_party/glad/`
 - [x] **DPI awareness** — `Scholion.manifest` with `PerMonitorV2`; embedded via `scholion.rc`
-- [ ] **MuPDF Windows libs** — build or download `.lib` files (see `third_party/mupdf/lib/`)
+- [x] **MuPDF Windows libs** — built from source in CI; cached by `actions/cache`
+- [x] **Distribution** — `Scholion-Windows.zip` with `Scholion.exe` + all MinGW DLLs, produced by CI on every `v*` tag
 - [ ] **File association** — register `.scholion` in HKEY_CLASSES_ROOT via installer
-      (argv[1] path already handled; association just makes double-click work in Explorer)
-- [ ] **Distribution** — create NSIS or WiX installer, or a simple ZIP of
-      `Scholion.exe` + required DLLs (glfw3.dll, libcurl.dll, etc.)
+      (`argv[1]` path handling already works; association just makes double-click work in Explorer)
 
 ---
 
@@ -133,14 +133,15 @@ When modifying the application:
 
 The Windows build runs in CI via `.github/workflows/build.yml` using an MSYS2/MinGW64 environment on `windows-2022`. MuPDF is built from source during CI (cached by `actions/cache`). GLFW is installed via MSYS2 packages. The final artifact is `Scholion-Windows.zip` — `Scholion.exe` bundled with all required MinGW DLLs.
 
-The Windows build job runs after `build-macos` completes (`needs: build-macos`) so the draft release already exists when Windows uploads its zip.
+`build-windows` runs in parallel with `build-linux` after `build-macos` completes, so the draft release already exists when this job uploads its zip. The `publish` job waits for both Windows and Linux before making the release live.
 
-## Restore Points
+## History
 
-The project is on GitHub (`armmrdn/Scholion`, private). Legacy pre-git tarballs:
-- `scholion-win-phase1.tar.gz` — Phase 1 complete (2026-05-28): CMakeLists.txt, GLAD 3.3 Core, AppIcon.ico, DPI manifest, scholion.rc, setup_windows.ps1, platform_win.cpp stub.
+The project is on GitHub (`armmrdn/Scholion`, private). Use `git log` and `git checkout` for history.
 
-  ## Honesty rules (read every turn)
+Full archive of every plan, decision, removal, and idea lives in `../DEVLOG.md` (local-only, never committed).
+
+## Honesty rules (read every turn)
 
 Before claiming a function, class, or import exists, verify it by reading
 the file or running a grep. Never fabricate symbols.

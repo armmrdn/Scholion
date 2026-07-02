@@ -1,20 +1,36 @@
 # Scholion — TODO / Backlog
 
-Items are ordered by priority. Completed items kept for history.
+Items are ordered by priority.
 
 ---
 
-## Pending work
+## Pending
 
-### ⚠ Pre-release: Remove benchmarking code
-**Goal:** strip all profiling/logging code before distributing to end users.
+### Icon upscaling for high-DPI and large-format usage
+**Goal:** the current `AppIcon.icns` / `AppIcon.ico` / Linux `.png` master artwork needs
+a high-resolution source so the icon renders sharply in contexts that demand large sizes:
+macOS Launchpad (128×128 / 256×256 / 512×512 @2x), Windows taskbar and Start menu
+(256×256), and Linux application menus / dock launchers (128×128 or larger).
+
+**Work required:**
+- Produce or commission a vector or high-res raster master at 1024×1024 minimum
+- Regenerate `scholion/resources/AppIcon.icns` via `scripts/make_icon.py` with the new master
+- `make_icon.py` auto-exports `scholion-win/resources/AppIcon.ico` in the same run
+- Add a `512×512.png` and `256×256.png` export to `scholion-lnx/resources/` for `.desktop` file use on Linux
+- Update the Linux CI bundle step to include the icon alongside the binary
+
+**Status:** pending.
+
+---
+
+### Remove benchmarking / developer-mode code before open-source release
+**Goal:** strip all profiling/logging code that is inappropriate for public distribution.
 
 **What to remove from `scholion/src/main.cpp`:**
 - `get_process_ram_mb()` function
 - `g_bench_file`, `g_bench_start`, `g_bench_last_write` globals
 - `bench_open()` and `bench_write()` functions
-- `AppSettings::developer_mode` field
-- `save_prefs()` / `load_prefs()` lines for `developer_mode`
+- `AppSettings::developer_mode` field and its `save_prefs()` / `load_prefs()` lines
 - Developer Mode checkbox block in `draw_settings_popup()`
 - Main loop line: `if (g_settings.developer_mode) bench_open();`
 - `#include <psapi.h>` in the `_WIN32` block
@@ -23,186 +39,79 @@ Items are ordered by priority. Completed items kept for history.
 **What to remove from `scholion-win/CMakeLists.txt`:**
 - `psapi` entry in `target_link_libraries`
 
-**To restore benchmarking in future:** re-add the same functions. CSV format:
-`elapsed_s, fps, frame_ms, vram_used_mb, vram_budget_mb, rast_queue, ram_mb, pages_total, pages_visible`
-Written once/second to `scholion_perf_<timestamp>.csv` on the Desktop.
+**Note:** this code is currently gated behind the `SCHOLION_DEV` compile flag and is never
+enabled in release builds (CI only sets it on the `develop` branch). Safe to ship as-is;
+cleanup is required before the repo goes public.
 
-**Status:** benchmarking active — remove before release.
+**Status:** pending (safe for binary releases; required before open-sourcing).
 
 ---
 
-### Performance optimization — Make program more lightweight
-**Goal:** optimize Scholion to run smoothly on more limited hardware with reduced CPU/GPU/VRAM usage.
+### Performance optimization — lightweight hardware support
+**Goal:** run smoothly on hardware with limited CPU/GPU/VRAM.
 
 **Areas to explore:**
 - Rasterization pipeline: batch MuPDF calls, reduce background thread wake frequency
-- LOD strategy: adaptive tier selection based on GPU memory availability
-- Texture caching: memory pooling, compression, or streaming from disk
-- Rendering: instancing, batch draw calls, reduce shader overhead
-- UI overhead: ImGui draw-call optimization, defer panel rendering
-- Frame timing: frame-skipping, adaptive refresh rates
-- Input handling: reduce per-frame hit-testing cost for large canvases
-- Profiling: identify bottleneck with `SCHOLION_DEBUG` instrumentation
+- LOD strategy: adaptive tier selection based on available GPU memory
+- Texture caching: memory pooling or streaming from disk
+- Rendering: instancing, batched draw calls, reduced shader overhead
+- Frame timing: adaptive refresh, frame-skipping on idle
+- Input: reduce per-frame hit-testing cost on large canvases
 
 **Status:** research and measurement phase pending.
 
 ---
 
-### ✓ Rubber-band select for text boxes — DONE (M23)
-**Status:** fully implemented.
+### Windows — `.scholion` file association
+**Goal:** double-clicking a `.scholion` file in Explorer opens Scholion directly.
 
-**Approach used:** `mouse_button_callback` captures `was_box_selecting` before calling
-`on_mouse_button`. On LMB release, if rubber-band just ended (`was_box_sel && !box_selecting()`),
-iterates `g_text_boxes` and inserts any box whose world rect falls inside the rubber-band rect.
-`box_start_world()` / `box_cur_world()` remain valid after `finalize_box_selection` clears
-`m_box_selecting`. `box.w / zoom` converts screen-px width to world units; `h == 0`
-(auto-height) falls back to top-left-only check. Additive in both plain and Cmd+drag modes
-(selection cleared at press time, not finalize time — consistent with page behavior).
+The `argv[1]` path handling already works; only the registry association is missing.
+Requires either a simple NSIS/WiX installer step or a first-run registry write.
 
-### ✓ Native file picker multi-select — ALREADY DONE
-**Status:** was already implemented before this session.
-
-All "Add PDF" call sites use `tinyfd_openFileDialog(..., allowMultipleSelects=1)`.
-`load_pdfs_from_selection` already splits the pipe-separated result correctly.
-Users can Cmd+click / Shift+click in the native macOS file picker to load multiple PDFs
-at once.
-
----
-
-### ✓ Documentation pass — DONE (M25)
-**Goal:** the codebase should be self-explanatory to a future maintainer who has not read
-this conversation history. Two levels of work:
-
-#### In-code comments (priority: high)
-Prefer short WHY comments over WHAT narration. Target the non-obvious invariants,
-coordinate systems, and state machines. Suggested areas:
-
-- **`src/main.cpp`** — largest file (3100+ lines); needs section banners and targeted
-  comments on:
-  - The drag state machine: three overlapping systems (`m_drag_pending_page` deferred
-    threshold, `m_multi_drag_active` page group, `g_box_dragging` text-box group) and how
-    they interact; `g_page_drag_states` vs `g_box_drag_states` split.
-  - The rasterization pipeline: worker thread → `g_rast_tasks` → `g_rast_ready` →
-    `drain_rast_results()` GL upload on main thread; why `glfwPostEmptyEvent()` is called.
-  - The undo stack design: per-type records, why TextBoxMove is one record per box while
-    PageMove batches all pages in one record.
-  - The save/load parser: why it is position/record-based rather than line-based; the
-    `doc_map` re-keying for annotation attachment after missing-PDF slot shifts.
-  - LOD budget enforcement: when High tiers are evicted unconditionally vs Low tiers
-    evicted only above 350 MB.
-  - The autosave timer: 60 s, resets on manual save or project open.
-  - The startup chooser suppression logic (Apple event grace window in `main()`).
-
-- **`include/input.h` / `src/input.cpp`** — comment the selection state machine:
-  which fields are mutually exclusive, when `m_box_selecting` and `m_multi_drag_active`
-  can be simultaneously true, and why `start_multi_drag` clears `m_box_selecting`.
-
-- **`src/renderer.cpp`** — comment the coordinate system: world space vs screen space,
-  how `world_to_screen` / `screen_to_world` relate to the canvas zoom/pan, and the
-  `draw_rect_dashed` screen-space offset invariant (why the offset is in screen px,
-  not world units).
-
-- **`src/pdf_loader.cpp`** — comment the three LOD tiers (DPI values, expected memory per
-  page) and the `needs_lod` guard that prevents over-uploading.
-
-- **`src/texture_cache.cpp`** — comment the eviction policy: High tier unconditional,
-  Low tier budget-gated, Thumb tier never evicted.
-
-#### Architecture document (priority: medium)
-Create `docs/ARCHITECTURE.md` covering:
-- The three-layer model (Canvas Engine / Document Model / Renderers) with concrete file
-  mappings.
-- Coordinate systems: screen px (GLFW), world units (canvas), and page-normalized [0,1]²
-  (annotation coords) — with transformation formulas.
-- The threading model: what is main-thread-only (GL, ImGui, GLFW callbacks) vs what runs
-  on the worker (MuPDF rasterize).
-- The project file format (.scholion JSON schema): top-level keys, per-doc fields,
-  per-page fields, annotation arrays, text_boxes array.
-- The undo stack: record types, what each covers, the "session" concept for TextBoxEdit.
-- The selection model: `m_selection` (pages), `m_selected_text_boxes` (IDs),
-  `g_selected_box` (text-tool focus) and how they interact.
-
----
-
-### Windows port
-**Goal:** build and run on Windows 10/11 with identical feature set.
-
-**Already portable:** all canvas, rendering, PDF, annotation, input, save/load logic.
-No platform ifdefs needed in those files.
-
-**Work required:**
-
-| Area | macOS today | Windows equivalent |
-|---|---|---|
-| `src/scholion_osx.mm` | ObjC++ Apple Events for file-open / `.scholion` association | New `src/platform_win.cpp` — `WM_DROPFILES` / `IDropTarget` for drag-drop; registry `.scholion` association via installer |
-| CMakeLists.txt target | `MACOSX_BUNDLE`, Info.plist, AppIcon.icns, codesign | `WIN32` subsystem, `.rc` resource with `.ico`, no bundle |
-| App icon | `AppIcon.icns` | `AppIcon.ico` + `.rc` file |
-| Recent projects path | `~/.scholion_recents` | `%APPDATA%\Scholion\recents` — wrap in a `platform_paths.h` |
-| Modifier key guards | already `GLFW_MOD_SUPER \|\| GLFW_MOD_CONTROL` throughout | no change needed |
-| OpenGL linking | `-framework OpenGL` | `opengl32.lib` (CMake handles via `find_package(OpenGL)`) |
-| Distribution signing | `codesign` + `notarytool` | `signtool` (optional for personal use) |
-
-**Tasks:**
-- Create `src/platform_win.cpp` with `Win32` file-open handling.
-- Add `include/platform_paths.h` abstracting `recents_path()` and `app_data_dir()`.
-- Update `CMakeLists.txt` with `if(WIN32)` / `if(APPLE)` target blocks.
-- Create `resources/AppIcon.ico` from existing PNG sources.
-- Test full build on Windows with Visual Studio 2022 or MSYS2/MinGW.
-- Cross-compatibility debugging pass (path separators, font rendering, VRAM query).
+**Status:** pending.
 
 ---
 
 ## Completed
 
-### ✓ Unified drag for mixed selection (pages + text boxes) — M22+
-**Status:** fully implemented. Cmd/Ctrl+click builds a unified selection of pages and text
-boxes; dragging any selected item moves the entire group rigidly.
+### ✓ Linux port — v1.1
+`scholion-lnx/` build tree; CI job on `ubuntu-22.04`; `Scholion-Linux.zip` release asset.
+Platform-specific: GLAD loader, `xdg-open` for reveal-in-file-manager, X11/GLFW.
 
-**Design:**
-- Text-box-initiated drag: `g_box_dragging` block owns movement; `g_page_drag_states`
-  records page initial positions at click time (avoids `m_multi_drag_active` timing race
-  with glfwPollEvents/ImGui frame boundary).
-- Page-initiated drag: `on_cursor_move` moves pages via `m_multi_drag_active`; the
-  `!g_was_multi_drag && cur_multi` detection in the main loop sets `g_box_dragging = true`
-  and populates `g_box_drag_states` so text boxes follow.
-- Clicking an already-selected text box without modifier keeps the selection and starts
-  group drag (mirrors page behavior).
-- Plain click on empty canvas calls `clear_selection()` — clears both pages and text boxes.
+### ✓ Annotation coordinate fix on rotated pages — v1.1
+`screen_to_page_norm()` now inverts the rotation transform so pen strokes, highlight
+glyph collection, and eraser all operate in PDF-native normalized space regardless of
+page rotation. Single function change in `canvas_annot.cpp`.
 
-### ✓ Modifier-click multi-select (canvas) — M22
-- ✓ Cmd/Ctrl+click pages — toggles individual page in/out of selection
-- ✓ Cmd/Ctrl+click text boxes — toggles in/out (M20)
-- ✓ Shift+click = whole-document toggle (unchanged)
-- ✓ Cmd+click on empty canvas starts rubber-band without clearing selection
+### ✓ Clean shutdown — v1.1
+`rast_cancel_all()` called before `rast_shutdown()` so the worker thread exits
+immediately on quit rather than draining the full task queue.
 
-### ✓ Polish multi-box dragging — M21
-Rigid group movement with grab-point-relative delta; undo per moved box.
+### ✓ Windows port — v1.0
+`scholion-win/` build tree; CI job on `windows-2022` (MSYS2/MinGW64); `Scholion-Windows.zip`
+release asset with DLLs bundled. GLAD 3.3 Core, AppIcon.ico, DPI-awareness manifest,
+dark title bar via `DwmSetWindowAttribute`.
 
-### ✓ Unified text-box selection + save feedback — M20
-Cmd+click text boxes into unified selection; "Saved!" / "saved" toast with fade.
+### ✓ Text-snapping highlights + References tab — M29
+Highlight tool snaps to MuPDF character bounding boxes; captured text feeds the
+References sidebar tab with filename + page number; Markdown export via save dialog.
 
-### ✓ Selection/visual polish — M19
-Double-click text-box edit fix; dotted offset selection borders; fainter thread wires;
-live visible/total page counter in overlay.
+### ✓ Panel interaction redesign — M27
+Single-click selects, double-click opens panel, Space tap toggles panel.
+Text boxes no longer render over the open panel.
 
-### ✓ Code audit & hardening — M18
-Viewport restore on load; single-load guard; dead-code removal; relink; hardened parser.
+### ✓ Rubber-band select for text boxes — M23
+Rubber-band box now includes text boxes in the selection. Additive in Cmd+drag mode.
 
-### ✓ Save/load fixes — M17
-Text-box wipe on load fixed; missing-PDF doc-index shift fixed; startup chooser;
-missing-PDF placeholders.
+### ✓ Modifier-click multi-select — M20–M22
+Cmd/Ctrl+click toggles pages and text boxes individually into a unified selection.
+Shift+click remains whole-document toggle. Group drag moves all selected items rigidly.
 
-### ✓ Text & search — M14–M16
-Full-text search (Cmd+F); status overlay (F3); Cmd+S save; text-box overhaul.
+### ✓ Save / load hardening — M17–M18
+Text-box wipe on load fixed; missing-PDF index shift fixed; startup chooser;
+missing-PDF placeholders with relink; position/record-based parser (CRLF-tolerant).
 
-### ✓ Core milestones — M1–M13
-Window + canvas, PDF rasterization, stacks, interaction, annotations, multi-select,
-save/load, autosave, VRAM optimization, UX polish.
-
----
-
-## Notes
-- Keymap reference lives in `../CLAUDE.md` — update it when new bindings land.
-- ✓ `Cmd+A` / `Ctrl+A` — generalized to `GLFW_MOD_SUPER || GLFW_MOD_CONTROL` in `input.cpp`.
-- No git in this tree — snapshots are tarballs in `~/Dropbox/Scholion/`. See CLAUDE.md
-  Restore Points section for the full list.
+### ✓ Core milestones — M1–M16
+Canvas + pan/zoom, PDF rasterization, stacks, annotations, multi-select, save/load,
+autosave, VRAM optimization (350 MB budget, 3-tier LOD), text boxes, full-text search,
+status overlay, UX polish.

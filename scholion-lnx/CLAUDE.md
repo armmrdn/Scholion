@@ -1,5 +1,7 @@
 # Scholion — Linux Port
 
+> Full archive of every plan, decision, removal, and idea lives in `../DEVLOG.md` (local-only, never committed).
+
 ## Overview
 
 Linux build of Scholion. The entire application logic lives in the shared
