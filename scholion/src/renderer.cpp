@@ -757,12 +757,13 @@ void Renderer::draw_page_annotations(const Canvas& canvas, const Page& page,
                   1.0f, 0.88f, 0.0f, 0.32f);
     }
 
-    // Pen strokes: thin red triangle strip per stroke
-    static constexpr float HALF_W = 1.2f;  // screen-pixel half-width
-
+    // Strokes: triangle strip per stroke. Per-stroke half-width and alpha let the pen
+    // (thin, opaque) and the unified-highlighter marker (thick, translucent) share this path.
     for (const auto& stroke : page.annots.strokes) {
         int n = static_cast<int>(stroke.pts.size());
         if (n < 2) continue;
+
+        const float half_w = stroke.width;  // screen-pixel half-width
 
         std::vector<float> strip;
         strip.reserve(n * 4);
@@ -780,13 +781,13 @@ void Renderer::draw_page_annotations(const Canvas& canvas, const Page& page,
             float l = std::sqrt(dx*dx + dy*dy);
             Vec2 nrm = (l > 0.01f) ? Vec2{-dy / l, dx / l} : Vec2{1.0f, 0.0f};
 
-            strip.push_back(sc.x + nrm.x * HALF_W);
-            strip.push_back(sc.y + nrm.y * HALF_W);
-            strip.push_back(sc.x - nrm.x * HALF_W);
-            strip.push_back(sc.y - nrm.y * HALF_W);
+            strip.push_back(sc.x + nrm.x * half_w);
+            strip.push_back(sc.y + nrm.y * half_w);
+            strip.push_back(sc.x - nrm.x * half_w);
+            strip.push_back(sc.y - nrm.y * half_w);
         }
 
-        glUniform4f(m_color_color_loc, stroke.r, stroke.g, stroke.b, 0.88f);
+        glUniform4f(m_color_color_loc, stroke.r, stroke.g, stroke.b, stroke.alpha);
         glBufferData(GL_ARRAY_BUFFER,
                      static_cast<GLsizeiptr>(strip.size() * sizeof(float)),
                      strip.data(), GL_STREAM_DRAW);

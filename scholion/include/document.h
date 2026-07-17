@@ -58,6 +58,11 @@ inline float dpi_for_lod(LodTier tier) {
 struct AnnotStroke {
     std::vector<Vec2> pts;
     float r = 0.82f, g = 0.06f, b = 0.06f;
+    // Screen-pixel half-width and opacity. Defaults match the original pen look; the
+    // unified highlighter creates thick, low-alpha "marker" strokes (wide width, ~0.3
+    // alpha) so the page/text shows through underneath.
+    float width = 1.2f;
+    float alpha = 0.88f;
 };
 
 /// An axis-aligned highlight rectangle in page-normalized coordinates.

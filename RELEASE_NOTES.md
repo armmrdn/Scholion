@@ -1,3 +1,25 @@
+## Scholion v1.3
+
+### //Highlighter
+- The highlighter is now a single unified tool driven by a freehand swipe. Swipe across text and it locks onto the underlying glyphs, capturing the text into the References tab as before. Swipe across a figure, chart, or any non-text region and it leaves a persistent translucent marker so non-text content can be highlighted too.
+- Highlighter color picker added to the tool property strip (applies to freehand marks; text highlights stay yellow).
+
+### //Text Boxes
+- Text boxes can now scale with zoom. A per-box "Scale" toggle in the text tool's property strip makes a box's text stay proportional to the page as you zoom, for margin notes that belong to the document. Existing boxes keep their fixed on-screen "sticky note" size by default.
+
+### //Page Rotation
+- Added "Rotate 180°" and "Reset Rotation" to the page right-click menu, alongside the existing 90° rotate options.
+
+### //Performance
+- The canvas now renders on demand instead of continuously, dropping idle CPU and battery use to near zero during long reading sessions (macOS/Linux). The window still responds instantly to input.
+
+### //Bug Fixes
+- A page annotation (pen/highlight/note flag) can no longer be accidentally placed on the page beneath a text box when clicking that box.
+- Double-clicking a text box to edit it now cleanly puts away any active annotation tool.
+- Reference notes are now readable in Light mode — the note editor and note text no longer render dark-on-dark or wash out.
+
+---
+
 ## Scholion v1.2
 
 ### //Tools

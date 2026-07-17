@@ -14,6 +14,7 @@
 AnnotTool   g_annot_tool    = AnnotTool::None;
 bool        g_ann_drawing   = false;
 float       g_pen_r = 0.82f, g_pen_g = 0.06f, g_pen_b = 0.06f;
+float       g_hl_r = 1.0f, g_hl_g = 0.85f, g_hl_b = 0.0f;   // highlighter yellow
 int         g_ann_doc_idx   = -1;
 int         g_ann_page_idx  = -1;
 AnnotStroke g_ann_cur_stroke;
@@ -90,49 +91,79 @@ void finalize_annotation() {
         }
         g_ann_cur_stroke = {};
     } else if (g_annot_tool == AnnotTool::Highlight) {
-        AnnotHighlight hl;
-        hl.x0 = std::min(g_ann_hl_start.x, g_ann_cur_norm.x);
-        hl.y0 = std::min(g_ann_hl_start.y, g_ann_cur_norm.y);
-        hl.x1 = std::max(g_ann_hl_start.x, g_ann_cur_norm.x);
-        hl.y1 = std::max(g_ann_hl_start.y, g_ann_cur_norm.y);
-        if (hl.x1 > hl.x0 && hl.y1 > hl.y0) {
+        // Unified highlighter: a freehand swipe. If it covers text glyphs, snap to a clean
+        // glyph-locked highlight (→ References). If not, keep it as a persistent translucent
+        // marker stroke so non-text content can be highlighted too.
+        const auto& pts = g_ann_cur_stroke.pts;
+        if (pts.size() >= 2) {
+            // Swipe coverage = AABB of the stroke path (D3 refines this to a per-point band).
+            float ax0 = pts[0].x, ay0 = pts[0].y, ax1 = pts[0].x, ay1 = pts[0].y;
+            for (const auto& p : pts) {
+                ax0 = std::min(ax0, p.x); ay0 = std::min(ay0, p.y);
+                ax1 = std::max(ax1, p.x); ay1 = std::max(ay1, p.y);
+            }
+            // Select glyphs whose center falls within a band around the swipe polyline
+            // (not merely its AABB), so a diagonal or wobbly swipe follows the line(s) it
+            // actually crosses instead of grabbing everything in the bounding box.
+            // BAND is normalized page units (~0.015 ≈ a line's worth on a Letter page);
+            // tune if a swipe grabs too much/little.
+            constexpr float BAND = 0.015f;
+            auto pt_seg_d2 = [](float px, float py, const Vec2& a, const Vec2& b) -> float {
+                float vx = b.x - a.x, vy = b.y - a.y;
+                float len2 = vx*vx + vy*vy;
+                float t = (len2 > 1e-9f)
+                          ? std::clamp(((px-a.x)*vx + (py-a.y)*vy) / len2, 0.0f, 1.0f) : 0.0f;
+                float dx = px - (a.x + t*vx), dy = py - (a.y + t*vy);
+                return dx*dx + dy*dy;
+            };
+            std::vector<const CharQuad*> sel;
             auto* loader = (g_ann_doc_idx >= 0 && g_ann_doc_idx < (int)g_loaders.size())
                            ? g_loaders[g_ann_doc_idx].get() : nullptr;
             if (loader && loader->valid()) {
                 const auto& quads = loader->get_char_quads(g_ann_page_idx);
-                std::vector<const CharQuad*> sel;
                 sel.reserve(quads.size());
                 for (const auto& q : quads) {
-                    float cx = (q.x0 + q.x1) * 0.5f;
-                    float cy = (q.y0 + q.y1) * 0.5f;
-                    if (cx >= hl.x0 && cx <= hl.x1 && cy >= hl.y0 && cy <= hl.y1)
-                        sel.push_back(&q);
-                }
-                if (!sel.empty()) {
-                    std::sort(sel.begin(), sel.end(),
-                              [](const CharQuad* a, const CharQuad* b){
-                                  return a->order < b->order; });
-                    float sx0 = sel[0]->x0, sy0 = sel[0]->y0;
-                    float sx1 = sel[0]->x1, sy1 = sel[0]->y1;
-                    std::string text;
-                    for (const auto* q : sel) {
-                        sx0 = std::min(sx0, q->x0); sy0 = std::min(sy0, q->y0);
-                        sx1 = std::max(sx1, q->x1); sy1 = std::max(sy1, q->y1);
-                        text += q->utf8;
-                        if (q->line_end) text += ' ';
-                    }
-                    while (!text.empty() && text.back() == ' ') text.pop_back();
-                    hl.x0 = sx0; hl.y0 = sy0; hl.x1 = sx1; hl.y1 = sy1;
-                    hl.text = std::move(text);
+                    float cx = (q.x0 + q.x1) * 0.5f, cy = (q.y0 + q.y1) * 0.5f;
+                    if (cx < ax0 - BAND || cx > ax1 + BAND ||
+                        cy < ay0 - BAND || cy > ay1 + BAND) continue;   // cheap AABB pre-filter
+                    float best = 1e9f;
+                    for (size_t i = 1; i < pts.size(); ++i)
+                        best = std::min(best, pt_seg_d2(cx, cy, pts[i-1], pts[i]));
+                    if (best <= BAND * BAND) sel.push_back(&q);
                 }
             }
-            fpage.annots.highlights.push_back(hl);
-            UndoRecord r;
-            r.type     = UndoRecord::Type::Highlight;
-            r.doc_idx  = g_ann_doc_idx;
-            r.page_idx = g_ann_page_idx;
-            push_undo(r);
+            if (!sel.empty()) {
+                // Text: clean glyph-locked highlight + extracted text.
+                std::sort(sel.begin(), sel.end(),
+                          [](const CharQuad* a, const CharQuad* b){ return a->order < b->order; });
+                AnnotHighlight hl;
+                hl.x0 = sel[0]->x0; hl.y0 = sel[0]->y0; hl.x1 = sel[0]->x1; hl.y1 = sel[0]->y1;
+                std::string text;
+                for (const auto* q : sel) {
+                    hl.x0 = std::min(hl.x0, q->x0); hl.y0 = std::min(hl.y0, q->y0);
+                    hl.x1 = std::max(hl.x1, q->x1); hl.y1 = std::max(hl.y1, q->y1);
+                    text += q->utf8;
+                    if (q->line_end) text += ' ';
+                }
+                while (!text.empty() && text.back() == ' ') text.pop_back();
+                hl.text = std::move(text);
+                fpage.annots.highlights.push_back(hl);
+                UndoRecord r;
+                r.type = UndoRecord::Type::Highlight;
+                r.doc_idx = g_ann_doc_idx; r.page_idx = g_ann_page_idx;
+                push_undo(r);
+            } else {
+                // Non-text: persistent translucent freehand marker (rides the stroke path).
+                g_ann_cur_stroke.width = MARKER_HALF_W;
+                g_ann_cur_stroke.alpha = MARKER_ALPHA;
+                fpage.annots.strokes.push_back(std::move(g_ann_cur_stroke));
+                UndoRecord r;
+                r.type = UndoRecord::Type::PenStroke;
+                r.doc_idx = g_ann_doc_idx; r.page_idx = g_ann_page_idx;
+                push_undo(r);
+            }
         }
+        g_ann_cur_stroke = {};
     }
     g_ann_drawing = false;
 }
@@ -161,15 +192,19 @@ void draw_canvas_annotation_preview() {
                 IM_COL32((int)(g_pen_r*255),(int)(g_pen_g*255),(int)(g_pen_b*255),220), 2.0f);
         }
     } else if (g_annot_tool == AnnotTool::Highlight) {
-        float x0 = std::min(g_ann_hl_start.x, g_ann_cur_norm.x);
-        float y0 = std::min(g_ann_hl_start.y, g_ann_cur_norm.y);
-        float x1 = std::max(g_ann_hl_start.x, g_ann_cur_norm.x);
-        float y1 = std::max(g_ann_hl_start.y, g_ann_cur_norm.y);
-        Vec2 tlw = {page->world_pos.x + x0 * page->world_w, page->world_pos.y + y0 * page->world_h};
-        Vec2 brw = {page->world_pos.x + x1 * page->world_w, page->world_pos.y + y1 * page->world_h};
-        Vec2 tls = g_canvas.world_to_screen(tlw);
-        Vec2 brs = g_canvas.world_to_screen(brw);
-        dl->AddRectFilled({tls.x, tls.y}, {brs.x, brs.y}, IM_COL32(255, 224, 0, 80));
+        // Freehand swipe preview — thick translucent line in the highlighter colour.
+        const auto& pts = g_ann_cur_stroke.pts;
+        ImU32 col = IM_COL32((int)(g_hl_r*255), (int)(g_hl_g*255), (int)(g_hl_b*255),
+                             (int)(MARKER_ALPHA*255));
+        for (int i = 1; i < (int)pts.size(); ++i) {
+            Vec2 aw = {page->world_pos.x + pts[i-1].x * page->world_w,
+                       page->world_pos.y + pts[i-1].y * page->world_h};
+            Vec2 bw = {page->world_pos.x + pts[i].x   * page->world_w,
+                       page->world_pos.y + pts[i].y   * page->world_h};
+            Vec2 as = g_canvas.world_to_screen(aw);
+            Vec2 bs = g_canvas.world_to_screen(bw);
+            dl->AddLine({as.x, as.y}, {bs.x, bs.y}, col, MARKER_HALF_W * 2.0f);
+        }
     }
 }
 

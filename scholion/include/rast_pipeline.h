@@ -12,6 +12,11 @@ void rast_shutdown();
 bool drain_rast_results();
 void stream_lod(bool vram_changed);
 
+// True while the background rasterizer still has queued, in-flight, or
+// ready-but-not-yet-uploaded work. The main loop uses this to keep the render
+// loop awake (loading shimmer, prompt tile uploads) instead of idling mid-load.
+bool rast_pending();
+
 // Called from load_pdf and panel interactions
 void enqueue_rast(const std::string& doc_path,
                   std::shared_ptr<PdfLoader> loader,

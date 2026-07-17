@@ -269,9 +269,9 @@ static std::string build_project_json() {
     for (int i = 0; i < (int)g_text_boxes.size(); ++i) {
         const auto& box = g_text_boxes[i];
         snprintf(b, sizeof(b),
-                 "    { \"id\": %d, \"x\": %.4f, \"y\": %.4f, \"r\": %.3f, \"g\": %.3f, \"b\": %.3f, \"fs\": %.1f, \"w\": %.2f, \"h\": %.2f, \"text\": \"",
+                 "    { \"id\": %d, \"x\": %.4f, \"y\": %.4f, \"r\": %.3f, \"g\": %.3f, \"b\": %.3f, \"fs\": %.1f, \"w\": %.2f, \"h\": %.2f, \"zs\": %d, \"text\": \"",
                  box.id, box.world_pos.x, box.world_pos.y, box.r, box.g, box.b, box.font_size,
-                 box.w, box.h);
+                 box.w, box.h, box.zoom_scaled ? 1 : 0);
         out += b;
         out += json_escape(box.text);
         snprintf(b, sizeof(b), "\" }%s\n", i + 1 < (int)g_text_boxes.size() ? "," : "");
@@ -312,8 +312,8 @@ static std::string build_project_json() {
             for (const auto& stroke : an.strokes) {
                 sep();
                 snprintf(b, sizeof(b),
-                         "    { \"doc\": %d, \"page\": %d, \"sr\": %.5f, \"sg\": %.5f, \"sb\": %.5f }",
-                         di, pi, stroke.r, stroke.g, stroke.b);
+                         "    { \"doc\": %d, \"page\": %d, \"sr\": %.5f, \"sg\": %.5f, \"sb\": %.5f, \"sw\": %.3f, \"sa\": %.4f }",
+                         di, pi, stroke.r, stroke.g, stroke.b, stroke.width, stroke.alpha);
                 out += b;
                 for (const auto& pt : stroke.pts) {
                     snprintf(b, sizeof(b), ",\n    { \"p\": [%.6f, %.6f] }", pt.x, pt.y);
@@ -571,13 +571,15 @@ void load_project_from_path(const std::string& path) {
             case T_ID:
                 if (sec == Section::TextBoxes) {
                     int id; float x, y, tr = 0.82f, tg = 0.06f, tb2 = 0.06f, tfs = 16.0f, tw = 0.0f, th = 0.0f;
+                    int tzs = 0;
                     int np = sscanf(at,
-                        "\"id\": %d, \"x\": %f, \"y\": %f, \"r\": %f, \"g\": %f, \"b\": %f, \"fs\": %f, \"w\": %f, \"h\": %f",
-                        &id, &x, &y, &tr, &tg, &tb2, &tfs, &tw, &th);
+                        "\"id\": %d, \"x\": %f, \"y\": %f, \"r\": %f, \"g\": %f, \"b\": %f, \"fs\": %f, \"w\": %f, \"h\": %f, \"zs\": %d",
+                        &id, &x, &y, &tr, &tg, &tb2, &tfs, &tw, &th, &tzs);
                     if (np >= 3) {
                         CanvasTextBox tb; tb.id = id; tb.world_pos = {x, y}; tb.text[0] = '\0';
                         if (np >= 7) { tb.r = tr; tb.g = tg; tb.b = tb2; tb.font_size = tfs; }
                         if (np >= 9) { tb.w = tw; tb.h = th; }
+                        if (np >= 10) tb.zoom_scaled = (tzs != 0);  // older files omit "zs" → false
                         extract_json_text(at, tb.text, sizeof(tb.text));
                         saved_boxes.push_back(tb);
                     }
@@ -585,7 +587,7 @@ void load_project_from_path(const std::string& path) {
                 break;
             case T_DOC:
                 if (sec == Section::Annots) {
-                    int di, pi;
+                    int di, pi; float sw, sa; int npx;
                     if (sscanf(at, "\"doc\": %d, \"page\": %d, \"hl\": [%f, %f, %f, %f]",
                                &di, &pi, &a, &b, &c, &d) == 6) {
                         flush_stroke();
@@ -612,11 +614,15 @@ void load_project_from_path(const std::string& path) {
                     } else if (sscanf(at, "\"doc\": %d, \"page\": %d, \"note\": \"%[^\"]\"",
                                       &di, &pi, s) == 3) {
                         flush_stroke(); saved_notes.push_back({di, pi, s});
-                    } else if (sscanf(at, "\"doc\": %d, \"page\": %d, \"sr\": %f, \"sg\": %f, \"sb\": %f",
-                                      &di, &pi, &a, &b, &c) == 5) {
+                    } else if ((npx = sscanf(at,
+                                   "\"doc\": %d, \"page\": %d, \"sr\": %f, \"sg\": %f, \"sb\": %f, \"sw\": %f, \"sa\": %f",
+                                   &di, &pi, &a, &b, &c, &sw, &sa)) >= 5) {
                         flush_stroke();
                         stroke_doc = di; stroke_page = pi;
-                        building_stroke = {}; building_stroke.r = a; building_stroke.g = b; building_stroke.b = c;
+                        building_stroke = {};  // struct defaults width=1.2, alpha=0.88
+                        building_stroke.r = a; building_stroke.g = b; building_stroke.b = c;
+                        if (npx >= 6) building_stroke.width = sw;  // older files omit sw/sa → defaults
+                        if (npx >= 7) building_stroke.alpha = sa;
                         building = true;
                     }
                 }

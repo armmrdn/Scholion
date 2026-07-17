@@ -6,12 +6,18 @@
 
 enum class AnnotTool { None, Pen, Highlight, Note, Eraser };
 
+// Freehand-highlighter "marker" stroke appearance: thick and translucent so the page/text
+// shows through underneath. Used when a highlighter swipe covers no text glyphs.
+constexpr float MARKER_HALF_W = 7.0f;   // screen-pixel half-width
+constexpr float MARKER_ALPHA  = 0.30f;
+
 struct RefNote { int after_idx; std::string text; };
 
 // Annotation input state — defined in canvas_annot.cpp
 extern AnnotTool   g_annot_tool;
 extern bool        g_ann_drawing;
 extern float       g_pen_r, g_pen_g, g_pen_b;
+extern float       g_hl_r, g_hl_g, g_hl_b;   // highlighter (marker) color
 extern int         g_ann_doc_idx;
 extern int         g_ann_page_idx;
 extern AnnotStroke g_ann_cur_stroke;

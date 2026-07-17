@@ -131,7 +131,9 @@ int  g_editing_box    = -1;  // id, -1 = not editing
 static bool  g_text_tool      = false;
 static float g_tbox_r = 0.82f, g_tbox_g = 0.06f, g_tbox_b = 0.06f;  // default red, like the pen
 static float g_tbox_font_size = 16.0f;
+static bool  g_tbox_zoom_scaled = false;  // template for new boxes: scale text with zoom
 static int  g_hovered_box    = -1;  // id under cursor (set per-frame); -1 = none
+static int  text_box_at(float sx, float sy);  // synchronous top-most text box under a point; -1 = none
 static bool g_box_dragging    = false;
 struct TextBoxDragState { int id; Vec2 initial_pos; };
 static std::vector<TextBoxDragState> g_box_drag_states = {};
@@ -726,7 +728,14 @@ static char s_ref_note_buf[2048] = {};
 
 static void mouse_button_callback(GLFWwindow* w, int button, int action, int mods) {
     if (ImGui::GetIO().WantCaptureMouse) return;
-    if (g_hovered_box >= 0) return;  // text box owns this click (one-frame lookahead)
+    // A text box under the cursor owns this click, so no annotation (pen/highlight/note)
+    // starts on the page beneath it. Synchronous hit-test replaces the old g_hovered_box
+    // guard, which was set one frame late in draw_canvas_text_boxes — a same-frame
+    // move-then-click could slip past it (e.g. dropping a stray Note flag under a box).
+    {
+        double hcx, hcy; glfwGetCursorPos(w, &hcx, &hcy);
+        if (text_box_at((float)hcx, (float)hcy) >= 0) return;
+    }
 
     // Annotation tool: intercept LMB press on a page before InputHandler sees it.
     // The page owns the click — InputHandler does not receive it, so no drag/select starts.
@@ -751,16 +760,19 @@ static void mouse_button_callback(GLFWwindow* w, int button, int action, int mod
                 g_ann_drawing  = true;
                 g_ann_doc_idx  = doc_idx;
                 g_ann_page_idx = page->page_index;
-                if (g_annot_tool == AnnotTool::Pen) {
-                    g_ann_cur_stroke     = {};
-                    g_ann_cur_stroke.r   = g_pen_r;
-                    g_ann_cur_stroke.g   = g_pen_g;
-                    g_ann_cur_stroke.b   = g_pen_b;
+                if (g_annot_tool == AnnotTool::Pen || g_annot_tool == AnnotTool::Highlight) {
+                    // Pen and the unified highlighter both capture a freehand point path.
+                    g_ann_cur_stroke = {};
+                    if (g_annot_tool == AnnotTool::Pen) {
+                        g_ann_cur_stroke.r = g_pen_r; g_ann_cur_stroke.g = g_pen_g; g_ann_cur_stroke.b = g_pen_b;
+                    } else {
+                        g_ann_cur_stroke.r = g_hl_r; g_ann_cur_stroke.g = g_hl_g; g_ann_cur_stroke.b = g_hl_b;
+                        g_ann_cur_stroke.width = MARKER_HALF_W; g_ann_cur_stroke.alpha = MARKER_ALPHA;
+                    }
                     g_ann_cur_stroke.pts.push_back(norm);
-                } else {
-                    g_ann_hl_start = norm;
-                    g_ann_cur_norm = norm;
                 }
+                g_ann_hl_start = norm;   // eraser radius origin / legacy
+                g_ann_cur_norm = norm;
             }
             return; // page owns this click — don't pass to InputHandler
         }
@@ -818,8 +830,9 @@ static void mouse_button_callback(GLFWwindow* w, int button, int action, int mod
 static void cursor_pos_callback(GLFWwindow* w, double x, double y) {
     if (ImGui::GetIO().WantCaptureMouse) { g_input.clear_hover(); return; }
     g_input.on_cursor_move(w, x, y);
-    // Accumulate pen points at mouse-move rate (more points per frame = smoother stroke).
-    if (g_ann_drawing && !s_panel_ann_active && g_annot_tool == AnnotTool::Pen
+    // Accumulate pen / highlighter-swipe points at mouse-move rate (smoother path).
+    if (g_ann_drawing && !s_panel_ann_active
+            && (g_annot_tool == AnnotTool::Pen || g_annot_tool == AnnotTool::Highlight)
             && g_ann_doc_idx >= 0 && g_ann_doc_idx < (int)g_documents.size()
             && g_ann_page_idx >= 0) {
         const Document& doc = g_documents[g_ann_doc_idx];
@@ -1163,6 +1176,54 @@ static constexpr float TBOX_MIN_H    = 28.0f;
 static constexpr float TBOX_DEFAULT_W = 200.0f; // bare-click box width
 static constexpr float TBOX_MIN_DRAG  = 8.0f;   // px; smaller drags count as a click
 
+// Screen-space layout of a text box, shared by draw_canvas_text_boxes (render + hover)
+// and text_box_at (the synchronous hit-test in mouse_button_callback) so the two can
+// never diverge. `scale` is 1.0 today; Part C multiplies it by the canvas zoom for boxes
+// flagged zoom_scaled, so glyph size and box dimensions grow with the page.
+struct TextBoxLayout { ImVec2 tl, br; float box_w, box_h, wrap, font_px, pad; };
+static TextBoxLayout text_box_layout(const CanvasTextBox& box) {
+    ImFont* font = ImGui::GetFont();
+    Vec2 sp = g_canvas.world_to_screen(box.world_pos);
+    // Fixed boxes render at a constant on-screen size; zoom_scaled boxes grow with the
+    // canvas zoom so their text stays proportional to the page they annotate. Stored
+    // w/h/font_size are always canonical at 100% zoom.
+    float scale   = box.zoom_scaled ? g_canvas.get_zoom() : 1.0f;
+    float pad     = TBOX_PAD * scale;
+    float font_px = box.font_size * scale;
+    const char* content = box.text[0] ? box.text : " ";
+    float box_w, wrap, box_h;
+    if (box.w > 0.0f) {
+        box_w = box.w * scale;
+        wrap  = box_w - 2.0f * pad;
+        ImVec2 ts = font->CalcTextSizeA(font_px, FLT_MAX, wrap, content);
+        box_h = std::max(box.h * scale, ts.y + 2.0f * pad);
+    } else {
+        float natural_w = font->CalcTextSizeA(font_px, FLT_MAX, 0.0f, content).x + 2.0f * pad;
+        box_w = std::clamp(natural_w, TBOX_MIN_W * scale, TBOX_MAX_W * scale);
+        wrap  = box_w - 2.0f * pad;
+        ImVec2 ts = font->CalcTextSizeA(font_px, FLT_MAX, wrap, content);
+        box_h = std::max(TBOX_MIN_H * scale, ts.y + 2.0f * pad);
+    }
+    return { {sp.x, sp.y}, {sp.x + box_w, sp.y + box_h}, box_w, box_h, wrap, font_px, pad };
+}
+
+// Top-most text box whose screen rect contains (sx, sy), or -1. Iterates in draw order
+// so the last (visually top) box wins, matching draw_canvas_text_boxes' hover logic.
+static int text_box_at(float sx, float sy) {
+    if (g_settings_open || g_search_open) return -1;   // boxes not interactive under overlays
+    ImVec2 vp = ImGui::GetMainViewport()->Size;
+    float canvas_right = g_input.panel_open() ? (vp.x - g_panel_w) : vp.x;
+    if (sx >= canvas_right) return -1;                 // clicks inside the panel excluded
+    int found = -1;
+    for (const auto& box : g_text_boxes) {
+        if (g_editing_box == box.id) continue;         // editing box is an ImGui window
+        TextBoxLayout L = text_box_layout(box);
+        if (sx >= L.tl.x && sx <= L.br.x && sy >= L.tl.y && sy <= L.br.y)
+            found = box.id;
+    }
+    return found;
+}
+
 // Draw a dotted rectangle on an ImGui draw list (no native dashed support).
 static void imgui_dashed_rect(ImDrawList* dl, ImVec2 tl, ImVec2 br, ImU32 col,
                               float dash = 6.0f, float gap = 4.0f, float thickness = 1.0f) {
@@ -1318,30 +1379,12 @@ static void draw_canvas_text_boxes() {
     for (auto& box : g_text_boxes) {
         if (g_editing_box == box.id) continue;  // editing box shown as ImGui window below
 
-        Vec2 sp = g_canvas.world_to_screen(box.world_pos);
-
-        // Rough off-screen cull
-        if (sp.x + TBOX_MAX_W < 0 || sp.x > vp.x || sp.y + 300 < 0 || sp.y > vp.y) continue;
-
-        const char* content = box.text[0] ? box.text : " ";
-        float box_w, wrap, box_h;
-        if (box.w > 0.0f) {
-            // Drag-sized (or default-width) box: width is fixed, text wraps to it,
-            // and the dragged height is a floor that grows downward to fit content.
-            box_w = box.w;
-            wrap  = box_w - 2.0f * TBOX_PAD;
-            ImVec2 text_sz = font->CalcTextSizeA(box.font_size, FLT_MAX, wrap, content);
-            box_h = std::max(box.h, text_sz.y + 2.0f * TBOX_PAD);
-        } else {
-            // Legacy boxes (saved before w/h existed): auto-size width to text.
-            float natural_w = font->CalcTextSizeA(box.font_size, FLT_MAX, 0.0f, content).x + 2.0f * TBOX_PAD;
-            box_w = std::clamp(natural_w, TBOX_MIN_W, TBOX_MAX_W);
-            wrap  = box_w - 2.0f * TBOX_PAD;
-            ImVec2 text_sz = font->CalcTextSizeA(box.font_size, FLT_MAX, wrap, content);
-            box_h = std::max(TBOX_MIN_H, text_sz.y + 2.0f * TBOX_PAD);
-        }
-        ImVec2 tl = {sp.x, sp.y};
-        ImVec2 br = {sp.x + box_w, sp.y + box_h};
+        TextBoxLayout L = text_box_layout(box);
+        // Off-screen cull using the box's actual on-screen extent (correct for zoom-scaled
+        // boxes, whose footprint can be much larger than the fixed-size constants).
+        if (L.br.x < 0 || L.tl.x > vp.x || L.br.y < 0 || L.tl.y > vp.y) continue;
+        ImVec2 tl = L.tl, br = L.br;
+        float  wrap = L.wrap;
 
         bool hit = !io.WantCaptureMouse
                 && mouse.x >= tl.x && mouse.x <= br.x
@@ -1350,13 +1393,14 @@ static void draw_canvas_text_boxes() {
 
         if (hit) new_hovered = box.id;
 
-        // Draw text (or placeholder)
+        // Draw text (or placeholder). Font size + padding come from the shared layout so
+        // a zoom_scaled box (Part C) renders larger; today L.font_px == box.font_size.
         if (box.text[0]) {
-            dl->AddText(font, box.font_size, {tl.x + TBOX_PAD, tl.y + TBOX_PAD},
+            dl->AddText(font, L.font_px, {tl.x + L.pad, tl.y + L.pad},
                         IM_COL32((int)(box.r*255), (int)(box.g*255), (int)(box.b*255), 220),
                         box.text, nullptr, wrap);
         } else {
-            dl->AddText(font, box.font_size, {tl.x + TBOX_PAD, tl.y + TBOX_PAD},
+            dl->AddText(font, L.font_px, {tl.x + L.pad, tl.y + L.pad},
                         IM_COL32(160, 160, 160, 130), "Double-click to edit...");
         }
 
@@ -1373,11 +1417,24 @@ static void draw_canvas_text_boxes() {
         // Click / drag / double-click
         if (hit) {
             if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                // Entering box editing disarms any annotation tool (symmetric with
+                // the tool-activation paths, which already clear g_editing_box). Also
+                // cancels any in-progress stroke so a stray pen line can't be committed.
+                g_annot_tool     = AnnotTool::None;
+                g_ann_drawing    = false;
                 g_selected_box   = box.id;
                 g_editing_box    = box.id;
                 g_tbox_r         = box.r; g_tbox_g = box.g; g_tbox_b = box.b;
                 g_tbox_font_size = box.font_size;
+                g_tbox_zoom_scaled = box.zoom_scaled;
             } else if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                // A click that lands on a text box (select/drag) must not also leave
+                // an annotation stroke running underneath it. mouse_button_callback's
+                // "text box owns this click" guard uses g_hovered_box, which lags one
+                // frame — a same-frame move-then-click onto a box can slip past it and
+                // start a pen/highlight stroke on the page below. Cancel it here so a
+                // stray line can't be drawn while the box is selected or dragged.
+                g_ann_drawing = false;
                 bool cmd      = (io.KeyCtrl || io.KeySuper);
                 bool in_sel   = g_input.selected_text_boxes().count(box.id) > 0;
                 auto& sel_ref = const_cast<std::unordered_set<int>&>(g_input.selected_text_boxes());
@@ -1400,6 +1457,7 @@ static void draw_canvas_text_boxes() {
                 // template for the next new box once this one is deselected).
                 g_tbox_r = box.r; g_tbox_g = box.g; g_tbox_b = box.b;
                 g_tbox_font_size = box.font_size;
+                g_tbox_zoom_scaled = box.zoom_scaled;
 
                 // Start multi-box drag: record initial positions of all selected text boxes
                 Vec2 w = g_canvas.screen_to_world({mouse.x, mouse.y});
@@ -1448,9 +1506,14 @@ static void draw_canvas_text_boxes() {
             nb.text[0]   = '\0';
             nb.r = g_tbox_r; nb.g = g_tbox_g; nb.b = g_tbox_b;
             nb.font_size = g_tbox_font_size;
+            nb.zoom_scaled = g_tbox_zoom_scaled;
+            // Drag-sized boxes: store w/h canonical at 100% zoom so a scaled box drawn
+            // while zoomed in doesn't balloon. font_size and the default width are already
+            // canonical sizes.
+            float inv = nb.zoom_scaled ? (1.0f / g_canvas.get_zoom()) : 1.0f;
             if (dw >= TBOX_MIN_DRAG && dh >= TBOX_MIN_DRAG) {
                 nb.world_pos = g_canvas.screen_to_world({a.x, a.y});
-                nb.w = dw; nb.h = dh;
+                nb.w = dw * inv; nb.h = dh * inv;
             } else {
                 // Bare click → default-width, auto-height box anchored at the click.
                 nb.world_pos = g_canvas.screen_to_world({g_tbox_create_start.x, g_tbox_create_start.y});
@@ -1476,13 +1539,16 @@ static void draw_canvas_text_boxes() {
         if (!eb) {
             g_editing_box = -1;
         } else {
+            // Scale the editor to match how the box renders, so it doesn't visibly jump
+            // between edit and display when the box is zoom_scaled.
+            float escale = eb->zoom_scaled ? g_canvas.get_zoom() : 1.0f;
             Vec2 sp = g_canvas.world_to_screen(eb->world_pos);
-            float ew = (eb->w > 0.0f) ? eb->w : TBOX_W;
-            float eh = std::max((eb->h > 0.0f) ? eb->h : 130.0f, 60.0f);
+            float ew = ((eb->w > 0.0f) ? eb->w : TBOX_W) * escale;
+            float eh = std::max(((eb->h > 0.0f) ? eb->h : 130.0f) * escale, 60.0f);
             ImGui::SetNextWindowPos({sp.x, sp.y}, ImGuiCond_Always);
             ImGui::SetNextWindowSize({ew, eh}, ImGuiCond_Always);
             ImGui::SetNextWindowBgAlpha(0.90f);
-            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {TBOX_PAD, TBOX_PAD});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {TBOX_PAD * escale, TBOX_PAD * escale});
             ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.11f, 0.11f, 0.14f, 0.92f));
 
             char wid[32]; snprintf(wid, sizeof(wid), "##tbedit%d", g_editing_box);
@@ -1490,6 +1556,7 @@ static void draw_canvas_text_boxes() {
                 ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
                 ImGuiWindowFlags_NoMove     | ImGuiWindowFlags_NoScrollbar |
                 ImGuiWindowFlags_NoSavedSettings);
+            ImGui::SetWindowFontScale(escale);  // scale the edited glyphs to match display
             ImGui::PopStyleVar();
             ImGui::PopStyleColor();
 
@@ -1634,12 +1701,16 @@ static void reveal_in_file_manager(const std::string& path) {
 // --- Context menu -----------------------------------------------------------
 
 static void apply_page_rotation(Page* page, int delta_cw) {
+    int d = ((delta_cw % 360) + 360) % 360;   // normalize to [0,360)
+    if (d == 0) return;                        // no-op (e.g. reset on an unrotated page)
     UndoRecord r;
     r.type = UndoRecord::Type::PageRotate;
     r.page_rots.push_back({page, page->rotation, page->world_w, page->world_h});
     push_undo(r);
-    page->rotation = (page->rotation + delta_cw) % 360;
-    std::swap(page->world_w, page->world_h);
+    page->rotation = (page->rotation + d) % 360;
+    // Swap the page footprint only for odd 90° turns; a 180° (or 180° reset) keeps w/h.
+    // The old unconditional swap was wrong for those cases.
+    if ((d / 90) % 2 != 0) std::swap(page->world_w, page->world_h);
 }
 
 static void draw_context_menu() {
@@ -1701,6 +1772,10 @@ static void draw_context_menu() {
             ImGui::Separator();
             if (ImGui::MenuItem("Rotate CW"))  { apply_page_rotation(page, 90);  ImGui::CloseCurrentPopup(); }
             if (ImGui::MenuItem("Rotate CCW")) { apply_page_rotation(page, 270); ImGui::CloseCurrentPopup(); }
+            if (ImGui::MenuItem("Rotate 180\xc2\xb0")) { apply_page_rotation(page, 180); ImGui::CloseCurrentPopup(); }
+            if (ImGui::MenuItem("Reset Rotation", nullptr, false, page->rotation != 0)) {
+                apply_page_rotation(page, (360 - page->rotation) % 360); ImGui::CloseCurrentPopup();
+            }
             ImGui::Separator();
             if (ImGui::MenuItem("Fan Pages Vertically")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
@@ -2340,14 +2415,18 @@ static void draw_references_tab() {
 
                 // Inset cursor so text box sits inside the border with kPad margin
                 ImGui::SetCursorPos({cb.x + kPad, cb.y + kPad});
+                // The note box is forced dark in both themes, so pin a light text colour
+                // too — otherwise light mode uses the theme's dark ImGuiCol_Text and the
+                // text is invisible on the dark box (the reported light-mode bug).
                 ImGui::PushStyleColor(ImGuiCol_FrameBg, {0.10f, 0.10f, 0.13f, 0.9f});
+                ImGui::PushStyleColor(ImGuiCol_Text,    {0.90f, 0.90f, 0.94f, 1.0f});
                 char edit_id[32]; snprintf(edit_id, sizeof(edit_id), "##rnedit%d", gi);
                 // Auto-focus input on the first frame it opens
                 if (s_editing_ref_note != s_prev_editing_ref)
                     ImGui::SetKeyboardFocusHere();
                 ImGui::InputTextMultiline(edit_id, s_ref_note_buf, sizeof(s_ref_note_buf),
                                           {txt_w, kTextH});
-                ImGui::PopStyleColor();
+                ImGui::PopStyleColor(2);
 
                 // Save and close on click outside the note box
                 if (ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
@@ -2406,11 +2485,14 @@ static void draw_references_tab() {
                     {tl.x + 3.5f, tl.y + box_h - 4.0f},
                     IM_COL32(130, 130, 178, 180), 2.0f);
 
-                // Note text: indented, lighter colour (italic not available in default font)
+                // Note text: indented; colour follows the theme so it stays readable in
+                // light mode (a light lavender washes out on the light window background).
+                ImU32 note_col = g_settings.dark_mode ? IM_COL32(185, 185, 205, 240)
+                                                      : IM_COL32( 55,  55,  75, 255);
                 ImGui::GetWindowDrawList()->AddText(
                     ImGui::GetFont(), ImGui::GetFontSize(),
                     {tl.x + kPad + 8.0f, tl.y + kPad},
-                    IM_COL32(185, 185, 205, 240),
+                    note_col,
                     note_text, nullptr, wrap_w);
 
                 // X pinned top-right — drawn after InvisibleButton so it wins the hit test
@@ -2448,12 +2530,14 @@ static void draw_references_tab() {
                 ImGui::GetWindowDrawList()->AddRect(
                     tl, {tl.x + avail, tl.y + box_h}, kBord, kRound);
 
-                // Centered placeholder text
+                // Centered placeholder text (theme-aware so it reads in light mode too)
                 const char* ph = "Attach Note to Reference";
                 ImVec2 ts = ImGui::CalcTextSize(ph);
+                ImU32 ph_col = g_settings.dark_mode ? IM_COL32(90, 90, 108, 200)
+                                                    : IM_COL32(120, 120, 135, 220);
                 ImGui::GetWindowDrawList()->AddText(
                     {tl.x + (avail - ts.x) * 0.5f, tl.y + (box_h - ts.y) * 0.5f},
-                    IM_COL32(90, 90, 108, 200), ph);
+                    ph_col, ph);
 
                 if (activated) {
                     g_ref_notes.push_back({gi, ""});
@@ -2725,39 +2809,36 @@ static void draw_panel_ui() {
                 g_ann_doc_idx      = doc_idx;
                 g_ann_page_idx     = pi;
                 s_panel_ann_active = true;
-                if (g_annot_tool == AnnotTool::Pen) {
-                    g_ann_cur_stroke   = {};
-                    g_ann_cur_stroke.r = g_pen_r;
-                    g_ann_cur_stroke.g = g_pen_g;
-                    g_ann_cur_stroke.b = g_pen_b;
+                if (g_annot_tool == AnnotTool::Pen || g_annot_tool == AnnotTool::Highlight) {
+                    g_ann_cur_stroke = {};
+                    if (g_annot_tool == AnnotTool::Pen) {
+                        g_ann_cur_stroke.r = g_pen_r; g_ann_cur_stroke.g = g_pen_g; g_ann_cur_stroke.b = g_pen_b;
+                    } else {
+                        g_ann_cur_stroke.r = g_hl_r; g_ann_cur_stroke.g = g_hl_g; g_ann_cur_stroke.b = g_hl_b;
+                        g_ann_cur_stroke.width = MARKER_HALF_W; g_ann_cur_stroke.alpha = MARKER_ALPHA;
+                    }
                     g_ann_cur_stroke.pts.push_back(pnorm);
-                } else {
-                    g_ann_hl_start = pnorm;
-                    g_ann_cur_norm = pnorm;
                 }
+                g_ann_hl_start = pnorm;
+                g_ann_cur_norm = pnorm;
             }
 
             if (g_ann_drawing && s_panel_ann_active &&
                     g_ann_doc_idx == doc_idx && g_ann_page_idx == pi) {
-                if (g_annot_tool == AnnotTool::Pen && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+                if ((g_annot_tool == AnnotTool::Pen || g_annot_tool == AnnotTool::Highlight)
+                        && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
                     g_ann_cur_stroke.pts.push_back(pnorm);
                     const auto& pts = g_ann_cur_stroke.pts;
+                    bool  hlt   = (g_annot_tool == AnnotTool::Highlight);
+                    ImU32 col   = hlt
+                        ? IM_COL32((int)(g_hl_r*255),(int)(g_hl_g*255),(int)(g_hl_b*255),(int)(MARKER_ALPHA*255))
+                        : IM_COL32((int)(g_pen_r*255),(int)(g_pen_g*255),(int)(g_pen_b*255),220);
+                    float thick = hlt ? MARKER_HALF_W * 2.0f : 2.0f;
                     for (int si = 1; si < (int)pts.size(); ++si) {
                         ImVec2 a = {img_pos.x + pts[si-1].x * img_w, img_pos.y + pts[si-1].y * img_h};
                         ImVec2 b = {img_pos.x + pts[si  ].x * img_w, img_pos.y + pts[si  ].y * img_h};
-                        dl->AddLine(a, b,
-                            IM_COL32((int)(g_pen_r*255),(int)(g_pen_g*255),(int)(g_pen_b*255),220), 2.0f);
+                        dl->AddLine(a, b, col, thick);
                     }
-                } else if (g_annot_tool == AnnotTool::Highlight) {
-                    g_ann_cur_norm = pnorm;
-                    float x0 = std::min(g_ann_hl_start.x, pnorm.x);
-                    float y0 = std::min(g_ann_hl_start.y, pnorm.y);
-                    float x1 = std::max(g_ann_hl_start.x, pnorm.x);
-                    float y1 = std::max(g_ann_hl_start.y, pnorm.y);
-                    dl->AddRectFilled(
-                        {img_pos.x + x0 * img_w, img_pos.y + y0 * img_h},
-                        {img_pos.x + x1 * img_w, img_pos.y + y1 * img_h},
-                        IM_COL32(255, 224, 0, 80));
                 }
                 if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
                     s_panel_ann_active = false;
@@ -2800,14 +2881,15 @@ static void draw_panel_ui() {
             dl->AddRectFilled(tl, br, IM_COL32(255, 224, 0, 80));
         }
         for (const auto& stroke : page.annots.strokes) {
+            int sa = (int)(stroke.alpha * 255.0f);
             for (int si = 1; si < (int)stroke.pts.size(); ++si) {
                 ImVec2 a = {img_pos.x + stroke.pts[si-1].x * img_w,
                             img_pos.y + stroke.pts[si-1].y * img_h};
                 ImVec2 b = {img_pos.x + stroke.pts[si  ].x * img_w,
                             img_pos.y + stroke.pts[si  ].y * img_h};
                 dl->AddLine(a, b,
-                    IM_COL32((int)(stroke.r*255), (int)(stroke.g*255), (int)(stroke.b*255), 220),
-                    2.0f);
+                    IM_COL32((int)(stroke.r*255), (int)(stroke.g*255), (int)(stroke.b*255), sa),
+                    stroke.width * 2.0f);
             }
         }
 
@@ -3358,8 +3440,9 @@ static void draw_toolbar_ui() {
     // right of all tool buttons when a tool with configurable properties is active.
     {
         bool show_pen_props  = (g_annot_tool == AnnotTool::Pen);
+        bool show_hl_props   = (g_annot_tool == AnnotTool::Highlight);
         bool show_text_props = (g_text_tool || g_selected_box >= 0);
-        if (show_pen_props || show_text_props) {
+        if (show_pen_props || show_hl_props || show_text_props) {
             ImGui::SameLine(0.0f, 10.0f);
             ImGui::TextDisabled("|");
             ImGui::SameLine(0.0f, 10.0f);
@@ -3370,6 +3453,13 @@ static void draw_toolbar_ui() {
                     ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
                 { g_pen_r = pcol[0]; g_pen_g = pcol[1]; g_pen_b = pcol[2]; }
             ImGui::SetItemTooltip("Pen color");
+        }
+        if (show_hl_props) {
+            float hcol[3] = {g_hl_r, g_hl_g, g_hl_b};
+            if (ImGui::ColorEdit3("##hlcolor", hcol,
+                    ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
+                { g_hl_r = hcol[0]; g_hl_g = hcol[1]; g_hl_b = hcol[2]; }
+            ImGui::SetItemTooltip("Highlighter color (freehand marks; text highlights stay yellow)");
         }
         if (show_text_props) {
             float tcol[3] = {g_tbox_r, g_tbox_g, g_tbox_b};
@@ -3387,6 +3477,12 @@ static void draw_toolbar_ui() {
                     if (b.id == g_selected_box) { b.font_size = g_tbox_font_size; break; }
             }
             ImGui::SetItemTooltip("Font size");
+            ImGui::SameLine();
+            if (ImGui::Checkbox("Scale", &g_tbox_zoom_scaled)) {
+                for (auto& b : g_text_boxes)
+                    if (b.id == g_selected_box) { b.zoom_scaled = g_tbox_zoom_scaled; break; }
+            }
+            ImGui::SetItemTooltip("Scale text with zoom so it stays proportional to the page");
         }
     }
 
@@ -3708,6 +3804,25 @@ static void run_benchmark(GLFWwindow* window, Renderer& renderer) {
 
 // ---------------------------------------------------------------------------
 
+// Returns true when the app should keep redrawing at the interactive frame rate.
+// When it returns false, the main loop blocks in glfwWaitEventsTimeout() for a
+// long idle interval instead, dropping idle CPU/GPU to near zero (PureRef-style).
+// Any GLFW input event, or a glfwPostEmptyEvent() from a worker thread, wakes the
+// loop immediately, so responsiveness is unaffected. Conservative by design: it
+// prefers a false-positive (a wasted redraw) over freezing a live animation.
+static bool app_wants_animation() {
+    if (rast_pending())                                    return true;  // tiles streaming / shimmer
+    if (g_save_feedback_type != SaveFeedbackType::None)    return true;  // "Saved!" fade
+    if (g_dl_state.load(std::memory_order_acquire) == 1)   return true;  // download spinner
+    if (g_search_running.load(std::memory_order_acquire))  return true;  // search spinner
+    if (g_startup_chooser)                                 return true;  // modal with hover states
+
+    if (ImGui::IsAnyMouseDown())        return true;  // drag / pan / draw in progress
+    if (ImGui::GetIO().WantTextInput)   return true;  // caret blink while editing text
+    if (ImGui::IsAnyItemHovered())      return true;  // tooltip / widget hover animation
+    return false;
+}
+
 int main(int argc, char* argv[]) {
     signal(SIGINT,  scholion_signal_handler);
     signal(SIGTERM, scholion_signal_handler);
@@ -3877,7 +3992,15 @@ int main(int argc, char* argv[]) {
     PerformanceOverlay overlay;
     double last_frame_time = glfwGetTime();
 
-    printf("Scholion v0.5.0 — Milestones 1–10 complete\n");
+    // Event-driven render pacing. `next_wait` is how long the loop blocks for the
+    // next event; recomputed each frame (short when animating/interacting, long
+    // when idle). `sampling_fps` records whether the previous frame was a
+    // sustained-active frame, so the overlay ignores the huge delta of the first
+    // frame waking from idle. (Windows uses PollEvents+Sleep and ignores these.)
+    double next_wait    = 0.016;
+    bool   sampling_fps = false;
+
+    printf("Scholion " SCHOLION_VERSION "\n");
 #ifdef SCHOLION_HAVE_MUPDF
     printf("  MuPDF: enabled\n");
 #else
@@ -3972,14 +4095,18 @@ int main(int argc, char* argv[]) {
         glfwPollEvents();
         Sleep(g_settings.compat_mode ? 33 : 16);
 #else
-        glfwWaitEventsTimeout(g_settings.compat_mode ? 0.033 : 0.016);
+        // Idle when nothing is animating: block up to 0.5 s so CPU/GPU drop to
+        // near zero. A GLFW event or a worker's glfwPostEmptyEvent() returns
+        // immediately, so this adds no latency. next_wait is set at the end of
+        // the previous iteration by app_wants_animation().
+        glfwWaitEventsTimeout(next_wait);
 #endif
 
         // Per-frame timing for the performance overlay
         double now_t   = glfwGetTime();
         float  delta_t = static_cast<float>(now_t - last_frame_time);
         last_frame_time = now_t;
-        overlay.update(delta_t);
+        overlay.update(delta_t, sampling_fps);
 
         if (g_input.consume_overlay_toggle()) overlay.toggle();
 
@@ -4266,6 +4393,17 @@ int main(int argc, char* argv[]) {
         }
 
         glfwSwapBuffers(window);
+
+        // Decide how long to block for the next event. ImGui interaction queries
+        // (mouse/hover/text-input) are valid here — they reflect the frame just
+        // rendered. When active, keep the interactive cap; when idle, block long.
+        // sampling_fps carries this frame's active-ness to the next iteration so
+        // the overlay ignores the oversized delta of the first frame after idle.
+        {
+            bool active   = app_wants_animation();
+            next_wait     = active ? (g_settings.compat_mode ? 0.033 : 0.016) : 0.5;
+            sampling_fps  = active;
+        }
 
         // Exit the main loop if quit was confirmed
         if (g_quit_state == QuitState::Confirmed) {

@@ -16,7 +16,7 @@ Designed and built by @ARMMRDN (2026).
 |----------|--------|
 | macOS | Fully functional — universal binary (Apple Silicon + Intel) |
 | Windows | Fully functional — x64 MinGW build, bundled DLLs |
-| Linux | Not started |
+| Linux | Functional — x86_64 build (`Scholion-Linux.zip`) |
 
 ---
 
@@ -26,12 +26,13 @@ Designed and built by @ARMMRDN (2026).
 - Infinite pan and zoom — arrange pages from multiple PDFs in any layout
 - Color-coded document stacks with thread wires connecting related pages
 - Tile-based GPU rendering keeps the canvas smooth across 100+ pages at any zoom level
-- Page rotation in 90° increments; annotations persist through rotations
+- Event-driven rendering — idle CPU and battery use drop to near zero during long reading sessions (macOS/Linux)
+- Page rotation in 90° increments, plus 180° and reset; annotations persist through rotations
 - Full-text search (Cmd+F / Ctrl+F) with hit highlights on the canvas and in the sidebar
-- Text boxes — drag to size, style with color and font size, undo/redo
+- Text boxes — drag to size, style with color and font size, with an optional per-box "scale with zoom" so margin notes stay proportional to the page; undo/redo
 
 **Annotations** (applied in the sidebar panel)
-- Highlight — drag across text to capture the underlying characters
+- Highlighter — one swipe tool: swipe across text to capture the underlying characters into the References tab; swipe across a figure or blank region to leave a persistent translucent marker
 - Freehand pen
 - Note flags (A–Z, 2A–2Z…) stamped on pages, visible on canvas and in panel
 
@@ -56,6 +57,7 @@ Pre-built binaries are on the [Releases](../../releases) page.
 |----------|------|
 | macOS (universal) | `Scholion.dmg` |
 | Windows (x64) | `Scholion-Windows.zip` |
+| Linux (x86_64) | `Scholion-Linux.zip` |
 
 ---
 

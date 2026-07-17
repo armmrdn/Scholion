@@ -3,7 +3,10 @@
 
 #include "imgui.h"
 
-void PerformanceOverlay::update(float delta_time) {
+void PerformanceOverlay::update(float delta_time, bool active) {
+    m_idle = !active;
+    if (!active) return;  // idle-frame deltas are not representative; keep last FPS
+
     float inst = (delta_time > 1e-6f) ? (1.0f / delta_time) : 0.0f;
 
     m_fps_history[m_fps_head] = inst;
@@ -37,8 +40,12 @@ void PerformanceOverlay::draw(const Canvas& canvas) {
 
     if (ImGui::Begin("##perf_overlay", nullptr, flags)) {
         // --- Performance health dot ---
+        // When idle (event-driven, no work), show a neutral grey dot and "idle"
+        // rather than a red dot / low FPS: the app is intentionally not redrawing,
+        // which is healthy, not a performance problem.
         ImU32 dot_col;
-        if      (m_fps >= 50.0f) dot_col = IM_COL32( 80, 220, 100, 255);  // green
+        if      (m_idle)         dot_col = IM_COL32(120, 120, 130, 255);  // grey
+        else if (m_fps >= 50.0f) dot_col = IM_COL32( 80, 220, 100, 255);  // green
         else if (m_fps >= 30.0f) dot_col = IM_COL32(240, 190,  70, 255);  // amber
         else                     dot_col = IM_COL32(230,  80,  80, 255);  // red
 
@@ -49,7 +56,8 @@ void PerformanceOverlay::draw(const Canvas& canvas) {
         dl->AddCircleFilled(ImVec2(p.x + radius, p.y + line_h * 0.5f), radius, dot_col);
         ImGui::Dummy(ImVec2(radius * 2.0f, line_h));
         ImGui::SameLine(0.0f, 6.0f);
-        ImGui::Text("%.0f FPS", m_fps);
+        if (m_idle) ImGui::TextUnformatted("idle");
+        else        ImGui::Text("%.0f FPS", m_fps);
 
         ImGui::Text("%d/%d pages", m_pages_shown, m_pages_total);
         ImGui::Text("Zoom: %.0f%%", canvas.get_zoom_percentage());

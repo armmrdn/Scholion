@@ -37,6 +37,10 @@ static std::vector<RastResult> g_rast_ready;
 static std::unordered_set<std::string> g_rast_inflight;
 static std::atomic<bool>       g_rast_stop{false};
 static std::thread             g_rast_thread;
+// True only while the worker is inside rasterize_to_buffer(). Lets rast_pending()
+// report work-in-progress during the brief window when the active task is not in
+// any of the tracked collections (popped from the queue, not yet in ready).
+static std::atomic<bool>       g_rast_working{false};
 
 // Backpressure cap: worker pauses once this many completed tiles are queued.
 // 16 tiles * 256 KB = 4 MB max in the ready queue; uploading that per frame
@@ -70,6 +74,7 @@ static void rast_worker() {
             g_rast_inflight.erase(rast_key(task.doc_path, task.page_index, task.tier,
                                            task.tile_col, task.tile_row));
         }
+        g_rast_working.store(true, std::memory_order_release);
         auto buf = task.loader->rasterize_to_buffer(task.page_index, task.tier,
                                                      task.tile_col, task.tile_row);
         {
@@ -77,6 +82,7 @@ static void rast_worker() {
             g_rast_ready.push_back({task.doc_path, task.page_index, task.tier, std::move(buf),
                                     task.tile_col, task.tile_row});
         }
+        g_rast_working.store(false, std::memory_order_release);
         glfwPostEmptyEvent();
     }
 }
@@ -175,6 +181,12 @@ void enqueue_rast(const std::string& doc_path,
     g_rast_inflight.insert(key);
     g_rast_tasks.push_back({loader, doc_path, page_index, tier});
     g_rast_cv.notify_one();
+}
+
+bool rast_pending() {
+    if (g_rast_working.load(std::memory_order_acquire)) return true;
+    std::lock_guard<std::mutex> lk(g_rast_mutex);
+    return !g_rast_tasks.empty() || !g_rast_inflight.empty() || !g_rast_ready.empty();
 }
 
 bool drain_rast_results() {

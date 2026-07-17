@@ -55,10 +55,10 @@ cleanup is required before the repo goes public.
 - LOD strategy: adaptive tier selection based on available GPU memory
 - Texture caching: memory pooling or streaming from disk
 - Rendering: instancing, batched draw calls, reduced shader overhead
-- Frame timing: adaptive refresh, frame-skipping on idle
+- Frame timing: adaptive refresh, frame-skipping on idle — **done in v1.3** (event-driven render loop)
 - Input: reduce per-frame hit-testing cost on large canvases
 
-**Status:** research and measurement phase pending.
+**Status:** frame-timing/idle addressed in v1.3; rasterization/LOD/texture/rendering items still pending.
 
 ---
 
@@ -73,6 +73,30 @@ Requires either a simple NSIS/WiX installer step or a first-run registry write.
 ---
 
 ## Completed
+
+### ✓ Unified swipe highlighter — v1.3
+Highlight tool is now a freehand swipe: over text it snaps to glyphs and feeds the References
+tab; over non-text it leaves a persistent translucent marker. `AnnotStroke` gained `width`/`alpha`
+(serialized as `sw`/`sa`, back-compatible). Single tool replaces the old rectangle-drag.
+
+### ✓ Per-box zoom-scaling text — v1.3
+`CanvasTextBox.zoom_scaled` + a "Scale" toggle in the text property strip: font and box scale
+with canvas zoom while stored `w/h/font_size` stay canonical at 100%. Shared `text_box_layout()`
+drives draw, hover, and hit-test so they never diverge. Serialized as `zs` (back-compatible).
+
+### ✓ Page rotation 180° / reset — v1.3
+Added "Rotate 180°" and "Reset Rotation" to the page context menu; fixed `apply_page_rotation`
+to swap `world_w/h` only on odd 90° turns (the old unconditional swap was wrong for 180°/reset).
+
+### ✓ Event-driven render loop — v1.3
+Canvas renders on demand (`glfwWaitEventsTimeout` + worker `glfwPostEmptyEvent`) instead of
+continuously; idle CPU/GPU drop to near zero on macOS/Linux. Overlay shows an "idle" state.
+(Partial completion of the Performance item below — frame-timing/idle skipping.)
+
+### ✓ Tool-exclusion + light-mode fixes — v1.3
+Synchronous text-box hit-test (`text_box_at`) so a click on a box can't also start an annotation
+on the page beneath it; double-click-to-edit disarms any active annotation tool; References notes
+are readable in Light mode (edit box pins light text on its dark background; note text theme-aware).
 
 ### ✓ Linux port — v1.1
 `scholion-lnx/` build tree; CI job on `ubuntu-22.04`; `Scholion-Linux.zip` release asset.

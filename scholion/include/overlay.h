@@ -7,8 +7,12 @@ class Canvas;
 /// Toggled with F3.
 class PerformanceOverlay {
 public:
-    // Feed per-frame timing; maintains a rolling FPS average.
-    void update(float delta_time);
+    // Feed per-frame timing; maintains a rolling FPS average. `active` is false
+    // when the app is running event-driven idle frames (long inter-frame gaps):
+    // those deltas are not representative of render performance, so they are not
+    // sampled — the FPS reading freezes at its last interactive value and the
+    // overlay shows an "idle" state instead of a misleading low number.
+    void update(float delta_time, bool active);
 
     // Emit the ImGui window. Must be called inside an ImGui frame, before
     // ImGui::Render(). Reads zoom % from the canvas.
@@ -28,6 +32,7 @@ private:
     int   m_fps_head  = 0;
     int   m_fps_count = 0;
     float m_fps       = 0.0f;
+    bool  m_idle      = false;  // true when running event-driven idle frames
 
     int   m_pages_shown = 0;
     int   m_pages_total = 0;

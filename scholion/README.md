@@ -82,6 +82,7 @@ Selected pages show a blue outline. A translucent blue rectangle appears during 
 | Fan pages vertically | Lay all pages of the document in a vertical column |
 | Fan pages horizontally | Lay all pages in a horizontal row |
 | Stack pages | Reset all pages to the original diagonal fan layout |
+| Rotate CW / CCW / 180° / Reset | Rotate the page in 90°/180° steps, or reset to upright — annotations follow |
 | Reveal in Finder | Open containing folder in macOS Finder |
 
 ### Right-click on empty canvas
@@ -117,7 +118,7 @@ Click any page to open the panel viewer on the right side of the window.
 | Tool | Shortcut | Behavior |
 |------|----------|---------|
 | Pen | P | Freehand stroke on the active page |
-| Highlight | H | Drag to stamp a yellow highlight rectangle |
+| Highlight | H | Swipe across text to capture it into References; swipe across non-text to leave a persistent translucent marker |
 | Note / Flag | F | Stamp a sequentially-labeled flag (A, B … Z, 2A, 2B …) |
 | Eraser | — | Drag over strokes/highlights to erase them |
 
@@ -150,7 +151,9 @@ matching the pen). Style changes persist to every future box until changed.
 
 Editing the picker affects only the **selected** box; the changed style is then
 inherited by the next new box. A dragged box fixes its width (text wraps) and
-grows downward if the text overflows. Boxes — including size and color — are
+grows downward if the text overflows. A per-box **Scale** toggle in the property
+strip makes the box's text scale with zoom, so margin notes stay proportional to
+the page; boxes default to a fixed on-screen "sticky note" size. Boxes — including size and color — are
 saved in the `.scholion` project file. While a box is open, the usual copy/paste
 keys move text into and out of the field.
 
@@ -248,3 +251,4 @@ Panel UI        — Dear ImGui sidebar, annotation tools, resize handle
 - [x] M14 — Text & search (copy page text, Cmd+F full-text search, single-doc fit, panel nav)
 - [x] M15 — Status overlay + Cmd+S save (F3 overlay, zoom %, Cmd+S, save-on-quit; text-box ESC/style)
 - [x] M16 — UI polish: ESC tool deactivation, vignette toggle, flag cursor icon, flag removal by click, spacebar panel close, settings credits
+- [x] M17 — v1.3: unified swipe highlighter (glyph-lock → References + freehand markers), per-box zoom-scaling text, page rotation 180°/reset, event-driven render loop (near-zero idle CPU), tool-race + light-mode readability fixes

@@ -1,2 +1,2 @@
 #pragma once
-#define SCHOLION_VERSION "1.2"
+#define SCHOLION_VERSION "1.3"
