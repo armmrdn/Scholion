@@ -1,3 +1,10 @@
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/scholion_banner_black.png">
+    <img src="assets/scholion_banner.png" alt="Scholion — a PDF visualization tool by @armmrdn" width="760">
+  </picture>
+</p>
+
 # Scholion
 
 A canvas-style PDF workspace for research and deep reading. Open multiple PDFs, arrange their pages freely on an infinite GPU-accelerated canvas, annotate with highlights, pen strokes, and note flags, and save your entire layout as a project file. A side panel lets you read pages closely and browse all your captured highlights in one place — export them as HTML with a single click.
@@ -6,7 +13,9 @@ Designed and built by @ARMMRDN (2026).
 
 ---
 
-<img src="Scholion-SpeedRun.gif" width="100%">
+<p align="center">
+  <img src="assets/Scholion-demo.gif" width="100%" alt="Scholion demo">
+</p>
 
 ---
 
