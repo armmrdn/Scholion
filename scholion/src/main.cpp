@@ -760,8 +760,10 @@ static void mouse_button_callback(GLFWwindow* w, int button, int action, int mod
                 g_ann_drawing  = true;
                 g_ann_doc_idx  = doc_idx;
                 g_ann_page_idx = page->page_index;
-                if (g_annot_tool == AnnotTool::Pen || g_annot_tool == AnnotTool::Highlight) {
-                    // Pen and the unified highlighter both capture a freehand point path.
+                // Pen and the freehand highlighter capture a point path; the box highlighter
+                // (and eraser) just track the start/current corner via g_ann_hl_start/cur_norm.
+                if (g_annot_tool == AnnotTool::Pen ||
+                    (g_annot_tool == AnnotTool::Highlight && !g_hl_box_mode)) {
                     g_ann_cur_stroke = {};
                     if (g_annot_tool == AnnotTool::Pen) {
                         g_ann_cur_stroke.r = g_pen_r; g_ann_cur_stroke.g = g_pen_g; g_ann_cur_stroke.b = g_pen_b;
@@ -771,7 +773,7 @@ static void mouse_button_callback(GLFWwindow* w, int button, int action, int mod
                     }
                     g_ann_cur_stroke.pts.push_back(norm);
                 }
-                g_ann_hl_start = norm;   // eraser radius origin / legacy
+                g_ann_hl_start = norm;   // box highlighter / eraser radius origin
                 g_ann_cur_norm = norm;
             }
             return; // page owns this click — don't pass to InputHandler
@@ -830,15 +832,19 @@ static void mouse_button_callback(GLFWwindow* w, int button, int action, int mod
 static void cursor_pos_callback(GLFWwindow* w, double x, double y) {
     if (ImGui::GetIO().WantCaptureMouse) { g_input.clear_hover(); return; }
     g_input.on_cursor_move(w, x, y);
-    // Accumulate pen / highlighter-swipe points at mouse-move rate (smoother path).
+    // Accumulate pen / freehand-highlighter-swipe points at mouse-move rate (smoother path).
+    // Box-mode highlight tracks a rectangle instead (via g_ann_cur_norm), so it's excluded.
     if (g_ann_drawing && !s_panel_ann_active
-            && (g_annot_tool == AnnotTool::Pen || g_annot_tool == AnnotTool::Highlight)
+            && (g_annot_tool == AnnotTool::Pen ||
+                (g_annot_tool == AnnotTool::Highlight && !g_hl_box_mode))
             && g_ann_doc_idx >= 0 && g_ann_doc_idx < (int)g_documents.size()
             && g_ann_page_idx >= 0) {
+        bool ortho = (glfwGetKey(w, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS) ||
+                     (glfwGetKey(w, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
         const Document& doc = g_documents[g_ann_doc_idx];
         for (const auto& pg : doc.pages) {
             if (pg.page_index == g_ann_page_idx) {
-                g_ann_cur_stroke.pts.push_back(screen_to_page_norm(pg, (float)x, (float)y));
+                stroke_add_point(pg, screen_to_page_norm(pg, (float)x, (float)y), ortho);
                 break;
             }
         }
@@ -2809,7 +2815,8 @@ static void draw_panel_ui() {
                 g_ann_doc_idx      = doc_idx;
                 g_ann_page_idx     = pi;
                 s_panel_ann_active = true;
-                if (g_annot_tool == AnnotTool::Pen || g_annot_tool == AnnotTool::Highlight) {
+                if (g_annot_tool == AnnotTool::Pen ||
+                    (g_annot_tool == AnnotTool::Highlight && !g_hl_box_mode)) {
                     g_ann_cur_stroke = {};
                     if (g_annot_tool == AnnotTool::Pen) {
                         g_ann_cur_stroke.r = g_pen_r; g_ann_cur_stroke.g = g_pen_g; g_ann_cur_stroke.b = g_pen_b;
@@ -2825,9 +2832,10 @@ static void draw_panel_ui() {
 
             if (g_ann_drawing && s_panel_ann_active &&
                     g_ann_doc_idx == doc_idx && g_ann_page_idx == pi) {
-                if ((g_annot_tool == AnnotTool::Pen || g_annot_tool == AnnotTool::Highlight)
+                if ((g_annot_tool == AnnotTool::Pen ||
+                     (g_annot_tool == AnnotTool::Highlight && !g_hl_box_mode))
                         && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-                    g_ann_cur_stroke.pts.push_back(pnorm);
+                    stroke_add_point(page, pnorm, ImGui::GetIO().KeyShift);  // Shift = ortho-lock
                     const auto& pts = g_ann_cur_stroke.pts;
                     bool  hlt   = (g_annot_tool == AnnotTool::Highlight);
                     ImU32 col   = hlt
@@ -2839,6 +2847,15 @@ static void draw_panel_ui() {
                         ImVec2 b = {img_pos.x + pts[si  ].x * img_w, img_pos.y + pts[si  ].y * img_h};
                         dl->AddLine(a, b, col, thick);
                     }
+                } else if (g_annot_tool == AnnotTool::Highlight && g_hl_box_mode) {
+                    // Box mode — track the rectangle and preview it in yellow.
+                    g_ann_cur_norm = pnorm;
+                    float x0 = std::min(g_ann_hl_start.x, pnorm.x), y0 = std::min(g_ann_hl_start.y, pnorm.y);
+                    float x1 = std::max(g_ann_hl_start.x, pnorm.x), y1 = std::max(g_ann_hl_start.y, pnorm.y);
+                    dl->AddRectFilled(
+                        {img_pos.x + x0 * img_w, img_pos.y + y0 * img_h},
+                        {img_pos.x + x1 * img_w, img_pos.y + y1 * img_h},
+                        IM_COL32(255, 224, 0, 80));
                 }
                 if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
                     s_panel_ann_active = false;
@@ -3455,11 +3472,21 @@ static void draw_toolbar_ui() {
             ImGui::SetItemTooltip("Pen color");
         }
         if (show_hl_props) {
-            float hcol[3] = {g_hl_r, g_hl_g, g_hl_b};
-            if (ImGui::ColorEdit3("##hlcolor", hcol,
-                    ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
-                { g_hl_r = hcol[0]; g_hl_g = hcol[1]; g_hl_b = hcol[2]; }
-            ImGui::SetItemTooltip("Highlighter color (freehand marks; text highlights stay yellow)");
+            // Mode: Box (rectangle drag — most reliable glyph capture) vs Freehand (swipe marker).
+            if (ImGui::RadioButton("Box", g_hl_box_mode)) g_hl_box_mode = true;
+            ImGui::SetItemTooltip("Drag a rectangle over text to capture it; over non-text leaves a yellow highlight");
+            ImGui::SameLine();
+            if (ImGui::RadioButton("Freehand", !g_hl_box_mode)) g_hl_box_mode = false;
+            ImGui::SetItemTooltip("Swipe like a marker; captures text it covers, leaves a mark on non-text");
+            // Colour applies to freehand marks only (box/text highlights are always yellow).
+            if (!g_hl_box_mode) {
+                ImGui::SameLine();
+                float hcol[3] = {g_hl_r, g_hl_g, g_hl_b};
+                if (ImGui::ColorEdit3("##hlcolor", hcol,
+                        ImGuiColorEditFlags_NoInputs | ImGuiColorEditFlags_NoLabel))
+                    { g_hl_r = hcol[0]; g_hl_g = hcol[1]; g_hl_b = hcol[2]; }
+                ImGui::SetItemTooltip("Freehand marker color");
+            }
         }
         if (show_text_props) {
             float tcol[3] = {g_tbox_r, g_tbox_g, g_tbox_b};

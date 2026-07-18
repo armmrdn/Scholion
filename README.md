@@ -41,8 +41,8 @@ Designed and built by @ARMMRDN (2026).
 - Text boxes — drag to size, style with color and font size, with an optional per-box "scale with zoom" so margin notes stay proportional to the page; undo/redo
 
 **Annotations** (applied in the sidebar panel)
-- Highlighter — one swipe tool: swipe across text to capture the underlying characters into the References tab; swipe across a figure or blank region to leave a persistent translucent marker
-- Freehand pen
+- Highlighter — two modes (toolbar toggle): **Box** drags a rectangle to reliably capture text into the References tab; **Freehand** swipes like a marker. Both capture the text they cover; over non-text, Box leaves a highlight rectangle and Freehand a persistent translucent marker
+- Freehand pen — hold **Shift** while drawing to lock the line perfectly straight (snaps to 45°)
 - Note flags (A–Z, 2A–2Z…) stamped on pages, visible on canvas and in panel
 
 **Sidebar Panel**

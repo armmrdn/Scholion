@@ -74,10 +74,16 @@ Requires either a simple NSIS/WiX installer step or a first-run registry write.
 
 ## Completed
 
-### ✓ Unified swipe highlighter — v1.3
-Highlight tool is now a freehand swipe: over text it snaps to glyphs and feeds the References
-tab; over non-text it leaves a persistent translucent marker. `AnnotStroke` gained `width`/`alpha`
-(serialized as `sw`/`sa`, back-compatible). Single tool replaces the old rectangle-drag.
+### ✓ Highlighter Box/Freehand modes — v1.3
+Highlighter has a toolbar mode toggle (`g_hl_box_mode`, default Box). Box = rectangle drag;
+Freehand = marker swipe. BOTH capture glyphs via center-in-AABB (reliable) → References. Non-text:
+Box → plain highlight rect, Freehand → translucent marker stroke. `AnnotStroke` gained
+`width`/`alpha` (serialized `sw`/`sa`, back-compatible) for the marker.
+
+### ✓ Pen ortho-lock (Shift = straight line) — v1.3
+Holding Shift while drawing collapses the stroke to a straight segment from its start, snapped to
+the nearest 45° in world-aspect space. Shared `stroke_add_point()` helper; applies to pen + freehand
+highlighter. No serialization change.
 
 ### ✓ Per-box zoom-scaling text — v1.3
 `CanvasTextBox.zoom_scaled` + a "Scale" toggle in the text property strip: font and box scale

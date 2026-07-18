@@ -90,6 +90,8 @@ Modifier is Cmd on macOS / Ctrl elsewhere unless noted (Cmd+A is Super-only toda
 | Tool | Behaviour |
 |---|---|
 | Pen / Highlight / Flag / Erase | Draw on the page open in the panel |
+| Shift (while drawing Pen or Freehand highlight) | Lock the stroke to a straight line, snapped to nearest 45° |
+| Highlighter Box / Freehand toggle | Box = rectangle drag (reliable glyph capture); Freehand = marker swipe (toolbar property strip) |
 
 **Project & undo**
 | Action | Binding |

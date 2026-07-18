@@ -117,11 +117,15 @@ Click any page to open the panel viewer on the right side of the window.
 
 | Tool | Shortcut | Behavior |
 |------|----------|---------|
-| Pen | P | Freehand stroke on the active page |
-| Highlight | H | Swipe across text to capture it into References; swipe across non-text to leave a persistent translucent marker |
+| Pen | P | Freehand stroke on the active page; hold **Shift** to lock the line straight (snaps to 45°) |
+| Highlight | H | Two modes via toolbar toggle: **Box** drags a rectangle to reliably capture text into References; **Freehand** swipes like a marker. Both capture the text they cover; over non-text, Box leaves a highlight rectangle and Freehand a persistent translucent marker |
 | Note / Flag | F | Stamp a sequentially-labeled flag (A, B … Z, 2A, 2B …) |
 | Eraser | — | Drag over strokes/highlights to erase them |
 
+- Hold **Shift** while drawing with the pen (or the Freehand highlighter) to lock the line
+  straight, snapped to the nearest 45° (horizontal, vertical, or diagonal); release to resume freehand.
+- The highlighter's **Box / Freehand** toggle and the Freehand marker color live in the toolbar
+  property strip (text highlights are always yellow).
 - While Note tool is active, a flag icon follows the cursor.
 - Clicking an existing flag badge in the panel removes it (Cmd+Z to undo).
 - Escape deactivates the active tool.
@@ -251,4 +255,4 @@ Panel UI        — Dear ImGui sidebar, annotation tools, resize handle
 - [x] M14 — Text & search (copy page text, Cmd+F full-text search, single-doc fit, panel nav)
 - [x] M15 — Status overlay + Cmd+S save (F3 overlay, zoom %, Cmd+S, save-on-quit; text-box ESC/style)
 - [x] M16 — UI polish: ESC tool deactivation, vignette toggle, flag cursor icon, flag removal by click, spacebar panel close, settings credits
-- [x] M17 — v1.3: unified swipe highlighter (glyph-lock → References + freehand markers), per-box zoom-scaling text, page rotation 180°/reset, event-driven render loop (near-zero idle CPU), tool-race + light-mode readability fixes
+- [x] M17 — v1.3: highlighter Box/Freehand modes (glyph-lock → References + freehand markers), pen Shift ortho-lock (45° straight lines), per-box zoom-scaling text, page rotation 180°/reset, event-driven render loop (near-zero idle CPU), tool-race + light-mode readability fixes

@@ -1,8 +1,11 @@
 ## Scholion v1.3
 
 ### //Highlighter
-- The highlighter is now a single unified tool driven by a freehand swipe. Swipe across text and it locks onto the underlying glyphs, capturing the text into the References tab as before. Swipe across a figure, chart, or any non-text region and it leaves a persistent translucent marker so non-text content can be highlighted too.
-- Highlighter color picker added to the tool property strip (applies to freehand marks; text highlights stay yellow).
+- The highlighter now has two modes, selectable in its toolbar property strip. **Box** (default) drags a rectangle over text to capture it into the References tab — the most reliable way to grab glyphs. **Freehand** swipes like a marker. Both modes capture the text they cover; where the gesture covers no text, Box leaves a plain highlight rectangle and Freehand leaves a persistent translucent marker, so figures, charts, and other non-text content can be highlighted too.
+- Freehand marker color picker in the property strip (text highlights stay yellow either way).
+
+### //Pen
+- Hold **Shift** while drawing to lock the stroke to a straight line, snapped to the nearest 45° (horizontal, vertical, or diagonal). Release Shift to resume freehand. The freehand highlighter honors it too.
 
 ### //Text Boxes
 - Text boxes can now scale with zoom. A per-box "Scale" toggle in the text tool's property strip makes a box's text stay proportional to the page as you zoom, for margin notes that belong to the document. Existing boxes keep their fixed on-screen "sticky note" size by default.

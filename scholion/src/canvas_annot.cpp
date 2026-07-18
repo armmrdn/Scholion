@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <climits>
+#include <cmath>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,7 @@ AnnotTool   g_annot_tool    = AnnotTool::None;
 bool        g_ann_drawing   = false;
 float       g_pen_r = 0.82f, g_pen_g = 0.06f, g_pen_b = 0.06f;
 float       g_hl_r = 1.0f, g_hl_g = 0.85f, g_hl_b = 0.0f;   // highlighter yellow
+bool        g_hl_box_mode = true;   // true = rectangle drag (reliable glyph capture); false = swipe
 int         g_ann_doc_idx   = -1;
 int         g_ann_page_idx  = -1;
 AnnotStroke g_ann_cur_stroke;
@@ -24,6 +26,28 @@ int         g_next_note_idx = 0;
 std::vector<RefNote> g_ref_notes;
 
 // --- Helpers -----------------------------------------------------------------
+
+void stroke_add_point(const Page& page, Vec2 norm, bool ortho) {
+    if (ortho && !g_ann_cur_stroke.pts.empty()) {
+        // Shift ortho-lock: collapse the stroke to a straight segment from its start to the
+        // cursor, snapped to the nearest 45°. Snap in world-aspect space (delta scaled by the
+        // page's world size) so diagonals are visually 45° on non-square pages, then convert
+        // the snapped endpoint back to page-normalized coords.
+        Vec2  s  = g_ann_cur_stroke.pts.front();
+        float ww = (page.world_w > 1e-3f) ? page.world_w : 1.0f;
+        float wh = (page.world_h > 1e-3f) ? page.world_h : 1.0f;
+        float dwx = (norm.x - s.x) * ww, dwy = (norm.y - s.y) * wh;
+        float len = std::sqrt(dwx * dwx + dwy * dwy);
+        constexpr float STEP = 0.78539816339f;  // 45° in radians
+        float ang = std::round(std::atan2(dwy, dwx) / STEP) * STEP;
+        Vec2 end = { s.x + std::cos(ang) * len / ww,
+                     s.y + std::sin(ang) * len / wh };
+        g_ann_cur_stroke.pts.resize(1);          // keep only the start point
+        g_ann_cur_stroke.pts.push_back(end);
+    } else {
+        g_ann_cur_stroke.pts.push_back(norm);
+    }
+}
 
 std::string note_label(int idx) {
     int  prefix = idx / 26;
@@ -91,31 +115,30 @@ void finalize_annotation() {
         }
         g_ann_cur_stroke = {};
     } else if (g_annot_tool == AnnotTool::Highlight) {
-        // Unified highlighter: a freehand swipe. If it covers text glyphs, snap to a clean
-        // glyph-locked highlight (→ References). If not, keep it as a persistent translucent
-        // marker stroke so non-text content can be highlighted too.
+        // Two modes (g_hl_box_mode): Box drags a rectangle; Freehand swipes a marker line.
+        // BOTH capture glyphs by center-in-AABB (reliable) → a glyph-locked highlight fed to
+        // References. When no glyphs are covered, Box leaves a plain highlight rectangle and
+        // Freehand leaves a persistent translucent marker stroke.
         const auto& pts = g_ann_cur_stroke.pts;
-        if (pts.size() >= 2) {
-            // Swipe coverage = AABB of the stroke path (D3 refines this to a per-point band).
-            float ax0 = pts[0].x, ay0 = pts[0].y, ax1 = pts[0].x, ay1 = pts[0].y;
+        float ax0, ay0, ax1, ay1;
+        bool  have_region = false;
+        if (g_hl_box_mode) {
+            ax0 = std::min(g_ann_hl_start.x, g_ann_cur_norm.x);
+            ay0 = std::min(g_ann_hl_start.y, g_ann_cur_norm.y);
+            ax1 = std::max(g_ann_hl_start.x, g_ann_cur_norm.x);
+            ay1 = std::max(g_ann_hl_start.y, g_ann_cur_norm.y);
+            have_region = (ax1 > ax0 && ay1 > ay0);
+        } else if (pts.size() >= 2) {
+            ax0 = ax1 = pts[0].x; ay0 = ay1 = pts[0].y;
             for (const auto& p : pts) {
                 ax0 = std::min(ax0, p.x); ay0 = std::min(ay0, p.y);
                 ax1 = std::max(ax1, p.x); ay1 = std::max(ay1, p.y);
             }
-            // Select glyphs whose center falls within a band around the swipe polyline
-            // (not merely its AABB), so a diagonal or wobbly swipe follows the line(s) it
-            // actually crosses instead of grabbing everything in the bounding box.
-            // BAND is normalized page units (~0.015 ≈ a line's worth on a Letter page);
-            // tune if a swipe grabs too much/little.
-            constexpr float BAND = 0.015f;
-            auto pt_seg_d2 = [](float px, float py, const Vec2& a, const Vec2& b) -> float {
-                float vx = b.x - a.x, vy = b.y - a.y;
-                float len2 = vx*vx + vy*vy;
-                float t = (len2 > 1e-9f)
-                          ? std::clamp(((px-a.x)*vx + (py-a.y)*vy) / len2, 0.0f, 1.0f) : 0.0f;
-                float dx = px - (a.x + t*vx), dy = py - (a.y + t*vy);
-                return dx*dx + dy*dy;
-            };
+            have_region = true;
+        }
+
+        if (have_region) {
+            // Glyph capture (both modes): center-in-AABB — forgiving, reliable for text.
             std::vector<const CharQuad*> sel;
             auto* loader = (g_ann_doc_idx >= 0 && g_ann_doc_idx < (int)g_loaders.size())
                            ? g_loaders[g_ann_doc_idx].get() : nullptr;
@@ -124,16 +147,12 @@ void finalize_annotation() {
                 sel.reserve(quads.size());
                 for (const auto& q : quads) {
                     float cx = (q.x0 + q.x1) * 0.5f, cy = (q.y0 + q.y1) * 0.5f;
-                    if (cx < ax0 - BAND || cx > ax1 + BAND ||
-                        cy < ay0 - BAND || cy > ay1 + BAND) continue;   // cheap AABB pre-filter
-                    float best = 1e9f;
-                    for (size_t i = 1; i < pts.size(); ++i)
-                        best = std::min(best, pt_seg_d2(cx, cy, pts[i-1], pts[i]));
-                    if (best <= BAND * BAND) sel.push_back(&q);
+                    if (cx >= ax0 && cx <= ax1 && cy >= ay0 && cy <= ay1)
+                        sel.push_back(&q);
                 }
             }
             if (!sel.empty()) {
-                // Text: clean glyph-locked highlight + extracted text.
+                // Text: clean glyph-locked highlight + extracted text (→ References).
                 std::sort(sel.begin(), sel.end(),
                           [](const CharQuad* a, const CharQuad* b){ return a->order < b->order; });
                 AnnotHighlight hl;
@@ -152,8 +171,17 @@ void finalize_annotation() {
                 r.type = UndoRecord::Type::Highlight;
                 r.doc_idx = g_ann_doc_idx; r.page_idx = g_ann_page_idx;
                 push_undo(r);
+            } else if (g_hl_box_mode) {
+                // Box over non-text → plain visual highlight rectangle (no References entry).
+                AnnotHighlight hl;
+                hl.x0 = ax0; hl.y0 = ay0; hl.x1 = ax1; hl.y1 = ay1;   // text stays empty
+                fpage.annots.highlights.push_back(hl);
+                UndoRecord r;
+                r.type = UndoRecord::Type::Highlight;
+                r.doc_idx = g_ann_doc_idx; r.page_idx = g_ann_page_idx;
+                push_undo(r);
             } else {
-                // Non-text: persistent translucent freehand marker (rides the stroke path).
+                // Freehand over non-text → persistent translucent marker (rides the stroke path).
                 g_ann_cur_stroke.width = MARKER_HALF_W;
                 g_ann_cur_stroke.alpha = MARKER_ALPHA;
                 fpage.annots.strokes.push_back(std::move(g_ann_cur_stroke));
@@ -192,18 +220,31 @@ void draw_canvas_annotation_preview() {
                 IM_COL32((int)(g_pen_r*255),(int)(g_pen_g*255),(int)(g_pen_b*255),220), 2.0f);
         }
     } else if (g_annot_tool == AnnotTool::Highlight) {
-        // Freehand swipe preview — thick translucent line in the highlighter colour.
-        const auto& pts = g_ann_cur_stroke.pts;
         ImU32 col = IM_COL32((int)(g_hl_r*255), (int)(g_hl_g*255), (int)(g_hl_b*255),
                              (int)(MARKER_ALPHA*255));
-        for (int i = 1; i < (int)pts.size(); ++i) {
-            Vec2 aw = {page->world_pos.x + pts[i-1].x * page->world_w,
-                       page->world_pos.y + pts[i-1].y * page->world_h};
-            Vec2 bw = {page->world_pos.x + pts[i].x   * page->world_w,
-                       page->world_pos.y + pts[i].y   * page->world_h};
-            Vec2 as = g_canvas.world_to_screen(aw);
-            Vec2 bs = g_canvas.world_to_screen(bw);
-            dl->AddLine({as.x, as.y}, {bs.x, bs.y}, col, MARKER_HALF_W * 2.0f);
+        if (g_hl_box_mode) {
+            // Box preview — yellow rectangle from the drag corners.
+            float x0 = std::min(g_ann_hl_start.x, g_ann_cur_norm.x);
+            float y0 = std::min(g_ann_hl_start.y, g_ann_cur_norm.y);
+            float x1 = std::max(g_ann_hl_start.x, g_ann_cur_norm.x);
+            float y1 = std::max(g_ann_hl_start.y, g_ann_cur_norm.y);
+            Vec2 tlw = {page->world_pos.x + x0 * page->world_w, page->world_pos.y + y0 * page->world_h};
+            Vec2 brw = {page->world_pos.x + x1 * page->world_w, page->world_pos.y + y1 * page->world_h};
+            Vec2 tls = g_canvas.world_to_screen(tlw);
+            Vec2 brs = g_canvas.world_to_screen(brw);
+            dl->AddRectFilled({tls.x, tls.y}, {brs.x, brs.y}, IM_COL32(255, 224, 0, 80));
+        } else {
+            // Freehand swipe preview — thick translucent line in the highlighter colour.
+            const auto& pts = g_ann_cur_stroke.pts;
+            for (int i = 1; i < (int)pts.size(); ++i) {
+                Vec2 aw = {page->world_pos.x + pts[i-1].x * page->world_w,
+                           page->world_pos.y + pts[i-1].y * page->world_h};
+                Vec2 bw = {page->world_pos.x + pts[i].x   * page->world_w,
+                           page->world_pos.y + pts[i].y   * page->world_h};
+                Vec2 as = g_canvas.world_to_screen(aw);
+                Vec2 bs = g_canvas.world_to_screen(bw);
+                dl->AddLine({as.x, as.y}, {bs.x, bs.y}, col, MARKER_HALF_W * 2.0f);
+            }
         }
     }
 }
