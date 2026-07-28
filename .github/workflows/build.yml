@@ -105,30 +105,29 @@ jobs:
         run: |
           lipo -info scholion/build/Scholion.app/Contents/MacOS/Scholion
 
-      # The .app is fully linked by now, so the build intermediates (universal object
-      # files for two arches + the CMake tree) are dead weight. Dropping them frees the
-      # scratch space hdiutil needs to create the DMG on the ~14 GB macOS runner
-      # (the "No space left on device" failure).
-      - name: Free disk space before DMG
-        run: |
-          echo "Before cleanup:"; df -h / | tail -1
-          # Move the finished .app out of the build tree, then nuke the tree.
-          mv scholion/build/Scholion.app "$RUNNER_TEMP/Scholion.app"
-          rm -rf scholion/build
-          mkdir -p scholion/build
-          mv "$RUNNER_TEMP/Scholion.app" scholion/build/Scholion.app
-          echo "After cleanup:";  df -h / | tail -1
-
       - name: Create DMG
         run: |
           mkdir -p scholion/build/dmg_stage
           cp -R scholion/build/Scholion.app scholion/build/dmg_stage/
           ln -s /Applications scholion/build/dmg_stage/Applications
+          # The prior failure was NOT the runner disk (root had ~39 GB free) — it was
+          # hdiutil auto-sizing the DMG's internal volume too small for the app, so the
+          # copy overflowed /Volumes/Scholion. Two-step, explicitly sized so it can't
+          # underestimate: build a read-write image big enough for the staged content
+          # plus a generous margin, then convert it to a compressed read-only DMG.
+          SIZE_MB=$(( $(du -sm scholion/build/dmg_stage | cut -f1) + 250 ))
+          echo "Staged content + margin = ${SIZE_MB} MB"
           hdiutil create \
             -volname "Scholion" \
             -srcfolder scholion/build/dmg_stage \
-            -ov -format UDZO \
-            scholion/build/Scholion.dmg
+            -fs HFS+ \
+            -format UDRW \
+            -size ${SIZE_MB}m \
+            -ov scholion/build/Scholion.rw.dmg
+          hdiutil convert scholion/build/Scholion.rw.dmg \
+            -format UDZO -imagekey zlib-level=9 \
+            -ov -o scholion/build/Scholion.dmg
+          rm -f scholion/build/Scholion.rw.dmg
 
       - name: Create draft release with DMG
         if: startsWith(github.ref, 'refs/tags/v')
