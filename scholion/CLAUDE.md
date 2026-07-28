@@ -205,9 +205,20 @@ Single workflow: `.github/workflows/build.yml`
 
 No `actions/upload-artifact` is used — artifacts go directly to the GitHub release draft, avoiding the storage quota entirely.
 
+**RELEASE_NOTES.md convention:** this file presents a **complete, self-contained picture of the
+product AT the current version** — NOT a detached delta of upgrades/fixes that only makes sense to
+someone who tracked the prior version. Grouped under stable `//`-prefixed category headers
+(`### //Tools` with **bold sub-groups** like **Pen**/**Highlighter**/**Text Boxes**, `### //Canvas`,
+`### //Sidebar Viewer & References`, `### //UI`, `### //<platform>`, and `### //Bug Fixes` last).
+Keyboard keys in **bold**. Use **contextual language** that reads as an update while also explaining
+what the feature does / the problem it solves — e.g. *"The pen tool now writes on the canvas as well
+as pages, with marks locking to the surface their origin is on,"* not the bare *"Added canvas pen
+strokes."* Do NOT stack prior versions in the file. When cutting a new version, truncate and rewrite
+the full snapshot; older releases keep their own notes on their GitHub release pages.
+
 **Cutting a release:**
 ```bash
-# 1. Update RELEASE_NOTES.md, commit, push to main
+# 1. Update RELEASE_NOTES.md (truncate to just this version), bump version.h, commit, push to main
 git push origin main
 
 # 2. Create a version tag via the GitHub API

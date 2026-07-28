@@ -28,6 +28,8 @@ extern float                                     g_content_scale;
 extern AppSettings                               g_settings;
 extern std::vector<CanvasTextBox>                g_text_boxes;
 extern int                                       g_next_box_id;
+extern std::vector<PageGroup>                    g_groups;
+extern int                                       g_next_group_id;
 extern bool                                      g_debug;
 extern GLFWwindow*                               g_window;
 extern float                                     g_panel_w;

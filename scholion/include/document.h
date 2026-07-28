@@ -73,6 +73,9 @@ struct AnnotHighlight {
     float x0 = 0.0f, y0 = 0.0f;
     float x1 = 0.0f, y1 = 0.0f;
     std::string text;
+    // Research note attached to this reference (empty = none). Stored on the highlight
+    // itself so it can never mis-key or orphan — it moves and deletes with the highlight.
+    std::string note;
 };
 
 /// A note flag stamped on a page. Label follows A–Z, then 2A–2Z, 3A–3Z, …
@@ -97,6 +100,7 @@ struct Page {
     float world_w    = 0.0f;        // derived from PDF media box (points → world units)
     float world_h    = 0.0f;
     int   rotation   = 0;           // clockwise degrees: 0, 90, 180, 270
+    int   group_id   = 0;           // ad-hoc page group; 0 = ungrouped (see PageGroup)
 
     PageAnnotations annots;          // persistent highlights and pen strokes
 
@@ -152,11 +156,40 @@ struct Document {
     // reference and annotations survive a re-save and indices stay aligned.
     bool missing = false;
 
+    // True when the PDF opened but is password-protected / encrypted and can't be
+    // rendered without authentication. Shown as a distinct placeholder page. Re-derived
+    // on every load (not persisted) — a single placeholder page stands in for the doc.
+    bool locked = false;
+
     // Thread visibility: toggled from the Open Documents list in the References tab.
     bool show_threads = false;
 };
 
+// --- Page group (ad-hoc cross-document cluster) -----------------------------
+
+/// A temporary, nondestructive grouping of pages — possibly drawn from several
+/// different documents — so they can be framed and moved together as a unit.
+/// Membership lives on each Page as `group_id`; this table only holds the
+/// group's identity and appearance. Ungrouping just clears the members'
+/// group_id (their document, position, and annotations are untouched), so the
+/// grouping never alters the underlying documents.
+struct PageGroup {
+    int         id = 0;                            // matches Page::group_id; 0 is never a real group
+    std::string name;                              // optional label shown on the frame
+    float       col_r = 0.63f, col_g = 0.32f, col_b = 0.75f;  // frame + label color
+};
+
 inline constexpr float PAGE_FAN_OFFSET = 20.0f;  // world-unit diagonal offset per page in a fan
+
+// Palette cycled per page group so successive groups are visually distinct.
+inline constexpr float GROUP_PALETTE[5][3] = {
+    {0.63f, 0.32f, 0.75f},   // violet
+    {0.20f, 0.60f, 0.58f},   // teal
+    {0.85f, 0.52f, 0.20f},   // amber
+    {0.30f, 0.58f, 0.30f},   // green
+    {0.78f, 0.32f, 0.44f},   // rose
+};
+inline constexpr int GROUP_PALETTE_SIZE = 5;
 
 // Color palette cycled per document (hue stripe, selection tint, etc.)
 inline constexpr float DOC_PALETTE[5][3] = {

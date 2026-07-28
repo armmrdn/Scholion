@@ -23,7 +23,8 @@ AnnotStroke g_ann_cur_stroke;
 Vec2        g_ann_hl_start  = {};
 Vec2        g_ann_cur_norm  = {};
 int         g_next_note_idx = 0;
-std::vector<RefNote> g_ref_notes;
+std::vector<AnnotStroke> g_canvas_strokes;
+bool        g_ann_canvas = false;
 
 // --- Helpers -----------------------------------------------------------------
 
@@ -46,6 +47,21 @@ void stroke_add_point(const Page& page, Vec2 norm, bool ortho) {
         g_ann_cur_stroke.pts.push_back(end);
     } else {
         g_ann_cur_stroke.pts.push_back(norm);
+    }
+}
+
+void stroke_add_point_world(Vec2 world, bool ortho) {
+    // Canvas strokes live in world space (uniform aspect), so ortho snaps directly.
+    if (ortho && !g_ann_cur_stroke.pts.empty()) {
+        Vec2 s = g_ann_cur_stroke.pts.front();
+        float dx = world.x - s.x, dy = world.y - s.y;
+        float len = std::sqrt(dx * dx + dy * dy);
+        constexpr float STEP = 0.78539816339f;  // 45°
+        float ang = std::round(std::atan2(dy, dx) / STEP) * STEP;
+        g_ann_cur_stroke.pts.resize(1);
+        g_ann_cur_stroke.pts.push_back({ s.x + std::cos(ang) * len, s.y + std::sin(ang) * len });
+    } else {
+        g_ann_cur_stroke.pts.push_back(world);
     }
 }
 
@@ -95,6 +111,18 @@ Vec2 screen_to_page_norm(const Page& page, float sx, float sy) {
 // --- Annotation finalization -------------------------------------------------
 
 void finalize_annotation() {
+    // Canvas (world-space) pen stroke: commit to the global list, no page involved.
+    if (g_ann_canvas) {
+        if (g_ann_cur_stroke.pts.size() >= 2) {
+            g_canvas_strokes.push_back(std::move(g_ann_cur_stroke));
+            UndoRecord r; r.type = UndoRecord::Type::CanvasStroke;
+            push_undo(r);
+        }
+        g_ann_cur_stroke = {};
+        g_ann_canvas = false;
+        g_ann_drawing = false;
+        return;
+    }
     if (g_ann_doc_idx < 0 || g_ann_doc_idx >= (int)g_documents.size()) {
         g_ann_drawing = false; return;
     }
@@ -162,9 +190,9 @@ void finalize_annotation() {
                     hl.x0 = std::min(hl.x0, q->x0); hl.y0 = std::min(hl.y0, q->y0);
                     hl.x1 = std::max(hl.x1, q->x1); hl.y1 = std::max(hl.y1, q->y1);
                     text += q->utf8;
-                    if (q->line_end) text += ' ';
+                    if (q->line_end) text += '\n';   // preserve the PDF's line structure
                 }
-                while (!text.empty() && text.back() == ' ') text.pop_back();
+                while (!text.empty() && (text.back() == ' ' || text.back() == '\n')) text.pop_back();
                 hl.text = std::move(text);
                 fpage.annots.highlights.push_back(hl);
                 UndoRecord r;

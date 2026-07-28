@@ -36,24 +36,27 @@ Designed and built by @ARMMRDN (2026).
 - Color-coded document stacks with thread wires connecting related pages
 - Tile-based GPU rendering keeps the canvas smooth across 100+ pages at any zoom level
 - Event-driven rendering — idle CPU and battery use drop to near zero during long reading sessions (macOS/Linux)
-- Page rotation in 90° increments, plus 180° and reset; annotations persist through rotations
+- Page rotation in 90° clockwise steps (repeat for any orientation); annotations persist through rotations
 - Full-text search (Cmd+F / Ctrl+F) with hit highlights on the canvas and in the sidebar
 - Text boxes — drag to size, style with color and font size, with an optional per-box "scale with zoom" so margin notes stay proportional to the page; undo/redo
+- Normalize an under- or over-sized document or image to the standard page size on the canvas (right-click → Normalize Size)
 
-**Annotations** (applied in the sidebar panel)
+**Annotations** (on pages, and on the canvas)
 - Highlighter — two modes (toolbar toggle): **Box** drags a rectangle to reliably capture text into the References tab; **Freehand** swipes like a marker. Both capture the text they cover; over non-text, Box leaves a highlight rectangle and Freehand a persistent translucent marker
-- Freehand pen — hold **Shift** while drawing to lock the line perfectly straight (snaps to 45°)
+- Freehand pen — draw on a page, or directly on the empty canvas (canvas marks stay locked to the canvas, in front of everything); hold **Shift** to lock the line straight (snaps to 45°)
 - Note flags (A–Z, 2A–2Z…) stamped on pages, visible on canvas and in panel
 
 **Sidebar Panel**
 - **Viewer tab** — page-by-page view of the open document with page navigation
-- **References tab** — all text highlights from every document collected in one list, exportable as a standalone HTML file
-- Open Documents list — toggle thread visibility per document; double-click to reveal in Finder or re-link a missing file
+- **References tab** — all text highlights collected in one list; expand any reference to read its full passage (line breaks preserved); exportable as a standalone HTML file
+- Open Documents list — always shown at the bottom; toggle a document's threads (they take that document's color); double-click to reveal in Finder or re-link a missing file
 - Edge tabs on the right side of the canvas open the panel without taking up canvas space
 
 **Project Files**
-- Save and restore full canvas layouts as `.scholion` JSON files
-- Autosave every 60 seconds
+- Save and restore full canvas layouts as `.scholion` files — **portable**: move, share, or sync a project folder and its PDF links keep working
+- Autosave every 60 seconds plus save-on-quit; atomic, power-loss-safe writes with an automatic crash-recovery backup
+- Format-versioned with an integrity checksum — a corrupt or newer-version file is detected on open and won't be silently overwritten
+- A standing save-status indicator shows whether your work is safe (`Saved <time>` / `Editing...` / `Saved!`)
 - Missing PDFs are kept as placeholders — positions and annotations survive a re-save; re-link when the file is found
 
 ---

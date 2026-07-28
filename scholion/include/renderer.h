@@ -84,7 +84,9 @@ private:
     // Tile variant: draws a textured quad over an arbitrary world-space rect.
     void draw_pdf_tile_quad(const Canvas& canvas, float wx, float wy, float ww, float wh,
                             uint32_t tex);
-    void draw_threads(const Canvas& canvas, const Document& doc);
+    // hued: false → default maroon wires (selected/dragged doc); true → the document's
+    // assigned hue color (threads toggled on from the Open Documents sidebar list).
+    void draw_threads(const Canvas& canvas, const Document& doc, bool hued);
     void draw_page_annotations(const Canvas& canvas, const Page& page,
                                const DrawHints& hints, int doc_idx);
 

@@ -103,6 +103,9 @@ jobs:
       - name: Build
         run: cmake --build scholion/build -j$(sysctl -n hw.ncpu)
 
+      - name: Self-test (save/load round-trip)
+        run: scholion/build/Scholion.app/Contents/MacOS/Scholion --selftest
+
       - name: Verify universal binary
         run: |
           lipo -info scholion/build/Scholion.app/Contents/MacOS/Scholion

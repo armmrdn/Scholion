@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(scholion VERSION 1.3.0 LANGUAGES C CXX)
+project(scholion VERSION 1.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -13,7 +13,6 @@ if(APPLE)
 endif()
 
 option(SCHOLION_WITH_MUPDF "Link MuPDF for PDF rasterization (milestone 2)" OFF)
-option(SCHOLION_DEV       "Enable developer/diagnostic tools (benchmark, CSV logger)" OFF)
 
 # --- Dependencies -----------------------------------------------------------
 
@@ -56,6 +55,7 @@ add_executable(scholion
     src/overlay.cpp
     src/pdf_loader.cpp
     src/texture_cache.cpp
+    src/selftest.cpp
     third_party/tinyfiledialogs/tinyfiledialogs.c
 )
 
@@ -136,7 +136,3 @@ if(SCHOLION_WITH_MUPDF)
     message(STATUS "MuPDF: bundled at ${MUPDF_DIR}")
 endif()
 
-if(SCHOLION_DEV)
-    target_compile_definitions(scholion PRIVATE SCHOLION_DEV)
-    message(STATUS "SCHOLION_DEV: developer/diagnostic tools enabled")
-endif()

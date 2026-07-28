@@ -1,6 +1,8 @@
 #include "app_settings.h"
 #include "app_state.h"
 #include "version.h"
+#include "logo_data.h"
+#include "font_data.h"
 #include "canvas.h"
 #include "canvas_annot.h"
 #include "canvas_text_box.h"
@@ -58,6 +60,7 @@ extern "C" const char* scholion_select_folder(const char* title);
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <ctime>
 #include <condition_variable>
 #include <csignal>
 #include <cstdio>
@@ -91,6 +94,8 @@ static GLFWcursor* g_cursor_arrow = nullptr;
 
 GLFWwindow*                              g_window  = nullptr;
 std::vector<Document>                    g_documents;
+std::vector<PageGroup>                   g_groups;
+int                                      g_next_group_id = 1;
 std::vector<std::shared_ptr<PdfLoader>>  g_loaders;
 TextureCache                             g_cache;
 float                                    g_content_scale = 1.0f;
@@ -107,6 +112,7 @@ AppSettings  g_settings;
 static bool  g_settings_open = false;
 
 static GLuint g_vignette_tex = 0;  // elliptical gradient texture, created once after GL init
+static GLuint g_logo_tex     = 0;  // app logo (embedded), created once after GL init
 
 // --- Quit confirmation -------------------------------------------------------
 static bool g_quit_requested = false;
@@ -134,6 +140,12 @@ static float g_tbox_font_size = 16.0f;
 static bool  g_tbox_zoom_scaled = false;  // template for new boxes: scale text with zoom
 static int  g_hovered_box    = -1;  // id under cursor (set per-frame); -1 = none
 static int  text_box_at(float sx, float sy);  // synchronous top-most text box under a point; -1 = none
+
+// Page-group helpers (defined below; forward-declared for mouse/key/context-menu use).
+static std::vector<Page*> group_pages(int gid);            // all pages with group_id == gid
+static int  group_handle_at(float sx, float sy);           // group whose frame/label is under a point; 0 = none
+static void create_group_from_selection();                 // group the selected pages (>=1)
+static void ungroup_group(int gid);                        // dissolve a group (nondestructive)
 static bool g_box_dragging    = false;
 struct TextBoxDragState { int id; Vec2 initial_pos; };
 static std::vector<TextBoxDragState> g_box_drag_states = {};
@@ -165,6 +177,7 @@ static std::vector<UndoRecord> g_undo_stack;
 static constexpr int           UNDO_LIMIT = 60;
 
 void push_undo(UndoRecord r) {
+    g_dirty = true;   // any undoable edit marks the project modified since last save
     g_undo_stack.push_back(std::move(r));
     if ((int)g_undo_stack.size() > UNDO_LIMIT)
         g_undo_stack.erase(g_undo_stack.begin());
@@ -172,6 +185,7 @@ void push_undo(UndoRecord r) {
 
 static void undo_last() {
     if (g_undo_stack.empty()) return;
+    g_dirty = true;   // undoing is itself a change to the working state
     UndoRecord r = std::move(g_undo_stack.back());
     g_undo_stack.pop_back();
 
@@ -204,6 +218,11 @@ static void undo_last() {
         case UndoRecord::Type::PageResize:
             for (auto& pm : r.page_moves)
                 if (pm.page) { pm.page->world_w = pm.old_w; pm.page->world_h = pm.old_h; }
+            break;
+        case UndoRecord::Type::DocScale:
+            for (auto& pm : r.page_moves)
+                if (pm.page) { pm.page->world_pos = pm.old_pos;
+                               pm.page->world_w = pm.old_w; pm.page->world_h = pm.old_h; }
             break;
         case UndoRecord::Type::PageRotate:
             for (auto& pr : r.page_rots)
@@ -271,6 +290,31 @@ static void undo_last() {
             g_input.set_documents(g_documents.empty() ? nullptr : &g_documents);
             break;
         }
+        case UndoRecord::Type::CanvasStroke:
+            if (!g_canvas_strokes.empty()) g_canvas_strokes.pop_back();
+            break;
+        case UndoRecord::Type::ErasedCanvasStroke: {
+            int at = std::clamp(r.canvas_idx, 0, (int)g_canvas_strokes.size());
+            g_canvas_strokes.insert(g_canvas_strokes.begin() + at, r.erased_stroke);
+            break;
+        }
+        case UndoRecord::Type::Group:
+            // Undo a group creation: revert members' group_id, then drop the group row.
+            for (auto& gm : r.group_members) if (gm.page) gm.page->group_id = gm.old_group;
+            g_groups.erase(std::remove_if(g_groups.begin(), g_groups.end(),
+                           [&](const PageGroup& g){ return g.id == r.group_row.id; }),
+                           g_groups.end());
+            break;
+        case UndoRecord::Type::Ungroup:
+            // Undo an ungroup: restore members' group_id and re-add the group row.
+            for (auto& gm : r.group_members) if (gm.page) gm.page->group_id = gm.old_group;
+            if (r.group_row.id != 0) g_groups.push_back(r.group_row);
+            break;
+        case UndoRecord::Type::GroupJoin:
+            // Undo a drag-to-add: revert members to their prior group (no row change —
+            // the target group already existed and keeps its original members).
+            for (auto& gm : r.group_members) if (gm.page) gm.page->group_id = gm.old_group;
+            break;
     }
 }
 
@@ -387,10 +431,14 @@ void load_pdf(const std::string& path) {
     doc.hue_r = c[0]; doc.hue_g = c[1]; doc.hue_b = c[2];
 
     // Register document immediately so it appears on canvas; pages show as
-    // warm-white placeholders until background rasterization completes.
-    printf("  Queuing %zu pages for background rasterization\xe2\x80\xa6\n", doc.pages.size());
-    for (const auto& page : doc.pages)
-        enqueue_rast(path, loader, page.page_index, LodTier::Thumb);
+    // warm-white placeholders until background rasterization completes. A locked
+    // (password-protected) doc can't be rasterized — skip it; it renders as a
+    // distinct locked placeholder instead.
+    if (!doc.locked) {
+        printf("  Queuing %zu pages for background rasterization\xe2\x80\xa6\n", doc.pages.size());
+        for (const auto& page : doc.pages)
+            enqueue_rast(path, loader, page.page_index, LodTier::Thumb);
+    }
 
     g_documents.push_back(std::move(doc));
     g_loaders.push_back(loader);
@@ -473,6 +521,8 @@ static void remove_document(int doc_idx) {
             [&](const UndoRecord& r) {
                 for (const auto& pm : r.page_moves)
                     if (removing.count(pm.page)) return true;
+                for (const auto& gm : r.group_members)
+                    if (removing.count(gm.page)) return true;
                 return false;
             }),
         g_undo_stack.end());
@@ -518,11 +568,12 @@ static bool relink_document(int doc_idx, const std::string& new_path) {
         return false;
     }
 
-    // Carry over saved positions + annotations onto the matching real pages.
+    // Carry over saved positions + annotations + group membership onto the matching real pages.
     for (auto& fp : fresh.pages)
         for (auto& op : old.pages)
             if (op.page_index == fp.page_index) {
                 fp.world_pos = op.world_pos;
+                fp.group_id  = op.group_id;   // keep the page in its group across a relink
                 fp.annots    = std::move(op.annots);
                 break;
             }
@@ -723,7 +774,11 @@ static void glfw_error_callback(int error, const char* description) {
 
 static int g_doc_z_counter = 0;
 
-static int  s_editing_ref_note = -1;    // ref index of the note being edited; -1 = none
+// The highlight whose research note is being edited in the panel (nullptr = none). A stable
+// pointer (not a list index) so editing can never target the wrong reference. Safe for the
+// edit session: highlights aren't added/removed while a note field has focus, and it is reset
+// on project load/new.
+static AnnotHighlight* s_editing_ref_hl = nullptr;
 static char s_ref_note_buf[2048] = {};
 
 static void mouse_button_callback(GLFWwindow* w, int button, int action, int mods) {
@@ -777,11 +832,37 @@ static void mouse_button_callback(GLFWwindow* w, int button, int action, int mod
                 g_ann_cur_norm = norm;
             }
             return; // page owns this click — don't pass to InputHandler
+        } else if (g_annot_tool == AnnotTool::Pen) {
+            // Pen started on empty canvas → a world-locked canvas stroke (drawn in front).
+            g_ann_drawing = true; g_ann_canvas = true;
+            g_ann_doc_idx = -1; g_ann_page_idx = -1;
+            g_ann_cur_stroke = {};
+            g_ann_cur_stroke.r = g_pen_r; g_ann_cur_stroke.g = g_pen_g; g_ann_cur_stroke.b = g_pen_b;
+            g_ann_cur_stroke.pts.push_back(g_canvas.screen_to_world({(float)cx, (float)cy}));
+            return;
         }
     }
 
     bool was_box_sel = g_input.box_selecting();
-    g_input.on_mouse_button(w, button, action, mods);
+    bool tools_active = g_text_tool || g_annot_tool != AnnotTool::None;
+
+    // Group frame handle: a left-press on a group's frame outline or label grabs the
+    // whole group and moves it as a unit. Opt-in and gated on no tool active / not
+    // panning, so dragging a page interior or a document (Shift+drag) is unchanged.
+    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS
+            && !tools_active && !g_input.is_space_held()) {
+        double gcx, gcy; glfwGetCursorPos(w, &gcx, &gcy);
+        int gid = group_handle_at((float)gcx, (float)gcy);
+        if (gid != 0) {
+            std::vector<Page*> pages = group_pages(gid);
+            if (!pages.empty()) {
+                g_input.begin_group_drag(pages, {(float)gcx, (float)gcy});
+                return;   // group handle owns this press
+            }
+        }
+    }
+
+    g_input.on_mouse_button(w, button, action, mods, tools_active);
 
     // Bring clicked page's document to front
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
@@ -832,6 +913,12 @@ static void mouse_button_callback(GLFWwindow* w, int button, int action, int mod
 static void cursor_pos_callback(GLFWwindow* w, double x, double y) {
     if (ImGui::GetIO().WantCaptureMouse) { g_input.clear_hover(); return; }
     g_input.on_cursor_move(w, x, y);
+    // Canvas (world-space) pen stroke — accumulate world points.
+    if (g_ann_drawing && g_ann_canvas && g_annot_tool == AnnotTool::Pen) {
+        bool ortho = (glfwGetKey(w, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS) ||
+                     (glfwGetKey(w, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
+        stroke_add_point_world(g_canvas.screen_to_world({(float)x, (float)y}), ortho);
+    }
     // Accumulate pen / freehand-highlighter-swipe points at mouse-move rate (smoother path).
     // Box-mode highlight tracks a rectangle instead (via g_ann_cur_norm), so it's excluded.
     if (g_ann_drawing && !s_panel_ann_active
@@ -934,17 +1021,10 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
 
     // While a ref-note is being edited in the panel, suppress all shortcuts and
     // canvas input — only Escape is allowed (to confirm and close the note).
-    if (s_editing_ref_note >= 0) {
+    if (s_editing_ref_hl) {
         if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS) {
-            for (int ni = 0; ni < (int)g_ref_notes.size(); ++ni) {
-                if (g_ref_notes[ni].after_idx == s_editing_ref_note) {
-                    g_ref_notes[ni].text = s_ref_note_buf;
-                    if (g_ref_notes[ni].text.empty())
-                        g_ref_notes.erase(g_ref_notes.begin() + ni);
-                    break;
-                }
-            }
-            s_editing_ref_note = -1;
+            s_editing_ref_hl->note = s_ref_note_buf;   // empty buffer clears the note
+            s_editing_ref_hl = nullptr;
         }
         return;
     }
@@ -1022,6 +1102,18 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
         g_selected_box = nb.id;
         g_editing_box  = -1;
         UndoRecord r; r.type = UndoRecord::Type::TextBoxCreate; r.box_id = nb.id; push_undo(r);
+    }
+
+    // Cmd/Ctrl+G groups the selected pages; Cmd/Ctrl+Shift+G ungroups them.
+    if (cmd && key == GLFW_KEY_G) {
+        bool shift = (mods & GLFW_MOD_SHIFT) != 0;
+        if (shift) {
+            std::unordered_set<int> gids;
+            for (Page* p : g_input.selection()) if (p->group_id) gids.insert(p->group_id);
+            for (int gid : gids) ungroup_group(gid);
+        } else {
+            create_group_from_selection();
+        }
     }
 }
 
@@ -1142,7 +1234,9 @@ static void draw_url_modal() {
 
 static void draw_cursor_tool_icon() {
     if (g_annot_tool == AnnotTool::None && !g_text_tool) return;
-    ImDrawList* dl = ImGui::GetForegroundDrawList();
+    // Background list: the cursor hint sits above all canvas content but below ImGui
+    // windows (drawn last among the canvas layers). See the layering note in main().
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
     ImVec2 m = ImGui::GetMousePos();
 
     if (g_annot_tool == AnnotTool::Pen) {
@@ -1249,14 +1343,408 @@ static void imgui_dashed_rect(ImDrawList* dl, ImVec2 tl, ImVec2 br, ImU32 col,
     }
 }
 
+// --- Page groups ------------------------------------------------------------
+// A group is an ad-hoc, nondestructive cluster of pages (possibly from several
+// documents) that can be moved together by grabbing its frame. Membership lives
+// on Page::group_id; g_groups holds each group's color/label. Movement reuses the
+// existing multi-drag machinery (begin_group_drag), so nothing about page or
+// document dragging changes — the group is opt-in via its frame handle.
+
+static constexpr float GROUP_FRAME_PAD   = 10.0f; // innermost boundary offset from member pages
+static constexpr float GROUP_RING_GAP    = 4.0f;  // spacing between per-document boundary rings
+static constexpr float GROUP_RING_ROUND  = 20.0f; // corner radius — bubble-like, node-editor feel
+static constexpr float GROUP_RING_THICK   = 1.5f; // boundary line thickness
+static constexpr int   GROUP_RING_ALPHA   = 165;  // dim, like the thread wires
+static constexpr float GROUP_HANDLE_BAND = 11.0f; // grab thickness around the boundary
+static constexpr float GROUP_LABEL_H     = 20.0f; // label tab height (screen px)
+static constexpr float GROUP_LABEL_INSET = 14.0f; // shift the label in from the rounded corner
+static constexpr double GROUP_DRAGADD_DWELL = 0.8; // seconds to hover a group before it swallows pages
+
+// Group name being renamed inline (0 = none) + its edit buffer.
+static int  g_editing_group = 0;
+static char g_group_name_buf[256] = "";
+
+// Drag-to-add-into-group state (a page held over a group for GROUP_DRAGADD_DWELL joins it).
+static std::vector<Page*> g_dragadd_pages;         // pages currently being dragged
+static int    g_dragadd_target = 0;                // group under the cursor that could swallow them
+static double g_dragadd_since  = 0.0;              // time the cursor entered g_dragadd_target
+static bool   g_dragadd_ready  = false;            // dwell satisfied — release will join
+static bool   g_was_dragging_for_add = false;      // previous-frame drag state (edge detect on release)
+
+// Brief fading outline on a page as it leaves a group — a subtle cue that its tie released.
+// Keyed by a snapshot of the page's world rect + color (not a pointer), so it can't dangle.
+static constexpr double GROUP_REMOVE_FLASH_DUR = 0.75;  // seconds
+struct GroupRemoveFlash { float x0, y0, x1, y1; float r, g, b; double t0; };
+static std::vector<GroupRemoveFlash> g_group_remove_flashes;
+
+static std::vector<Page*> group_pages(int gid) {
+    std::vector<Page*> out;
+    if (gid == 0) return out;
+    for (auto& doc : g_documents)
+        for (auto& p : doc.pages)
+            if (p.group_id == gid) out.push_back(&p);
+    return out;
+}
+
+static const PageGroup* find_group(int gid) {
+    for (const auto& g : g_groups) if (g.id == gid) return &g;
+    return nullptr;
+}
+
+// Distinct documents contributing pages to a group, in g_documents order. The
+// count drives how many concentric boundary rings are drawn (one per document,
+// in that document's hue); the order fixes which ring sits where.
+static std::vector<const Document*> group_contrib_docs(int gid) {
+    std::vector<const Document*> out;
+    if (gid == 0) return out;
+    for (const auto& doc : g_documents) {
+        bool has = false;
+        for (const auto& p : doc.pages) if (p.group_id == gid) { has = true; break; }
+        if (has) out.push_back(&doc);
+    }
+    return out;
+}
+
+// Tight screen-space AABB of a group's member pages (no padding). false if empty.
+static bool group_base_screen(int gid, ImVec2& tl, ImVec2& br) {
+    float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
+    bool any = false;
+    for (auto& doc : g_documents)
+        for (auto& p : doc.pages)
+            if (p.group_id == gid) {
+                any = true;
+                x0 = std::min(x0, p.world_pos.x);
+                y0 = std::min(y0, p.world_pos.y);
+                x1 = std::max(x1, p.world_pos.x + p.world_w);
+                y1 = std::max(y1, p.world_pos.y + p.world_h);
+            }
+    if (!any) return false;
+    Vec2 s_tl = g_canvas.world_to_screen({x0, y0});
+    Vec2 s_br = g_canvas.world_to_screen({x1, y1});
+    tl = {s_tl.x, s_tl.y};
+    br = {s_br.x, s_br.y};
+    return true;
+}
+
+// Outermost boundary ring rect (screen space) — base bounds grown by the full ring
+// stack. Used as the grab region and the anchor for the label tab.
+static bool group_outer_frame(int gid, ImVec2& tl, ImVec2& br) {
+    ImVec2 b_tl, b_br;
+    if (!group_base_screen(gid, b_tl, b_br)) return false;
+    int rings = std::max(1, (int)group_contrib_docs(gid).size());
+    float off = GROUP_FRAME_PAD + (rings - 1) * GROUP_RING_GAP;
+    tl = {b_tl.x - off, b_tl.y - off};
+    br = {b_br.x + off, b_br.y + off};
+    return true;
+}
+
+// Label-tab rectangle, derived identically for draw and hit-test.
+static ImVec4 group_label_screen(ImVec2 frame_tl, const char* label) {
+    float font_px = ImGui::GetFontSize();
+    ImVec2 ts = ImGui::GetFont()->CalcTextSizeA(font_px, FLT_MAX, 0.0f, label);
+    float w = std::max(ts.x + 16.0f, 44.0f);
+    // Inset from the corner so the tab clears the boundary's rounded radius.
+    float x0 = frame_tl.x + GROUP_LABEL_INSET;
+    return { x0, frame_tl.y - GROUP_LABEL_H, x0 + w, frame_tl.y };
+}
+
+// Topmost group whose boundary or label tab is under (sx, sy); 0 = none.
+static int group_handle_at(float sx, float sy) {
+    if (g_settings_open || g_search_open) return 0;
+    ImVec2 vp = ImGui::GetMainViewport()->Size;
+    float canvas_right = g_input.panel_open() ? (vp.x - g_panel_w) : vp.x;
+    if (sx >= canvas_right) return 0;
+    int found = 0;
+    for (const auto& grp : g_groups) {
+        ImVec2 tl, br;
+        if (!group_outer_frame(grp.id, tl, br)) continue;
+        const char* label = grp.name.empty() ? "Group" : grp.name.c_str();
+        ImVec4 lr = group_label_screen(tl, label);
+        bool in_label = sx >= lr.x && sx <= lr.z && sy >= lr.y && sy <= lr.w;
+        // Grab band straddling the outermost boundary line.
+        float bnd = GROUP_HANDLE_BAND;
+        bool in_outer = sx >= tl.x - bnd && sx <= br.x + bnd && sy >= tl.y - bnd && sy <= br.y + bnd;
+        bool in_inner = sx >  tl.x + bnd && sx <  br.x - bnd && sy >  tl.y + bnd && sy <  br.y - bnd;
+        if (in_label || (in_outer && !in_inner)) found = grp.id;
+    }
+    return found;
+}
+
+// Topmost group whose outer frame *interior* contains (sx, sy); 0 = none. Used by the
+// drag-to-add dwell test (the whole enclosed area is a drop target, not just the border).
+static int group_area_at(float sx, float sy) {
+    if (g_settings_open || g_search_open) return 0;
+    ImVec2 vp = ImGui::GetMainViewport()->Size;
+    float canvas_right = g_input.panel_open() ? (vp.x - g_panel_w) : vp.x;
+    if (sx >= canvas_right) return 0;
+    int found = 0;
+    for (const auto& grp : g_groups) {
+        ImVec2 tl, br;
+        if (!group_outer_frame(grp.id, tl, br)) continue;
+        if (sx >= tl.x && sx <= br.x && sy >= tl.y && sy <= br.y) found = grp.id;
+    }
+    return found;
+}
+
+static void draw_page_groups() {
+    if (g_settings_open || g_search_open) return;
+
+    // Drop a stale rename target if its group is gone.
+    if (g_editing_group != 0 && !find_group(g_editing_group)) g_editing_group = 0;
+
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    for (auto& grp : g_groups) {
+        ImVec2 base_tl, base_br;
+        if (!group_base_screen(grp.id, base_tl, base_br)) continue;  // empty — nothing to draw
+
+        std::vector<const Document*> docs = group_contrib_docs(grp.id);
+        int rings = std::max(0, (int)docs.size() - 1);
+        float outer_off = GROUP_FRAME_PAD + rings * GROUP_RING_GAP;
+
+        // Drag-to-add feedback: a soft interior wash while a dragged page dwells over
+        // this group, brightening once the dwell is satisfied (release will join).
+        if (grp.id == g_dragadd_target) {
+            int a = g_dragadd_ready ? 60 : 26;
+            dl->AddRectFilled({base_tl.x - outer_off, base_tl.y - outer_off},
+                              {base_br.x + outer_off, base_br.y + outer_off},
+                              IM_COL32(255, 255, 255, a), GROUP_RING_ROUND);
+        }
+
+        // One solid, dim, rounded boundary ring per contributing document, in that
+        // document's hue. Multiple documents => concentric multi-colored rings a few
+        // px apart — the node-editor thread aesthetic applied to a page cluster.
+        for (int i = 0; i < (int)docs.size(); ++i) {
+            float off = GROUP_FRAME_PAD + i * GROUP_RING_GAP;
+            ImU32 col = IM_COL32((int)(docs[i]->hue_r * 255),
+                                 (int)(docs[i]->hue_g * 255),
+                                 (int)(docs[i]->hue_b * 255), GROUP_RING_ALPHA);
+            dl->AddRect({base_tl.x - off, base_tl.y - off},
+                        {base_br.x + off, base_br.y + off},
+                        col, GROUP_RING_ROUND, ImDrawFlags_RoundCornersAll, GROUP_RING_THICK);
+        }
+
+        ImVec2 outer_tl = {base_tl.x - outer_off, base_tl.y - outer_off};
+
+        const char* label = grp.name.empty() ? "Group" : grp.name.c_str();
+        ImVec4 lr = group_label_screen(outer_tl, label);
+
+        // Label tab tinted with the group's lead document hue (darkened for legible light text),
+        // so the tab reads as part of the group's color theme.
+        ImU32 pill_col;
+        if (!docs.empty())
+            pill_col = IM_COL32((int)(docs[0]->hue_r * 0.45f * 255),
+                                (int)(docs[0]->hue_g * 0.45f * 255),
+                                (int)(docs[0]->hue_b * 0.45f * 255), 230);
+        else
+            pill_col = IM_COL32(38, 35, 32, 215);
+
+        if (g_editing_group == grp.id) {
+            // Inline rename: a small borderless InputText at the label tab.
+            ImGui::SetNextWindowPos({lr.x, lr.y});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {2.0f, 2.0f});
+            ImGui::Begin("##grp_rename", nullptr,
+                         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                         ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                         ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings);
+            ImGui::SetNextItemWidth(std::max(120.0f, lr.z - lr.x));
+            if (ImGui::IsWindowAppearing()) ImGui::SetKeyboardFocusHere();
+            // Enter confirms (no line breaks needed); Escape reverts; clicking out commits.
+            ImGui::InputText("##grpname", g_group_name_buf, sizeof(g_group_name_buf),
+                             ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
+            if (ImGui::IsItemDeactivated()) {
+                if (ImGui::IsItemDeactivatedAfterEdit()) { grp.name = g_group_name_buf; g_dirty = true; }
+                g_editing_group = 0;
+            }
+            ImGui::End();
+            ImGui::PopStyleVar();
+        } else {
+            dl->AddRectFilled({lr.x, lr.y}, {lr.z, lr.w}, pill_col, 5.0f, ImDrawFlags_RoundCornersTop);
+            dl->AddText({lr.x + 8.0f, lr.y + (GROUP_LABEL_H - ImGui::GetFontSize()) * 0.5f},
+                        IM_COL32(235, 231, 225, 255), label);
+            // Double-click the tab to rename it.
+            if (!ImGui::GetIO().WantCaptureMouse && ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
+                ImVec2 m = ImGui::GetMousePos();
+                if (m.x >= lr.x && m.x <= lr.z && m.y >= lr.y && m.y <= lr.w) {
+                    g_editing_group = grp.id;
+                    strncpy(g_group_name_buf, grp.name.c_str(), sizeof(g_group_name_buf) - 1);
+                    g_group_name_buf[sizeof(g_group_name_buf) - 1] = '\0';
+                }
+            }
+        }
+    }
+}
+
+// Group the currently selected pages into a fresh group (flat: each page joins
+// this group, leaving any previous one). Nondestructive and undoable.
+static void create_group_from_selection() {
+    const auto& sel = g_input.selection();
+    if (sel.empty()) return;
+    int gid = g_next_group_id++;
+    PageGroup grp;
+    grp.id = gid;
+    const float* cv = GROUP_PALETTE[(gid - 1) % GROUP_PALETTE_SIZE];
+    grp.col_r = cv[0]; grp.col_g = cv[1]; grp.col_b = cv[2];
+
+    UndoRecord r; r.type = UndoRecord::Type::Group; r.group_row = grp;
+    for (Page* p : sel) {
+        r.group_members.push_back({p, p->group_id});
+        p->group_id = gid;
+    }
+    g_groups.push_back(grp);
+    push_undo(r);
+}
+
+// Dissolve a group: members revert to ungrouped, the row is removed. Undoable.
+static void ungroup_group(int gid) {
+    if (gid == 0) return;
+    if (g_editing_group == gid) g_editing_group = 0;
+    const PageGroup* g = find_group(gid);
+    UndoRecord r; r.type = UndoRecord::Type::Ungroup;
+    if (g) r.group_row = *g;
+    bool any = false;
+    for (auto& doc : g_documents)
+        for (auto& p : doc.pages)
+            if (p.group_id == gid) {
+                r.group_members.push_back({&p, gid});
+                p.group_id = 0;
+                any = true;
+            }
+    g_groups.erase(std::remove_if(g_groups.begin(), g_groups.end(),
+                   [&](const PageGroup& x){ return x.id == gid; }), g_groups.end());
+    if (any) push_undo(r);
+}
+
+// Add pages to an existing group (drag-to-add). Flat rule: a page joins this group,
+// leaving any previous one (old_group recorded for undo). The target row already
+// exists, so undo (GroupJoin) only reverts membership — it never removes the row.
+static void add_pages_to_group(int gid, const std::vector<Page*>& pages) {
+    if (gid == 0 || !find_group(gid)) return;
+    UndoRecord r; r.type = UndoRecord::Type::GroupJoin;
+    bool any = false;
+    for (Page* p : pages) {
+        if (!p || p->group_id == gid) continue;
+        r.group_members.push_back({p, p->group_id});
+        p->group_id = gid;
+        any = true;
+    }
+    if (any) push_undo(r);
+}
+
+// Per-frame: while pages are being dragged, arm a target group once the cursor dwells
+// over it long enough; on release, the target swallows the dragged pages. Add-only —
+// dropping outside any group never removes a page (Ungroup is the removal path).
+static void update_group_drag_add() {
+    bool dragging = (g_input.dragged_page() != nullptr) || g_input.is_multi_dragging();
+    if (dragging) {
+        g_dragadd_pages.clear();
+        if (g_input.is_multi_dragging()) {
+            for (Page* p : g_input.selection()) g_dragadd_pages.push_back(p);
+        } else if (const Page* dp = g_input.dragged_page()) {
+            g_dragadd_pages.push_back(const_cast<Page*>(dp));
+        }
+        ImVec2 m = ImGui::GetMousePos();
+        int cand = group_area_at(m.x, m.y);
+        if (cand != 0) {
+            // Only a candidate if at least one dragged page isn't already in it.
+            bool any_new = false;
+            for (Page* p : g_dragadd_pages) if (p->group_id != cand) { any_new = true; break; }
+            if (!any_new) cand = 0;
+        }
+        if (cand != g_dragadd_target) {
+            g_dragadd_target = cand;
+            g_dragadd_since  = ImGui::GetTime();
+            g_dragadd_ready  = false;
+        } else if (cand != 0 && !g_dragadd_ready &&
+                   ImGui::GetTime() - g_dragadd_since >= GROUP_DRAGADD_DWELL) {
+            g_dragadd_ready = true;
+        }
+    } else {
+        // Drag ended this frame — commit if a target was armed and satisfied.
+        if (g_was_dragging_for_add && g_dragadd_ready && g_dragadd_target != 0 && !g_dragadd_pages.empty())
+            add_pages_to_group(g_dragadd_target, g_dragadd_pages);
+        g_dragadd_pages.clear();
+        g_dragadd_target = 0;
+        g_dragadd_ready  = false;
+    }
+    g_was_dragging_for_add = dragging;
+}
+
+// Remove a single page from its group (nondestructive, undoable) — the deliberate,
+// menu-driven counterpart to drag-to-add, so a stray drag can't change membership. The
+// group's boundary recomputes to omit the page automatically; a brief fading outline in
+// the page's document color flags the change.
+static void remove_page_from_group(Page* p) {
+    if (!p || p->group_id == 0) return;
+    UndoRecord r; r.type = UndoRecord::Type::GroupJoin;   // GroupJoin = revert membership only
+    r.group_members.push_back({p, p->group_id});
+
+    float fr = 0.6f, fg = 0.6f, fb = 0.6f;                // flash color = owning document hue
+    for (const auto& doc : g_documents) {
+        bool has = false;
+        for (const auto& pg : doc.pages) if (&pg == p) { has = true; break; }
+        if (has) { fr = doc.hue_r; fg = doc.hue_g; fb = doc.hue_b; break; }
+    }
+    g_group_remove_flashes.push_back({ p->world_pos.x, p->world_pos.y,
+                                       p->world_pos.x + p->world_w, p->world_pos.y + p->world_h,
+                                       fr, fg, fb, ImGui::GetTime() });
+    p->group_id = 0;
+    push_undo(r);
+}
+
+// Draw + age the "left the group" page flashes. Fades a rounded outline (and a faint fill)
+// out over GROUP_REMOVE_FLASH_DUR. Runs on the canvas layer (below the UI).
+static void draw_group_remove_flashes() {
+    if (g_group_remove_flashes.empty()) return;
+    double now = ImGui::GetTime();
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    for (const auto& f : g_group_remove_flashes) {
+        float t = (float)((now - f.t0) / GROUP_REMOVE_FLASH_DUR);
+        if (t < 0.0f) t = 0.0f;
+        if (t > 1.0f) continue;
+        float ease = 1.0f - t;                 // fade out
+        Vec2 tl = g_canvas.world_to_screen({f.x0, f.y0});
+        Vec2 br = g_canvas.world_to_screen({f.x1, f.y1});
+        ImU32 line = IM_COL32((int)(f.r * 255), (int)(f.g * 255), (int)(f.b * 255),
+                              (int)(235.0f * ease));
+        ImU32 fill = IM_COL32((int)(f.r * 255), (int)(f.g * 255), (int)(f.b * 255),
+                              (int)(45.0f * ease));
+        dl->AddRectFilled({tl.x, tl.y}, {br.x, br.y}, fill, GROUP_RING_ROUND);
+        dl->AddRect({tl.x, tl.y}, {br.x, br.y}, line, GROUP_RING_ROUND,
+                    ImDrawFlags_RoundCornersAll, 2.0f);
+    }
+    g_group_remove_flashes.erase(
+        std::remove_if(g_group_remove_flashes.begin(), g_group_remove_flashes.end(),
+            [&](const GroupRemoveFlash& f){ return (now - f.t0) >= GROUP_REMOVE_FLASH_DUR; }),
+        g_group_remove_flashes.end());
+}
+
+// Label locked (password-protected) documents' placeholder pages so the distinct
+// indigo rect reads clearly instead of looking like a blank page.
+static void draw_locked_doc_labels() {
+    if (g_settings_open || g_search_open) return;
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    const char* txt = "Password-protected PDF";
+    for (const auto& doc : g_documents) {
+        if (!doc.locked) continue;
+        for (const auto& page : doc.pages) {
+            Vec2 c = g_canvas.world_to_screen({page.world_pos.x + page.world_w * 0.5f,
+                                               page.world_pos.y + page.world_h * 0.5f});
+            ImVec2 ts = ImGui::CalcTextSize(txt);
+            dl->AddText({c.x - ts.x * 0.5f, c.y - ts.y * 0.5f},
+                        IM_COL32(205, 208, 230, 235), txt);
+        }
+    }
+}
+
 static void draw_canvas_text_boxes() {
-    // ForegroundDrawList renders above all ImGui windows, so skip canvas text-box
-    // drawing whenever a blocking overlay is up. The user can't interact with
-    // boxes through the overlay anyway.
+    // BackgroundDrawList: text boxes live on the canvas layer (above pages/marks but
+    // BELOW every ImGui window), so context menus, tooltips, and dialogs correctly draw
+    // on top of them. The panel-clip below keeps them from bleeding through a translucent
+    // sidebar. These early-outs skip work under the full-screen Settings/Search overlays.
     if (g_settings_open) return;
     if (g_search_open) return;
 
-    ImDrawList* dl    = ImGui::GetForegroundDrawList();
+    ImDrawList* dl    = ImGui::GetBackgroundDrawList();
     ImFont*     font  = ImGui::GetFont();
     ImVec2      mouse = ImGui::GetMousePos();
     ImGuiIO&    io    = ImGui::GetIO();
@@ -1465,23 +1953,26 @@ static void draw_canvas_text_boxes() {
                 g_tbox_font_size = box.font_size;
                 g_tbox_zoom_scaled = box.zoom_scaled;
 
-                // Start multi-box drag: record initial positions of all selected text boxes
-                Vec2 w = g_canvas.screen_to_world({mouse.x, mouse.y});
-                g_box_drag_start_world = w;
-                g_box_drag_states.clear();
-                for (int sel_id : g_input.selected_text_boxes()) {
-                    for (const auto& b : g_text_boxes) {
-                        if (b.id == sel_id) {
-                            g_box_drag_states.push_back({sel_id, b.world_pos});
-                            break;
+                // Start multi-box drag — suppressed while any tool is active so boxes/pages
+                // don't move in tool mode (selection above still applies).
+                if (!g_text_tool && g_annot_tool == AnnotTool::None) {
+                    Vec2 w = g_canvas.screen_to_world({mouse.x, mouse.y});
+                    g_box_drag_start_world = w;
+                    g_box_drag_states.clear();
+                    for (int sel_id : g_input.selected_text_boxes()) {
+                        for (const auto& b : g_text_boxes) {
+                            if (b.id == sel_id) {
+                                g_box_drag_states.push_back({sel_id, b.world_pos});
+                                break;
+                            }
                         }
                     }
+                    // Record initial positions of selected pages so they move with the boxes
+                    g_page_drag_states.clear();
+                    for (Page* p : g_input.selection())
+                        g_page_drag_states.push_back({p, p->world_pos});
+                    g_box_dragging = true;
                 }
-                // Record initial positions of selected pages so they move with the boxes
-                g_page_drag_states.clear();
-                for (Page* p : g_input.selection())
-                    g_page_drag_states.push_back({p, p->world_pos});
-                g_box_dragging = true;
             }
         }
     }
@@ -1696,14 +2187,6 @@ static void reveal_in_file_manager(const std::string& path) {
 #endif
 }
 
-// --- Benchmark logger -------------------------------------------------------
-// Activated by the Developer Mode checkbox in Settings.
-// Writes scholion_perf_<timestamp>.csv to the user's Desktop once per second.
-//
-// Columns: elapsed_s, fps, frame_ms, frame_ms_max, vram_used_mb,
-//          rast_queue, rast_cancelled, rast_completed, rast_perm_fail,
-//          ram_mb, pages_total, pages_visible, pages_thumb, pages_low, pages_high
-//
 // --- Context menu -----------------------------------------------------------
 
 static void apply_page_rotation(Page* page, int delta_cw) {
@@ -1717,6 +2200,53 @@ static void apply_page_rotation(Page* page, int delta_cw) {
     // Swap the page footprint only for odd 90° turns; a 180° (or 180° reset) keeps w/h.
     // The old unconditional swap was wrong for those cases.
     if ((d / 90) % 2 != 0) std::swap(page->world_w, page->world_h);
+}
+
+// Scale a whole document so its pages match the standard page size on the canvas — fixes
+// documents/images that import wildly under- or over-sized. Target = median page height of
+// the OTHER (non-missing) documents; falls back to Letter (792 pt) if this is the only one.
+// Scales uniformly about the document's visual centroid; annotations (page-normalized) and
+// threads (page geometry) follow automatically.
+static void normalize_document_size(Document& doc) {
+    if (doc.pages.empty()) return;
+    auto median_h = [](std::vector<float> hs) -> float {
+        if (hs.empty()) return 0.0f;
+        std::sort(hs.begin(), hs.end());
+        return hs[hs.size() / 2];
+    };
+    std::vector<float> mine;
+    for (const auto& p : doc.pages) if (p.world_h > 0.0f) mine.push_back(p.world_h);
+    float cur_h = median_h(mine);
+    if (cur_h <= 0.0f) return;
+
+    std::vector<float> others;
+    for (auto& d : g_documents) {
+        if (&d == &doc || d.missing) continue;
+        for (const auto& p : d.pages) if (p.world_h > 0.0f) others.push_back(p.world_h);
+    }
+    float target_h = others.empty() ? 792.0f : median_h(others);
+    float scale = target_h / cur_h;
+    if (!(scale > 0.0f) || std::abs(scale - 1.0f) < 1e-3f) return;   // no-op / degenerate
+
+    Vec2 pivot = {0.0f, 0.0f};
+    for (const auto& p : doc.pages) {
+        pivot.x += p.world_pos.x + p.world_w * 0.5f;
+        pivot.y += p.world_pos.y + p.world_h * 0.5f;
+    }
+    pivot.x /= (float)doc.pages.size();
+    pivot.y /= (float)doc.pages.size();
+
+    UndoRecord r; r.type = UndoRecord::Type::DocScale;
+    for (auto& p : doc.pages) {
+        r.page_moves.push_back({&p, p.world_pos, p.world_w, p.world_h});
+        p.world_pos = { pivot.x + (p.world_pos.x - pivot.x) * scale,
+                        pivot.y + (p.world_pos.y - pivot.y) * scale };
+        p.world_w *= scale;
+        p.world_h *= scale;
+    }
+    push_undo(r);
+    doc.stack_origin = { pivot.x + (doc.stack_origin.x - pivot.x) * scale,
+                         pivot.y + (doc.stack_origin.y - pivot.y) * scale };
 }
 
 static void draw_context_menu() {
@@ -1757,6 +2287,11 @@ static void draw_context_menu() {
                 }
                 ImGui::Separator();
             }
+            if (doc->locked) {
+                ImGui::TextDisabled("Password-protected PDF:");
+                ImGui::TextDisabled("%s", doc->path.c_str());
+                ImGui::Separator();
+            }
             if (ImGui::MenuItem("Return to Stack")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
@@ -1776,12 +2311,13 @@ static void draw_context_menu() {
                 }
             }
             ImGui::Separator();
-            if (ImGui::MenuItem("Rotate CW"))  { apply_page_rotation(page, 90);  ImGui::CloseCurrentPopup(); }
-            if (ImGui::MenuItem("Rotate CCW")) { apply_page_rotation(page, 270); ImGui::CloseCurrentPopup(); }
-            if (ImGui::MenuItem("Rotate 180\xc2\xb0")) { apply_page_rotation(page, 180); ImGui::CloseCurrentPopup(); }
-            if (ImGui::MenuItem("Reset Rotation", nullptr, false, page->rotation != 0)) {
-                apply_page_rotation(page, (360 - page->rotation) % 360); ImGui::CloseCurrentPopup();
+            // Single rotation option: 90° clockwise. Repeat to reach 180°/270°/upright.
+            if (ImGui::MenuItem("Rotate 90\xc2\xb0")) { apply_page_rotation(page, 90); ImGui::CloseCurrentPopup(); }
+            if (ImGui::MenuItem("Normalize Size")) {
+                normalize_document_size(*doc);
+                ImGui::CloseCurrentPopup();
             }
+            ImGui::SetItemTooltip("Scale this document to match the standard page size on the canvas");
             ImGui::Separator();
             if (ImGui::MenuItem("Fan Pages Vertically")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
@@ -1867,6 +2403,32 @@ static void draw_context_menu() {
                 }
             }
 
+            // Grouping — gather pages into an ad-hoc movable cluster, or dissolve one.
+            bool can_group   = sel.size() >= 2 && sel.count(page);
+            bool can_ungroup = page->group_id != 0;
+            if (can_group || can_ungroup) {
+                ImGui::Separator();
+                if (can_group) {
+                    if (ImGui::MenuItem("Group Selected Pages")) {
+                        create_group_from_selection();
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::SetItemTooltip("Frame these pages so they move together — drag the frame to move the whole group");
+                }
+                if (can_ungroup) {
+                    if (ImGui::MenuItem("Remove Page from Group")) {
+                        remove_page_from_group(page);
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::SetItemTooltip("Take just this page out of the group (the rest stay grouped)");
+                    if (ImGui::MenuItem("Ungroup")) {
+                        ungroup_group(page->group_id);
+                        ImGui::CloseCurrentPopup();
+                    }
+                    ImGui::SetItemTooltip("Dissolve this group; its pages return to their normal document behavior");
+                }
+            }
+
             ImGui::Separator();
             if (ImGui::MenuItem("Zoom to Fit Document")) {
                 float bx0 = 1e30f, by0 = 1e30f, bx1 = -1e30f, by1 = -1e30f;
@@ -1912,6 +2474,14 @@ static void draw_context_menu() {
 static void new_project() {
     clear_documents();
     g_text_boxes.clear();
+    g_canvas_strokes.clear();
+    s_editing_ref_hl  = nullptr;      // notes live on highlights now; cleared with the documents
+    s_ref_note_buf[0] = '\0';
+    g_groups.clear();
+    g_next_group_id = 1;
+    g_editing_group = 0;
+    g_group_remove_flashes.clear();
+    g_load_ok = true; g_dirty = false; g_last_save_wall = 0;   // fresh, unsaved state
     g_selected_box = g_editing_box = -1;
     g_prev_selected_box = g_prev_editing_box = -1;
     g_just_created = g_edit_was_new = false;
@@ -1937,27 +2507,54 @@ static void draw_startup_chooser() {
     if (ImGui::BeginPopupModal("##startup", nullptr,
             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
             ImGuiWindowFlags_NoTitleBar)) {
-        const float btn_w = 260.0f;
-        ImGui::SetWindowFontScale(1.5f);
+        // Button width tracks the UI scale so labels fit in Larger-UI mode.
+        const float ui        = ImGui::GetIO().FontGlobalScale;
+        const float btn_w     = 260.0f * ui;
         const char* app_title = "Scholion " SCHOLION_VERSION;
+        const char* subtitle  = "Open a project or add PDFs to begin";
+
+        // Measure widths up front (the title is drawn at 1.5x window font scale), then
+        // center everything within a single content width so nothing goes off-center
+        // no matter which element is widest — holds in both normal and Larger-UI modes.
+        ImGui::SetWindowFontScale(1.5f);
         float title_w = ImGui::CalcTextSize(app_title).x;
-        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (btn_w - title_w) * 0.5f));
+        ImGui::SetWindowFontScale(1.0f);
+        float sub_w   = ImGui::CalcTextSize(subtitle).x;
+        float content_w = std::max({btn_w, title_w, sub_w});
+
+        auto center_in = [&](float w) {
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (content_w - w) * 0.5f));
+        };
+
+        // App logo — kept small (fixed size) in both UI modes, centered above the title.
+        if (g_logo_tex) {
+            const float logo = 72.0f;
+            center_in(logo);
+            ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(g_logo_tex)), {logo, logo});
+            ImGui::Spacing();
+        }
+
+        ImGui::SetWindowFontScale(1.5f);
+        center_in(title_w);
         ImGui::TextUnformatted(app_title);
         ImGui::SetWindowFontScale(1.0f);
         ImGui::Spacing();
-        {
-            float sub_w = ImGui::CalcTextSize("Open a project or add PDFs to begin").x;
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (btn_w - sub_w) * 0.5f));
-        }
-        ImGui::TextUnformatted("Open a project or add PDFs to begin");
-        ImGui::Spacing();
-        const ImVec2 bsz = {260.0f, 0.0f};
 
-        if (ImGui::Button("Open Project File", bsz)) {
+        center_in(sub_w);
+        ImGui::TextUnformatted(subtitle);
+        ImGui::Spacing();
+
+        const ImVec2 bsz = {btn_w, 0.0f};
+        auto centered_button = [&](const char* label) {
+            center_in(btn_w);
+            return ImGui::Button(label, bsz);
+        };
+
+        if (centered_button("Open Project File")) {
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
             load_project();
         }
-        if (ImGui::Button("Add PDF File(s)", bsz)) {
+        if (centered_button("Add PDF File(s)")) {
             const char* pats[] = {"*.pdf", "*.PDF"};
 #ifdef __APPLE__
             const char* r = scholion_open_file("Select PDF files", pats, 2, 1);
@@ -1969,7 +2566,7 @@ static void draw_startup_chooser() {
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
             if (r) load_pdfs_from_selection(r);
         }
-        if (ImGui::Button("Add Folder of PDFs", bsz)) {
+        if (centered_button("Add Folder of PDFs")) {
 #ifdef __APPLE__
             const char* d = scholion_select_folder("Select PDF folder");
 #else
@@ -1981,7 +2578,7 @@ static void draw_startup_chooser() {
             if (d) load_pdfs_from_folder(d);
         }
         ImGui::Separator();
-        if (ImGui::Button("Start with Blank Canvas", bsz)) {
+        if (centered_button("Start with Blank Canvas")) {
             g_startup_chooser = false; ImGui::CloseCurrentPopup();
         }
         ImGui::EndPopup();
@@ -2020,13 +2617,21 @@ static void draw_settings_popup() {
     ImGui::SameLine();
     ImGui::RadioButton("Light", (int*)&g_settings.dark_mode, 0);
     if (g_settings.dark_mode != was_dark) {
-        apply_theme(g_settings.dark_mode);
+        apply_appearance();
         save_prefs();
     }
     bool prev_vignette = g_settings.vignette_on;
     ImGui::Checkbox("Canvas Vignette", &g_settings.vignette_on);
     if (g_settings.vignette_on != prev_vignette)
         save_prefs();
+
+    bool prev_large = g_settings.large_ui;
+    ImGui::Checkbox("Larger UI", &g_settings.large_ui);
+    ImGui::SetItemTooltip("Scale all text, buttons, and panels up for smaller or high-resolution screens");
+    if (g_settings.large_ui != prev_large) {
+        apply_appearance();
+        save_prefs();
+    }
 
     // --- Canvas Grid ---
     ImGui::SeparatorText("Canvas Grid");
@@ -2114,6 +2719,15 @@ static void draw_settings_popup() {
         ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail - tw) * 0.5f));
         ImGui::TextUnformatted(s);
     };
+
+    // Small centered logo at the top of the footer.
+    if (g_logo_tex) {
+        const float logo = 44.0f;
+        float avail = ImGui::GetContentRegionAvail().x;
+        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (avail - logo) * 0.5f));
+        ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(g_logo_tex)), {logo, logo});
+        ImGui::Spacing();
+    }
 
     center_line("Scholion is a canvas-style PDF review utility.");
     center_line("designed and built by @armmrdn (2026)");
@@ -2271,7 +2885,8 @@ struct RefEntry { int di, pi, hi; };  // indices into g_documents[di].pages[pi].
 
 static void draw_references_tab() {
     namespace fs = std::filesystem;
-    static int s_prev_editing_ref = -1;
+    static AnnotHighlight* s_prev_editing_hl = nullptr;
+    static std::unordered_set<int> s_expanded_refs;  // reference indices shown fully expanded
 
     // Build a flat sorted list of all text highlights across all documents.
     // Sorted by document order then page order (stable presentation).
@@ -2343,11 +2958,8 @@ static void draw_references_tab() {
                     fprintf(f, "  <blockquote>&#8220;%s&#8221;</blockquote>\n", text.c_str());
                     fprintf(f, "  <div class=\"source\">%s &mdash; p.%d</div>\n",
                             fname.c_str(), pg.page_index + 1);
-                    for (const auto& rn : g_ref_notes) {
-                        if (rn.after_idx == gi && !rn.text.empty())
-                            fprintf(f, "  <div class=\"note\">%s</div>\n",
-                                    esc(rn.text).c_str());
-                    }
+                    if (!hl.note.empty())
+                        fprintf(f, "  <div class=\"note\">%s</div>\n", esc(hl.note).c_str());
                     fprintf(f, "</div>\n");
                     if (gi + 1 < (int)entries.size()) fprintf(f, "<hr>\n");
                 }
@@ -2367,7 +2979,7 @@ static void draw_references_tab() {
             "Select the Highlight tool, then drag across text on any page "
             "\xe2\x80\x94 it will appear here with the filename and page number.");
         ImGui::PopStyleColor();
-        return;
+        // NOTE: no early return — the Open Documents list below must stay reachable.
     }
 
     for (int gi = 0; gi < (int)entries.size(); ++gi) {
@@ -2377,27 +2989,53 @@ static void draw_references_tab() {
         const auto&     hl  = pg.annots.highlights[e.hi];
 
         // --- Highlight card ---
+        // Disclosure arrow on the left toggles the full blurb; source line follows.
+        bool expanded = s_expanded_refs.count(gi) > 0;
+        char aid[24]; snprintf(aid, sizeof(aid), "##rex%d", gi);
+        if (ImGui::ArrowButton(aid, expanded ? ImGuiDir_Down : ImGuiDir_Right)) {
+            if (expanded) s_expanded_refs.erase(gi); else s_expanded_refs.insert(gi);
+            expanded = !expanded;
+        }
+        ImGui::SetItemTooltip(expanded ? "Collapse" : "Show full text");
+        ImGui::SameLine();
         ImGui::PushStyleColor(ImGuiCol_Text, {doc.hue_r, doc.hue_g, doc.hue_b, 0.85f});
         std::string fname = fs::path(doc.path).filename().string();
         char source[256]; snprintf(source, sizeof(source), "%s · p.%d", fname.c_str(), pg.page_index + 1);
         ImGui::TextUnformatted(source);
         ImGui::PopStyleColor();
 
-        std::string display = hl.text;
-        bool truncated = display.size() > 120;
-        if (truncated) { display.resize(117); display += "..."; }
-        char row[512];
-        snprintf(row, sizeof(row), "\"%s\"##hl%d", display.c_str(), gi);
-        if (ImGui::Selectable(row, false)) {
+        auto zoom_here = [&]{
             zoom_to_rect(pg.world_pos.x, pg.world_pos.y,
                          pg.world_pos.x + pg.world_w, pg.world_pos.y + pg.world_h);
+        };
+        if (!expanded) {
+            // Collapsed: single-line truncated preview (newlines flattened), click → zoom.
+            std::string display = hl.text;
+            for (char& c : display) if (c == '\n' || c == '\r') c = ' ';
+            bool truncated = display.size() > 120;
+            if (truncated) { display.resize(117); display += "..."; }
+            char row[512];
+            snprintf(row, sizeof(row), "\"%s\"##hl%d", display.c_str(), gi);
+            if (ImGui::Selectable(row, false)) zoom_here();
+            if (truncated) ImGui::SetItemTooltip("%s", hl.text.c_str());
+        } else {
+            // Expanded: full multiline blurb wrapped to the sidebar width, click → zoom.
+            float wrap_w = ImGui::GetContentRegionAvail().x;
+            std::string quoted = "\"" + hl.text + "\"";
+            ImVec2 tsz = ImGui::CalcTextSize(quoted.c_str(), nullptr, false, wrap_w);
+            ImVec2 tl  = ImGui::GetCursorScreenPos();
+            char bid[24]; snprintf(bid, sizeof(bid), "##hlful%d", gi);
+            if (ImGui::InvisibleButton(bid, {wrap_w, std::max(tsz.y, ImGui::GetTextLineHeight())}))
+                zoom_here();
+            ImGui::GetWindowDrawList()->AddText(
+                ImGui::GetFont(), ImGui::GetFontSize(), tl,
+                ImGui::GetColorU32(ImGuiCol_Text), quoted.c_str(), nullptr, wrap_w);
         }
-        if (truncated) ImGui::SetItemTooltip("%s", hl.text.c_str());
 
-        // --- Note for this reference (indexed by gi) ---
-        int note_slot = -1;
-        for (int ni = 0; ni < (int)g_ref_notes.size(); ++ni)
-            if (g_ref_notes[ni].after_idx == gi) { note_slot = ni; break; }
+        // --- Research note for this reference (stored on the highlight itself) ---
+        AnnotHighlight& note_hl = g_documents[e.di].pages[e.pi].annots.highlights[e.hi];
+        bool editing  = (s_editing_ref_hl == &note_hl);
+        bool has_note = !note_hl.note.empty();
 
         {
             const float kXW    = 20.0f;
@@ -2411,7 +3049,7 @@ static void draw_references_tab() {
             ImVec2 cb = ImGui::GetCursorPos();
             ImVec2 tl = ImGui::GetCursorScreenPos();
 
-            if (note_slot >= 0 && s_editing_ref_note == gi) {
+            if (editing) {
                 // ---- Editing: text box inset inside border, X top-right ----
                 float txt_w    = avail - kXW - kSpc - kPad * 2.0f;
                 ImVec2 content_sz = ImGui::CalcTextSize(s_ref_note_buf, nullptr, false, txt_w);
@@ -2428,7 +3066,7 @@ static void draw_references_tab() {
                 ImGui::PushStyleColor(ImGuiCol_Text,    {0.90f, 0.90f, 0.94f, 1.0f});
                 char edit_id[32]; snprintf(edit_id, sizeof(edit_id), "##rnedit%d", gi);
                 // Auto-focus input on the first frame it opens
-                if (s_editing_ref_note != s_prev_editing_ref)
+                if (s_editing_ref_hl != s_prev_editing_hl)
                     ImGui::SetKeyboardFocusHere();
                 ImGui::InputTextMultiline(edit_id, s_ref_note_buf, sizeof(s_ref_note_buf),
                                           {txt_w, kTextH});
@@ -2440,15 +3078,8 @@ static void draw_references_tab() {
                     bool in_box = mp.x >= tl.x && mp.x < tl.x + avail
                                && mp.y >= tl.y && mp.y < tl.y + box_h;
                     if (!in_box) {
-                        for (int ni = 0; ni < (int)g_ref_notes.size(); ++ni) {
-                            if (g_ref_notes[ni].after_idx == gi) {
-                                g_ref_notes[ni].text = s_ref_note_buf;
-                                if (g_ref_notes[ni].text.empty())
-                                    g_ref_notes.erase(g_ref_notes.begin() + ni);
-                                break;
-                            }
-                        }
-                        s_editing_ref_note = -1;
+                        note_hl.note = s_ref_note_buf;      // empty text simply clears the note
+                        s_editing_ref_hl = nullptr;
                     }
                 }
 
@@ -2456,27 +3087,29 @@ static void draw_references_tab() {
                 ImGui::GetWindowDrawList()->AddRect(
                     tl, {tl.x + avail, tl.y + box_h}, kBord, kRound);
 
-                // X pinned to top-right corner of the border box
+                // X pinned to top-right corner of the border box — deletes the note
                 ImGui::SetCursorScreenPos({tl.x + avail - kXW - 1.0f, tl.y + 2.0f});
                 char del_id[32]; snprintf(del_id, sizeof(del_id), "X##rnd%d", gi);
                 if (ImGui::SmallButton(del_id)) {
-                    g_ref_notes.erase(g_ref_notes.begin() + note_slot);
-                    s_editing_ref_note = -1;
+                    note_hl.note.clear();
+                    s_editing_ref_hl = nullptr;
                 }
 
                 // Advance cursor past the whole box
                 ImGui::SetCursorPos({cb.x, cb.y + box_h + ImGui::GetStyle().ItemSpacing.y});
 
-            } else if (note_slot >= 0) {
+            } else if (has_note) {
                 // ---- Display: full-box hitbox, DrawList text, X top-right ----
-                const char* note_text = g_ref_notes[note_slot].text.c_str();
+                const char* note_text = note_hl.note.c_str();
                 // Wrap width: avail minus X button, border padding, and extra indent
                 const float wrap_w = avail - kXW - kSpc - kPad * 2.0f - 8.0f;
                 ImVec2 text_sz = ImGui::CalcTextSize(note_text, nullptr, false, wrap_w);
                 const float box_h = kPad * 2.0f + text_sz.y;
 
-                // InvisibleButton covers the whole box — becomes the re-edit hit target
+                // InvisibleButton covers the whole box — becomes the re-edit hit target.
+                // Allow overlap so the X SmallButton drawn on top of it still wins the click.
                 char bg_id[32]; snprintf(bg_id, sizeof(bg_id), "##rna_bg%d", gi);
+                ImGui::SetNextItemAllowOverlap();
                 ImGui::InvisibleButton(bg_id, {avail, box_h});
                 bool bg_clicked = ImGui::IsItemHovered()
                                && ImGui::IsMouseClicked(ImGuiMouseButton_Left);
@@ -2510,9 +3143,9 @@ static void draw_references_tab() {
                 ImGui::SetCursorPos({cb.x, cb.y + box_h + ImGui::GetStyle().ItemSpacing.y});
 
                 if (x_clicked) {
-                    g_ref_notes.erase(g_ref_notes.begin() + note_slot);
+                    note_hl.note.clear();
                 } else if (bg_clicked) {
-                    s_editing_ref_note = gi;
+                    s_editing_ref_hl = &note_hl;
                     strncpy(s_ref_note_buf, note_text, sizeof(s_ref_note_buf) - 1);
                     s_ref_note_buf[sizeof(s_ref_note_buf) - 1] = '\0';
                 }
@@ -2546,8 +3179,7 @@ static void draw_references_tab() {
                     ph_col, ph);
 
                 if (activated) {
-                    g_ref_notes.push_back({gi, ""});
-                    s_editing_ref_note = gi;
+                    s_editing_ref_hl = &note_hl;
                     s_ref_note_buf[0] = '\0';
                 }
             }
@@ -2559,7 +3191,7 @@ static void draw_references_tab() {
         ImGui::PopStyleColor();
         ImGui::Spacing();
     }
-    s_prev_editing_ref = s_editing_ref_note;
+    s_prev_editing_hl = s_editing_ref_hl;
 
     // ---- Open Documents --------------------------------------------------------
     if (g_documents.empty()) return;
@@ -2949,6 +3581,52 @@ static void draw_panel_ui() {
 
     ImGui::EndTabBar();
     ImGui::End();
+}
+
+// --- Canvas (world-space) pen strokes -----------------------------------------
+// Drawn via BackgroundDrawList (above the GL page layer, below ImGui windows) so canvas
+// marks read as "in front" of pages while staying beneath the sidebar. Includes the
+// in-progress stroke as a live preview.
+static void draw_canvas_strokes() {
+    ImDrawList* dl = ImGui::GetBackgroundDrawList();
+    auto draw_one = [&](const AnnotStroke& s) {
+        if (s.pts.size() < 2) return;
+        ImU32 col = IM_COL32((int)(s.r*255), (int)(s.g*255), (int)(s.b*255), (int)(s.alpha*255));
+        float th = s.width * 2.0f;
+        for (size_t i = 1; i < s.pts.size(); ++i) {
+            Vec2 a = g_canvas.world_to_screen(s.pts[i-1]);
+            Vec2 b = g_canvas.world_to_screen(s.pts[i]);
+            dl->AddLine({a.x, a.y}, {b.x, b.y}, col, th);
+        }
+    };
+    for (const auto& s : g_canvas_strokes) draw_one(s);
+    if (g_ann_canvas && g_ann_drawing) draw_one(g_ann_cur_stroke);  // live preview
+}
+
+// Eraser over the canvas removes canvas strokes whose path passes near the cursor (world
+// distance). Runs each frame while the eraser is held; each removed stroke is undoable.
+static void erase_canvas_strokes_at_cursor() {
+    if (g_annot_tool != AnnotTool::Eraser) return;
+    if (!ImGui::IsMouseDown(ImGuiMouseButton_Left)) return;
+    if (ImGui::GetIO().WantCaptureMouse) return;
+    ImVec2 m = ImGui::GetMousePos();
+    Vec2 world = g_canvas.screen_to_world({m.x, m.y});
+    float zoom = g_canvas.get_zoom();
+    float er  = (zoom > 1e-4f) ? (12.0f / zoom) : 12.0f;   // ~12 screen px in world units
+    float er2 = er * er;
+    for (int i = (int)g_canvas_strokes.size() - 1; i >= 0; --i) {
+        bool hit = false;
+        for (const auto& p : g_canvas_strokes[i].pts) {
+            float dx = world.x - p.x, dy = world.y - p.y;
+            if (dx*dx + dy*dy <= er2) { hit = true; break; }
+        }
+        if (hit) {
+            UndoRecord r; r.type = UndoRecord::Type::ErasedCanvasStroke;
+            r.canvas_idx = i; r.erased_stroke = g_canvas_strokes[i];
+            push_undo(r);
+            g_canvas_strokes.erase(g_canvas_strokes.begin() + i);
+        }
+    }
 }
 
 // --- Canvas note badges (drawn via ImGui background list, on top of GL) ----
@@ -3562,275 +4240,6 @@ static void draw_toolbar_ui() {
 
 // ---------------------------------------------------------------------------
 
-// --- Developer benchmark (--benchmark flag; dev build only) -----------------
-//
-// Measures real-world-ish GPU and rasterization performance without requiring
-// a PDF file.  Outputs results to stdout and a JSON file on the Desktop.
-//
-// Usage:   ./Scholion.app/Contents/MacOS/Scholion --benchmark
-//          Scholion.exe --benchmark
-//
-// Phases:
-//  1. System info (GPU, RAM, platform, GL version)
-//  2. GL texture upload — Thumb/Low/High sizes, p50/p95 latency (ms)
-//  3. Synthetic rasterization — simulate the background rast worker rendering
-//     TILE_PX tiles and uploading them; measures time per tile at 256 px
-//  4. Canvas FPS — render loop with N synthetic pages (10/50/100/300/500),
-//     16-texture thumb pool, vsync off; measures min/avg/max FPS per N
-//
-#ifdef SCHOLION_DEV
-#include <sys/types.h>
-#ifdef __APPLE__
-#include <sys/sysctl.h>
-#endif
-
-static void run_benchmark(GLFWwindow* window, Renderer& renderer) {
-    using Clock = std::chrono::steady_clock;
-    using ms    = std::chrono::duration<double, std::milli>;
-
-    // ---- System info --------------------------------------------------------
-    const char* gl_renderer = (const char*)glGetString(GL_RENDERER);
-    const char* gl_vendor   = (const char*)glGetString(GL_VENDOR);
-    const char* gl_version  = (const char*)glGetString(GL_VERSION);
-
-    uint64_t ram_bytes = 0;
-#ifdef __APPLE__
-    size_t sz = sizeof(ram_bytes);
-    sysctlbyname("hw.memsize", &ram_bytes, &sz, nullptr, 0);
-#elif defined(_WIN32)
-    MEMORYSTATUSEX ms2{}; ms2.dwLength = sizeof(ms2);
-    GlobalMemoryStatusEx(&ms2); ram_bytes = ms2.ullTotalPhys;
-#endif
-    double ram_gb = (double)ram_bytes / (1024.0 * 1024.0 * 1024.0);
-
-#ifdef __APPLE__
-    const char* platform = "macOS";
-#elif defined(_WIN32)
-    const char* platform = "Windows";
-#else
-    const char* platform = "Linux";
-#endif
-
-    printf("\n=== Scholion Benchmark ===\n");
-    printf("Platform : %s\n", platform);
-    printf("GPU      : %s (%s)\n", gl_renderer, gl_vendor);
-    printf("GL       : %s\n", gl_version);
-    printf("RAM      : %.1f GB\n\n", ram_gb);
-
-    // ---- Phase 1: GL texture upload latency ---------------------------------
-    struct TierTest { const char* name; int w; int h; };
-    TierTest tiers[] = {
-        { "Thumb (600×850)",   600,  850 },
-        { "Low  (1250×1750)", 1250, 1750 },
-        { "High-tile (256×256)", 256,  256 },
-    };
-
-    printf("--- Phase 1: Texture upload latency ---\n");
-    printf("%-24s  %8s  %8s  %8s\n", "Tier", "p50 ms", "p95 ms", "max ms");
-
-    for (auto& t : tiers) {
-        std::vector<uint8_t> px((size_t)t.w * t.h * 4, 128);
-        GLuint tex = 0;
-        glGenTextures(1, &tex);
-        glBindTexture(GL_TEXTURE_2D, tex);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-
-        // 2 warmup, 7 timed
-        for (int i = 0; i < 2; ++i) {
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t.w, t.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-            glFinish();
-        }
-        std::vector<double> times(7);
-        for (int i = 0; i < 7; ++i) {
-            auto t0 = Clock::now();
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, t.w, t.h, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-            glFinish();
-            times[i] = ms(Clock::now() - t0).count();
-        }
-        glDeleteTextures(1, &tex);
-        std::sort(times.begin(), times.end());
-        printf("%-24s  %8.2f  %8.2f  %8.2f\n",
-               t.name, times[3], times[6], times[6]);
-    }
-
-    // ---- Phase 2: Tile throughput (simulate background rasterizer) ----------
-    // Render TILE_PX×TILE_PX tiles with unique content (like real LOD tiles),
-    // upload them, measure how many tiles/second the GL path can sustain.
-    printf("\n--- Phase 2: Tile throughput ---\n");
-    {
-        constexpr int N_TILES = 64;
-        std::vector<GLuint> texs(N_TILES, 0);
-        glGenTextures(N_TILES, texs.data());
-        std::vector<uint8_t> tile_px((size_t)TILE_PX * TILE_PX * 4);
-
-        auto start = Clock::now();
-        for (int i = 0; i < N_TILES; ++i) {
-            uint8_t grey = (uint8_t)(40 + (i * 3) % 200);
-            std::fill(tile_px.begin(), tile_px.end(), grey);
-            glBindTexture(GL_TEXTURE_2D, texs[i]);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, TILE_PX, TILE_PX, 0,
-                         GL_RGBA, GL_UNSIGNED_BYTE, tile_px.data());
-        }
-        glFinish();
-        double elapsed = ms(Clock::now() - start).count();
-        glDeleteTextures(N_TILES, texs.data());
-        printf("%d tiles (%dx%d) uploaded in %.1f ms = %.0f tiles/sec\n",
-               N_TILES, TILE_PX, TILE_PX, elapsed, N_TILES * 1000.0 / elapsed);
-    }
-
-    // ---- Phase 3: Canvas render FPS with synthetic pages --------------------
-    printf("\n--- Phase 3: Canvas render FPS (vsync OFF) ---\n");
-    printf("%-10s  %8s  %8s  %8s\n", "N pages", "min FPS", "avg FPS", "max FPS");
-
-    glfwSwapInterval(0);  // disable vsync
-
-    // 16-texture thumb pool (unique grey shades)
-    constexpr int POOL = 16;
-    constexpr int THW  = 600, THH = 850;
-    GLuint pool_tex[POOL] = {};
-    glGenTextures(POOL, pool_tex);
-    for (int i = 0; i < POOL; ++i) {
-        uint8_t grey = (uint8_t)(40 + i * 13);
-        std::vector<uint8_t> px((size_t)THW * THH * 4, grey);
-        glBindTexture(GL_TEXTURE_2D, pool_tex[i]);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, THW, THH, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
-    }
-
-    int fb_w, fb_h;
-    glfwGetFramebufferSize(window, &fb_w, &fb_h);
-
-    // Synthetic docs — we'll temporarily populate g_documents with dummy pages
-    // and feed them through the real renderer.draw() path.
-    static const int N_VALS[] = { 10, 50, 100, 300, 500 };
-    for (int N : N_VALS) {
-        // Build synthetic documents (each 1 page)
-        g_documents.clear();
-        g_loaders.clear();
-        constexpr float PAGE_W = 612.0f, PAGE_H = 792.0f;
-        constexpr int   COLS   = 5;
-        for (int i = 0; i < N; ++i) {
-            int col = i % COLS, row = i / COLS;
-            Document doc;
-            doc.path   = "bench_" + std::to_string(i);
-            doc.hue_r  = 0.5f; doc.hue_g = 0.5f; doc.hue_b = 0.5f;
-            Page pg;
-            pg.page_index  = 0;
-            pg.world_pos   = { static_cast<float>(col) * (PAGE_W + 20.0f),
-                                static_cast<float>(row) * (PAGE_H + 20.0f) };
-            pg.world_w     = PAGE_W;
-            pg.world_h     = PAGE_H;
-            pg.tex_thumb   = pool_tex[i % POOL];
-            g_documents.push_back(doc);
-            g_documents.back().pages.push_back(pg);
-            g_loaders.push_back(nullptr);
-        }
-
-        // Fit all pages in view
-        g_canvas.set_zoom(1.0f);
-        g_canvas.set_offset({(float)(COLS / 2) * (PAGE_W + 20.0f),
-                              (float)(N / COLS / 2) * (PAGE_H + 20.0f)});
-
-        // Render for 2 seconds, collect FPS samples
-        constexpr double RUN_S = 2.0;
-        double t_end = glfwGetTime() + RUN_S;
-        double t_prev = glfwGetTime();
-        double fps_min = 1e9, fps_max = 0.0, fps_sum = 0.0;
-        int    fps_n = 0;
-
-        while (glfwGetTime() < t_end) {
-            glfwPollEvents();
-            glViewport(0, 0, fb_w, fb_h);
-            ImGui_ImplOpenGL3_NewFrame();
-            ImGui_ImplGlfw_NewFrame();
-            ImGui::NewFrame();
-
-            DrawHints hints;
-            hints.selected_doc    = nullptr;
-            hints.hovered_page    = nullptr;
-            hints.dragged_page    = nullptr;
-            hints.selection       = nullptr;
-            hints.box_selecting   = false;
-            hints.grid_mode       = GridMode::Off;
-            hints.dark_mode       = true;
-            hints.draw_time       = (float)glfwGetTime();
-            hints.tile_cache      = &g_tile_cache;
-            hints.content_scale   = g_content_scale;
-            renderer.draw(g_canvas, g_documents, hints);
-
-            ImGui::Render();
-            ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
-            glfwSwapBuffers(window);
-
-            double now = glfwGetTime();
-            double dt  = now - t_prev;
-            t_prev = now;
-            if (dt > 0.0) {
-                double fps = 1.0 / dt;
-                fps_min = std::min(fps_min, fps);
-                fps_max = std::max(fps_max, fps);
-                fps_sum += fps;
-                ++fps_n;
-            }
-        }
-
-        double fps_avg = fps_n > 0 ? fps_sum / fps_n : 0.0;
-        printf("%-10d  %8.1f  %8.1f  %8.1f\n", N, fps_min, fps_avg, fps_max);
-    }
-
-    // Restore vsync and clear synthetic docs
-    g_documents.clear();
-    g_loaders.clear();
-    glfwSwapInterval(1);
-    glDeleteTextures(POOL, pool_tex);
-
-    // ---- Write JSON to Desktop ----------------------------------------------
-    char ts_buf[32];
-    {
-        auto t   = std::chrono::system_clock::now();
-        auto now = std::chrono::system_clock::to_time_t(t);
-        std::strftime(ts_buf, sizeof(ts_buf), "%Y%m%d_%H%M%S", std::localtime(&now));
-    }
-    std::string desktop;
-#ifdef __APPLE__
-    const char* home = std::getenv("HOME");
-    desktop = home ? std::string(home) + "/Desktop" : ".";
-#elif defined(_WIN32)
-    wchar_t* dp = nullptr;
-    if (SHGetKnownFolderPath(FOLDERID_Desktop, 0, nullptr, &dp) == S_OK) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, dp, -1, nullptr, 0, nullptr, nullptr);
-        desktop.resize(len - 1);
-        WideCharToMultiByte(CP_UTF8, 0, dp, -1, &desktop[0], len, nullptr, nullptr);
-        CoTaskMemFree(dp);
-    }
-#else
-    desktop = ".";
-#endif
-    std::string json_path = desktop + "/scholion_bench_" + ts_buf + ".json";
-
-    FILE* f = fopen(json_path.c_str(), "w");
-    if (f) {
-        fprintf(f, "{\n");
-        fprintf(f, "  \"platform\": \"%s\",\n", platform);
-        fprintf(f, "  \"gpu\": \"%s\",\n", gl_renderer);
-        fprintf(f, "  \"gl_version\": \"%s\",\n", gl_version);
-        fprintf(f, "  \"ram_gb\": %.1f,\n", ram_gb);
-        fprintf(f, "  \"tile_px\": %d\n", TILE_PX);
-        fprintf(f, "}\n");
-        fclose(f);
-        printf("\nJSON written: %s\n", json_path.c_str());
-    }
-
-    printf("\n=== Benchmark complete ===\n");
-}
-#endif // SCHOLION_DEV
-
-// ---------------------------------------------------------------------------
-
 // Returns true when the app should keep redrawing at the interactive frame rate.
 // When it returns false, the main loop blocks in glfwWaitEventsTimeout() for a
 // long idle interval instead, dropping idle CPU/GPU to near zero (PureRef-style).
@@ -3843,6 +4252,7 @@ static bool app_wants_animation() {
     if (g_dl_state.load(std::memory_order_acquire) == 1)   return true;  // download spinner
     if (g_search_running.load(std::memory_order_acquire))  return true;  // search spinner
     if (g_startup_chooser)                                 return true;  // modal with hover states
+    if (!g_group_remove_flashes.empty())                   return true;  // group-removal flash fading
 
     if (ImGui::IsAnyMouseDown())        return true;  // drag / pan / draw in progress
     if (ImGui::GetIO().WantTextInput)   return true;  // caret blink while editing text
@@ -3851,6 +4261,11 @@ static bool app_wants_animation() {
 }
 
 int main(int argc, char* argv[]) {
+    // Headless self-test: runs the save/load round-trip and exits. No window/GL needed.
+    for (int i = 1; i < argc; ++i)
+        if (std::strcmp(argv[i], "--selftest") == 0)
+            return run_selftest();
+
     signal(SIGINT,  scholion_signal_handler);
     signal(SIGTERM, scholion_signal_handler);
     g_debug = (std::getenv("SCHOLION_DEBUG") != nullptr);
@@ -3957,8 +4372,27 @@ int main(int argc, char* argv[]) {
     ImGui::CreateContext();
     ImGui::GetIO().ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
     ImGui::GetIO().IniFilename = nullptr;
+
+    // Bundled UI font (DejaVu Sans, embedded) replaces the default bitmap font: real Unicode
+    // (ellipsis, dashes, ·, °, Greek) and crisp scaling for the Larger-UI option. Ranges are
+    // static so the pointer stays valid until the atlas is built. See include/font_data.h.
+    {
+        static const ImWchar font_ranges[] = {
+            0x0020, 0x00FF,   // Basic Latin + Latin-1 Supplement (·, °, accented letters)
+            0x2000, 0x206F,   // General Punctuation (… ellipsis, – — dashes, curly quotes)
+            0x0370, 0x03FF,   // Greek
+            0,
+        };
+        ImFontConfig cfg;
+        cfg.OversampleH = 2;
+        cfg.OversampleV = 1;
+        cfg.PixelSnapH  = true;
+        ImGui::GetIO().Fonts->AddFontFromMemoryCompressedTTF(
+            dejavu_sans_compressed_data, dejavu_sans_compressed_size, 15.0f, &cfg, font_ranges);
+    }
+
     try { load_prefs(); } catch (...) {}   // guard against filesystem exceptions on second run
-    apply_theme(g_settings.dark_mode);
+    apply_appearance();   // theme + UI scale (restores the persisted Larger-UI choice)
     ImGui_ImplGlfw_InitForOpenGL(window, true);
     ImGui_ImplOpenGL3_Init("#version 330");
 
@@ -3972,21 +4406,6 @@ int main(int argc, char* argv[]) {
         glfwTerminate();
         return 1;
     }
-
-#ifdef SCHOLION_DEV
-    for (int i = 1; i < argc; ++i) {
-        if (strcmp(argv[i], "--benchmark") == 0) {
-            run_benchmark(window, renderer);
-            renderer.shutdown();
-            ImGui_ImplOpenGL3_Shutdown();
-            ImGui_ImplGlfw_Shutdown();
-            ImGui::DestroyContext();
-            glfwDestroyWindow(window);
-            glfwTerminate();
-            return 0;
-        }
-    }
-#endif
 
     // Bake an elliptical vignette gradient texture (256×256, single upload).
     // Stretched to the full viewport each frame: the circle in texture-space
@@ -4011,6 +4430,16 @@ int main(int argc, char* argv[]) {
         glGenTextures(1, &g_vignette_tex);
         glBindTexture(GL_TEXTURE_2D, g_vignette_tex);
         glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, V, V, 0, GL_RGBA, GL_UNSIGNED_BYTE, px.data());
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glBindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    // App logo (embedded RGBA) — used in the startup chooser and settings footer.
+    {
+        glGenTextures(1, &g_logo_tex);
+        glBindTexture(GL_TEXTURE_2D, g_logo_tex);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, LOGO_W, LOGO_H, 0, GL_RGBA, GL_UNSIGNED_BYTE, LOGO_RGBA);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glBindTexture(GL_TEXTURE_2D, 0);
@@ -4106,7 +4535,7 @@ int main(int argc, char* argv[]) {
     while (!glfwWindowShouldClose(window)) {
         // Graceful exit on SIGINT/SIGTERM — autosave before breaking
         if (g_signal_received) {
-            if (!g_project_path.empty() && !g_documents.empty()) {
+            if (!g_project_path.empty() && !g_documents.empty() && g_load_ok) {
                 fprintf(stderr, "Signal %d — saving %s\n",
                         (int)g_signal_received, g_project_path.c_str());
                 save_to_path(g_project_path);
@@ -4261,9 +4690,20 @@ int main(int argc, char* argv[]) {
         if (g_ann_drawing && !ImGui::IsMouseDown(ImGuiMouseButton_Left))
             finalize_annotation();
 
-        draw_cursor_tool_icon();
-        draw_canvas_text_boxes();
+        // Canvas layers — all on the BackgroundDrawList, so every ImGui window (menus,
+        // panel, dialogs, tooltips) renders on top of them. Painter order (bottom → top):
+        // locked labels → group frames → in-progress annotation → canvas strokes → note
+        // badges → text boxes → cursor icon. Text boxes and the cursor icon are drawn last
+        // (further below) so they stay above the other canvas marks while remaining under
+        // the UI. (g_hovered_box, set in draw_canvas_text_boxes, is then one frame stale
+        // for the double-click guard — harmless, since hover persists across a double-click.)
+        draw_locked_doc_labels();
+        update_group_drag_add();
+        draw_page_groups();
+        draw_group_remove_flashes();
         update_canvas_annotations();
+        erase_canvas_strokes_at_cursor();
+        draw_canvas_strokes();
 
         // Double-click on a page -> open panel scrolled to that page
         if (!ImGui::GetIO().WantCaptureMouse && g_hovered_box < 0
@@ -4313,6 +4753,8 @@ int main(int argc, char* argv[]) {
         }
 
         draw_canvas_note_badges();
+        draw_canvas_text_boxes();  // above the other canvas marks, still below ImGui windows
+        draw_cursor_tool_icon();   // topmost canvas layer, still below the ImGui windows
         draw_toolbar_ui();
         draw_context_menu();
         draw_canvas_context_menu();
@@ -4356,39 +4798,61 @@ int main(int argc, char* argv[]) {
             overlay.set_page_count(visible_pages, total_pages);
         }
 
-        // Render save feedback (temporary "Saved!" message)
-        {
+        // Standing save-status indicator (top-left, below the toolbar): always tells the user
+        // whether their work is safe. Flashes "Saved!" on each save (manual or auto), then rests
+        // at the last-saved clock time; shows "Editing…" when there are unsaved edits, "Unsaved"
+        // before the first save, and a warning when autosave is suppressed (suspect load, #D).
+        if (!g_documents.empty() || !g_project_path.empty()) {
             auto now = std::chrono::steady_clock::now();
-            auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                  now - g_save_feedback_time).count();
-            float fade_duration_ms = (g_save_feedback_type == SaveFeedbackType::Manual) ? 2500.0f : 500.0f;
+            long since_ms = (long)std::chrono::duration_cast<std::chrono::milliseconds>(
+                                now - g_save_feedback_time).count();
+            bool flashing = (g_save_feedback_type != SaveFeedbackType::None && since_ms < 1200);
+            if (g_save_feedback_type != SaveFeedbackType::None && since_ms >= 1200)
+                g_save_feedback_type = SaveFeedbackType::None;   // flash finished
 
-            if (g_save_feedback_type != SaveFeedbackType::None && elapsed_ms < fade_duration_ms) {
-                float alpha = 1.0f - (float)elapsed_ms / fade_duration_ms;
-                const char* msg = (g_save_feedback_type == SaveFeedbackType::Manual) ? "Saved!" : "saved";
-
-                // Tucked just below the toolbar (toolbar top=14, height≈37 → bottom≈51).
-                ImGui::SetNextWindowPos({14.0f, 54.0f}, ImGuiCond_Always, {0.0f, 0.0f});
-                ImGui::SetNextWindowBgAlpha(0.55f * alpha);
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {8.0f, 5.0f});
-                ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
-                ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.12f, 0.15f, 1.0f));
-                ImGui::Begin("##save_feedback", nullptr,
-                    ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
-                    ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
-                    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
-                    ImGuiWindowFlags_AlwaysAutoResize);
-                ImGui::SetWindowFontScale(1.2f);
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.85f, 0.85f, 0.9f, alpha));
-                ImGui::TextUnformatted(msg);
-                ImGui::PopStyleColor();
-                ImGui::SetWindowFontScale(1.0f);
-                ImGui::End();
-                ImGui::PopStyleColor();
-                ImGui::PopStyleVar(2);
-            } else if (elapsed_ms >= fade_duration_ms) {
-                g_save_feedback_type = SaveFeedbackType::None;  // reset after fade
+            char   status[64];
+            ImVec4 col;
+            float  scale = 1.0f;
+            if (flashing) {
+                float a = 1.0f - (float)since_ms / 1200.0f;
+                snprintf(status, sizeof(status), "Saved!");
+                col = ImVec4(0.85f, 0.92f, 1.0f, 0.55f + 0.45f * a);
+                scale = 1.2f;
+            } else if (!g_load_ok) {
+                snprintf(status, sizeof(status), "Autosave paused - save manually");
+                col = ImVec4(0.95f, 0.74f, 0.34f, 0.90f);
+            } else if (g_project_path.empty() || g_last_save_wall == 0) {
+                snprintf(status, sizeof(status), "Unsaved");
+                col = ImVec4(0.62f, 0.62f, 0.68f, 0.65f);
+            } else if (g_dirty) {
+                snprintf(status, sizeof(status), "Editing...");
+                col = ImVec4(0.82f, 0.76f, 0.60f, 0.75f);
+            } else {
+                char clk[32]; std::time_t t = g_last_save_wall;
+                std::strftime(clk, sizeof(clk), "%I:%M %p", std::localtime(&t));
+                const char* c = (clk[0] == '0') ? clk + 1 : clk;   // trim leading-zero hour
+                snprintf(status, sizeof(status), "Saved %s", c);
+                col = ImVec4(0.62f, 0.62f, 0.68f, 0.65f);
             }
+
+            ImGui::SetNextWindowPos({14.0f, 54.0f}, ImGuiCond_Always, {0.0f, 0.0f});
+            ImGui::SetNextWindowBgAlpha(0.5f);
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {8.0f, 5.0f});
+            ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 4.0f);
+            ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.12f, 0.12f, 0.15f, 1.0f));
+            ImGui::Begin("##save_status", nullptr,
+                ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+                ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+                ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                ImGuiWindowFlags_NoInputs | ImGuiWindowFlags_AlwaysAutoResize);
+            ImGui::SetWindowFontScale(scale);
+            ImGui::PushStyleColor(ImGuiCol_Text, col);
+            ImGui::TextUnformatted(status);
+            ImGui::PopStyleColor();
+            ImGui::SetWindowFontScale(1.0f);
+            ImGui::End();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar(2);
         }
 
         overlay.draw(g_canvas);
@@ -4406,7 +4870,9 @@ int main(int argc, char* argv[]) {
         // right-click Save) and on project open, so a user who just saved doesn't
         // get an autosave 1 s later. No autosave when no project path is set yet
         // (new blank session) to avoid a Save-As dialog popping up unexpectedly.
-        if (!g_project_path.empty() && !g_documents.empty()) {
+        // g_load_ok gate: after a suspect load (corrupt/truncated/newer-format), don't let
+        // autosave overwrite the on-disk file — the user must explicitly save first.
+        if (!g_project_path.empty() && !g_documents.empty() && g_load_ok) {
             auto now     = std::chrono::steady_clock::now();
             auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
                                now - g_last_save_time).count();
@@ -4439,8 +4905,9 @@ int main(int argc, char* argv[]) {
     }
 
     // Final save on clean exit (red button / Cmd+Q) so the last edits since the
-    // previous autosave aren't lost. Only when a project path is already set.
-    if (!g_project_path.empty() && !g_documents.empty()) {
+    // previous autosave aren't lost. Only when a project path is set AND the load was clean
+    // (g_load_ok) — a suspect-loaded file is never auto-overwritten, even on quit.
+    if (!g_project_path.empty() && !g_documents.empty() && g_load_ok) {
         // Wait up to 3 s for any in-flight background autosave before writing
         // the exit save. The timeout prevents hanging if the background thread
         // is blocked on a slow disk or network-backed path (e.g. Dropbox).
@@ -4450,8 +4917,11 @@ int main(int argc, char* argv[]) {
                    std::chrono::steady_clock::now() < deadline)
                 std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        if (save_to_path(g_project_path))
+        if (save_to_path(g_project_path)) {
             printf("Saved on exit: %s\n", g_project_path.c_str());
+            // Clean quit → the working file is known-good; drop the crash-recovery backup.
+            std::remove((g_project_path + ".bak").c_str());
+        }
     }
 
     // Stop background workers before cleaning up shared state.
@@ -4463,6 +4933,7 @@ int main(int argc, char* argv[]) {
     rast_shutdown();
 
     if (g_vignette_tex) { glDeleteTextures(1, &g_vignette_tex); g_vignette_tex = 0; }
+    if (g_logo_tex)     { glDeleteTextures(1, &g_logo_tex);     g_logo_tex = 0; }
     if (g_cursor_hand)  { glfwDestroyCursor(g_cursor_hand);  g_cursor_hand  = nullptr; }
     if (g_cursor_arrow) { glfwDestroyCursor(g_cursor_arrow); g_cursor_arrow = nullptr; }
 

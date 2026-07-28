@@ -4,7 +4,7 @@
 
 InputHandler::InputHandler(Canvas& canvas) : m_canvas(canvas) {}
 
-void InputHandler::on_mouse_button(GLFWwindow* window, int button, int action, int mods) {
+void InputHandler::on_mouse_button(GLFWwindow* window, int button, int action, int mods, bool tools_active) {
     if (button == GLFW_MOUSE_BUTTON_MIDDLE) {
         m_panning = (action == GLFW_PRESS);
         if (m_panning) m_last_mouse = m_current_mouse;
@@ -21,7 +21,9 @@ void InputHandler::on_mouse_button(GLFWwindow* window, int button, int action, i
     }
 
     if (button == GLFW_MOUSE_BUTTON_LEFT && !m_space_held) {
-        if (action == GLFW_PRESS) {
+        // While a tool is active, the canvas is for tool actions (draw / create box), not
+        // moving items — suppress all item drag/selection so pages don't move underneath.
+        if (action == GLFW_PRESS && !tools_active) {
             bool shift = (mods & GLFW_MOD_SHIFT) != 0;
             bool cmd   = (mods & GLFW_MOD_SUPER) || (mods & GLFW_MOD_CONTROL);
             auto hit = hit_test(m_current_mouse);

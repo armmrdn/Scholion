@@ -11,7 +11,10 @@ class InputHandler {
 public:
     InputHandler(Canvas& canvas);
 
-    void on_mouse_button(GLFWwindow* window, int button, int action, int mods);
+    // tools_active: when true (an annotation/text tool is up), left-press item interaction
+    // (page/doc drag, multi-drag, rubber-band select) is suppressed so nothing gets moved —
+    // panning (middle-mouse / space+drag) still works.
+    void on_mouse_button(GLFWwindow* window, int button, int action, int mods, bool tools_active = false);
     void on_cursor_move(GLFWwindow* window, double xpos, double ypos);
     void on_scroll(GLFWwindow* window, double xoffset, double yoffset);
     void on_key(GLFWwindow* window, int key, int scancode, int action, int mods);
@@ -35,9 +38,21 @@ public:
     }
 
     bool is_panning()       const { return m_panning; }
+    bool is_space_held()    const { return m_space_held; }
     bool is_multi_dragging() const { return m_multi_drag_active; }
     Vec2 multi_drag_grab_world() const { return m_multi_drag_grab_world; }
     void start_multi_drag(Vec2 grab_screen);
+
+    // Grab an explicit set of pages (a page group) and start a rigid multi-drag,
+    // replacing the current selection. Used by the group-frame handle so dragging a
+    // group's frame moves all its members at once. Reuses start_multi_drag's grab-
+    // point-relative model, so the existing multi-drag undo path applies unchanged.
+    void begin_group_drag(const std::vector<Page*>& pages, Vec2 grab_screen) {
+        m_selection.clear();
+        m_selected_text_boxes.clear();
+        for (Page* p : pages) m_selection.insert(p);
+        start_multi_drag(grab_screen);
+    }
 
     const Document* selected_doc() const { return m_selected_doc; }
     const Document* hovered_doc()  const { return m_hovered_doc; }

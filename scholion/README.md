@@ -82,7 +82,8 @@ Selected pages show a blue outline. A translucent blue rectangle appears during 
 | Fan pages vertically | Lay all pages of the document in a vertical column |
 | Fan pages horizontally | Lay all pages in a horizontal row |
 | Stack pages | Reset all pages to the original diagonal fan layout |
-| Rotate CW / CCW / 180° / Reset | Rotate the page in 90°/180° steps, or reset to upright — annotations follow |
+| Rotate 90° | Rotate the page 90° clockwise (repeat for 180°/270°/upright) — annotations follow |
+| Normalize Size | Scale the document to match the standard page size of the other documents on the canvas |
 | Reveal in Finder | Open containing folder in macOS Finder |
 
 ### Right-click on empty canvas
@@ -117,7 +118,7 @@ Click any page to open the panel viewer on the right side of the window.
 
 | Tool | Shortcut | Behavior |
 |------|----------|---------|
-| Pen | P | Freehand stroke on the active page; hold **Shift** to lock the line straight (snaps to 45°) |
+| Pen | P | Freehand stroke on a page, or directly on the empty canvas (canvas marks stay world-locked, in front); hold **Shift** to lock the line straight (snaps to 45°) |
 | Highlight | H | Two modes via toolbar toggle: **Box** drags a rectangle to reliably capture text into References; **Freehand** swipes like a marker. Both capture the text they cover; over non-text, Box leaves a highlight rectangle and Freehand a persistent translucent marker |
 | Note / Flag | F | Stamp a sequentially-labeled flag (A, B … Z, 2A, 2B …) |
 | Eraser | — | Drag over strokes/highlights to erase them |
@@ -256,3 +257,4 @@ Panel UI        — Dear ImGui sidebar, annotation tools, resize handle
 - [x] M15 — Status overlay + Cmd+S save (F3 overlay, zoom %, Cmd+S, save-on-quit; text-box ESC/style)
 - [x] M16 — UI polish: ESC tool deactivation, vignette toggle, flag cursor icon, flag removal by click, spacebar panel close, settings credits
 - [x] M17 — v1.3: highlighter Box/Freehand modes (glyph-lock → References + freehand markers), pen Shift ortho-lock (45° straight lines), per-box zoom-scaling text, page rotation 180°/reset, event-driven render loop (near-zero idle CPU), tool-race + light-mode readability fixes
+- [x] M18 — v1.4: References polish (Open Documents always visible, doc-colored threads, collapsible blurbs, line-break capture), Normalize Size, canvas pen marks (world-locked), tool movement-lock, and file durability — portable relative paths, crash-recovery `.bak`, format versioning + integrity checksum + anti-clobber, standing save-status indicator

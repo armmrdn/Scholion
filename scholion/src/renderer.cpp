@@ -187,10 +187,11 @@ void Renderer::draw(const Canvas& canvas, const std::vector<Document>& docs,
         draw_placeholder_pages(canvas);
     } else {
         draw_pdf_pages(canvas, docs, hints);
-        if (hints.selected_doc) draw_threads(canvas, *hints.selected_doc);
+        // Selected/dragged doc → maroon; sidebar-toggled docs → their own hue.
+        if (hints.selected_doc) draw_threads(canvas, *hints.selected_doc, /*hued=*/false);
         for (const auto& doc : docs)
             if (&doc != hints.selected_doc && doc.show_threads)
-                draw_threads(canvas, doc);
+                draw_threads(canvas, doc, /*hued=*/true);
 
         // Rubber-band box selection overlay
         if (hints.box_selecting) {
@@ -541,13 +542,16 @@ void Renderer::draw_pdf_pages(const Canvas& canvas, const std::vector<Document>&
                               page.world_w, STRIPE_H,
                               doc.hue_r, doc.hue_g, doc.hue_b, 0.55f);
                 } else {
-                    // Three placeholder states — each with a distinct color:
+                    // Placeholder states — each with a distinct color:
                     //   missing PDF  → dark grey (document unresolvable)
+                    //   locked PDF   → muted indigo (password-protected)
                     //   rast failed  → warm rose (page unreadable; no retry)
                     //   loading      → warm white with a slow breathing shimmer
                     float fr, fg, fb;
                     if (doc.missing) {
                         fr = 0.28f; fg = 0.28f; fb = 0.31f;
+                    } else if (doc.locked) {
+                        fr = 0.19f; fg = 0.21f; fb = 0.33f;
                     } else if (page.rast_failed) {
                         fr = 0.96f; fg = 0.89f; fb = 0.88f;
                     } else {
@@ -645,8 +649,13 @@ static EdgeAnchor nearest_edge_anchor(const Page& page, Vec2 toward) {
     }
 }
 
-void Renderer::draw_threads(const Canvas& canvas, const Document& doc) {
+void Renderer::draw_threads(const Canvas& canvas, const Document& doc, bool hued) {
     if (doc.pages.size() < 2) return;
+
+    // Wire color: default maroon, or the document's assigned hue when toggled from the
+    // Open Documents list. Same faint alphas either way (glow halo + core wire).
+    float gr = hued ? doc.hue_r : 0.42f, gg = hued ? doc.hue_g : 0.03f, gb = hued ? doc.hue_b : 0.06f;
+    float cr = hued ? doc.hue_r : 0.52f, cg = hued ? doc.hue_g : 0.05f, cb = hued ? doc.hue_b : 0.08f;
 
     std::vector<const Page*> ordered;
     ordered.reserve(doc.pages.size());
@@ -709,15 +718,15 @@ void Renderer::draw_threads(const Canvas& canvas, const Document& doc) {
             glow.push_back(pos.y - nrm.y * GW);
         }
 
-        // Glow: faint maroon halo (midpoint between original and reduced opacity)
-        glUniform4f(m_color_color_loc, 0.42f, 0.03f, 0.06f, 0.055f);
+        // Glow: faint halo (maroon by default, or the document's hue)
+        glUniform4f(m_color_color_loc, gr, gg, gb, 0.055f);
         glBufferData(GL_ARRAY_BUFFER,
                      static_cast<GLsizeiptr>(glow.size() * sizeof(float)),
                      glow.data(), GL_STREAM_DRAW);
         glDrawArrays(GL_TRIANGLE_STRIP, 0, VERT_N);
 
-        // Core wire: dark maroon (midpoint between original and reduced opacity)
-        glUniform4f(m_color_color_loc, 0.52f, 0.05f, 0.08f, 0.34f);
+        // Core wire (dark maroon by default, or the document's hue)
+        glUniform4f(m_color_color_loc, cr, cg, cb, 0.34f);
         glBufferData(GL_ARRAY_BUFFER,
                      static_cast<GLsizeiptr>(strip.size() * sizeof(float)),
                      strip.data(), GL_STREAM_DRAW);

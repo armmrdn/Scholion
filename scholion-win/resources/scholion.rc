@@ -18,8 +18,8 @@ IDI_ICON1 ICON "AppIcon.ico"
 
 // Version information block (visible in Explorer → Properties → Details tab)
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION    1,3,0,0
-PRODUCTVERSION 1,3,0,0
+FILEVERSION    1,4,0,0
+PRODUCTVERSION 1,4,0,0
 FILEFLAGSMASK  0x3fL
 FILEFLAGS      0x0L
 FILEOS         VOS__WINDOWS32
@@ -32,12 +32,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "Scholion"
             VALUE "FileDescription",  "Scholion — Infinite Canvas PDF Workspace"
-            VALUE "FileVersion",      "1.3.0.0"
+            VALUE "FileVersion",      "1.4.0.0"
             VALUE "InternalName",     "Scholion"
             VALUE "LegalCopyright",   ""
             VALUE "OriginalFilename", "Scholion.exe"
             VALUE "ProductName",      "Scholion"
-            VALUE "ProductVersion",   "1.3.0.0"
+            VALUE "ProductVersion",   "1.4.0.0"
         END
     END
     BLOCK "VarFileInfo"

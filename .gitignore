@@ -28,6 +28,8 @@ Thumbs.db
 *.tmp
 *.log
 *.tar.gz
+*.tgz
+*.icloud
 
 # Local-only development log (never committed — full archive of plans and changes)
 DEVLOG.md

@@ -1,147 +1,229 @@
 # Scholion — TODO / Backlog
 
-Items are ordered by priority.
+Consolidated backlog (updated 2026-07-28). Tiered by when it must happen. The **Completed**
+archive is at the bottom.
 
 ---
 
-## Pending
+## Tier 0 — v1.4 ship readiness (nothing blocking if pushing as-is)
 
-### Icon upscaling for high-DPI and large-format usage
-**Goal:** the current `AppIcon.icns` / `AppIcon.ico` / Linux `.png` master artwork needs
-a high-resolution source so the icon renders sharply in contexts that demand large sizes:
-macOS Launchpad (128×128 / 256×256 / 512×512 @2x), Windows taskbar and Start menu
-(256×256), and Linux application menus / dock launchers (128×128 or larger).
+v1.4 is feature-complete and builds clean on all three trees; the headless save/load self-test
+(`Scholion --selftest`) runs in CI. If pushing v1.4 as-is, **no engineering work is required** — the
+only true gate items (Tier 1) are decisions, and the current AGPL/private-repo posture is internally
+consistent (see Tier 1). Remaining polish is Tier 3+.
 
-**Work required:**
-- Produce or commission a vector or high-res raster master at 1024×1024 minimum
-- Regenerate `scholion/resources/AppIcon.icns` via `scripts/make_icon.py` with the new master
-- `make_icon.py` auto-exports `scholion-win/resources/AppIcon.ico` in the same run
-- Add a `512×512.png` and `256×256.png` export to `scholion-lnx/resources/` for `.desktop` file use on Linux
-- Update the Linux CI bundle step to include the icon alongside the binary
-
-**Status:** pending.
+- [ ] **Finalize `RELEASE_NOTES.md` + commit + tag** — the notes are drafted (full v1.4 snapshot).
+      Sequence: commit → push `main` → create `v1.4` tag via the GitHub API (branch protection blocks
+      direct tag push). CI builds/publishes all three platforms. (Task #7.)
 
 ---
 
-### Remove benchmarking / developer-mode code before open-source release
-**Goal:** strip all profiling/logging code that is inappropriate for public distribution.
+## Tier 1 — DECIDE & ACT (final items; owner: you)
 
-**What to remove from `scholion/src/main.cpp`:**
-- `get_process_ram_mb()` function
-- `g_bench_file`, `g_bench_start`, `g_bench_last_write` globals
-- `bench_open()` and `bench_write()` functions
-- `AppSettings::developer_mode` field and its `save_prefs()` / `load_prefs()` lines
-- Developer Mode checkbox block in `draw_settings_popup()`
-- Main loop line: `if (g_settings.developer_mode) bench_open();`
-- `#include <psapi.h>` in the `_WIN32` block
-- `#include <mach/mach.h>` in the `__APPLE__` block
+These are the real gate for a *public* release. They are decisions, not code — though (a) can spawn
+a large engineering effort depending on the answer.
 
-**What to remove from `scholion-win/CMakeLists.txt`:**
-- `psapi` entry in `target_link_libraries`
+- [ ] **(a) Licensing / distribution model — AGPL vs. closed.** MuPDF is **AGPL-3.0**. Distributing
+      binaries linked against it obliges offering complete corresponding source under AGPL.
+      Two consistent paths:
+      - **Open-source under AGPL** (repo goes public, source offered) → v1.4 can ship now as-is.
+      - **Keep closed / proprietary** → must swap the PDF backend (see Tier 2e) *before* any public
+        binary distribution. Until then, keep the repo **private** and distribution **restricted**.
+      The current state (private repo, restricted releases) is fine as a holding pattern. This
+      decision drives (b), Tier 2e, and the whole distribution roadmap.
+- [ ] **(b) Notarize (macOS) + code-sign (Windows).** Today: ad-hoc macOS signing → Gatekeeper
+      "unidentified developer"; unsigned `.exe` → SmartScreen warning. For a professional audience:
+      Apple Developer ID + `notarytool` (replace the ad-hoc `-` in `scholion/CMakeLists.txt`), and an
+      Authenticode cert for Windows. Requires paid certs (Apple $99/yr; Windows OV/EV cert). Do
+      before wide public release; not needed while distribution is restricted.
 
-**Note:** this code is currently gated behind the `SCHOLION_DEV` compile flag and is never
-enabled in release builds (CI only sets it on the `develop` branch). Safe to ship as-is;
-cleanup is required before the repo goes public.
-
-**Status:** pending (safe for binary releases; required before open-sourcing).
-
----
-
-### Performance optimization — lightweight hardware support
-**Goal:** run smoothly on hardware with limited CPU/GPU/VRAM.
-
-**Areas to explore:**
-- Rasterization pipeline: batch MuPDF calls, reduce background thread wake frequency
-- LOD strategy: adaptive tier selection based on available GPU memory
-- Texture caching: memory pooling or streaming from disk
-- Rendering: instancing, batched draw calls, reduced shader overhead
-- Frame timing: adaptive refresh, frame-skipping on idle — **done in v1.3** (event-driven render loop)
-- Input: reduce per-frame hit-testing cost on large canvases
-
-**Status:** frame-timing/idle addressed in v1.3; rasterization/LOD/texture/rendering items still pending.
+> Leaning per the owner: **push v1.4 as-is now**, and defer (a)/(b) + Tier 2 to a later major version
+> that reworks distribution.
 
 ---
 
-### Windows — `.scholion` file association
-**Goal:** double-clicking a `.scholion` file in Explorer opens Scholion directly.
+## Tier 2 — Deferred to a future major version (large refactor / restructure)
 
-The `argv[1]` path handling already works; only the registry association is missing.
-Requires either a simple NSIS/WiX installer step or a first-run registry write.
+High structural value, high regression risk — intentionally **not** in v1.4. Group these into a
+"v2 / restructure" milestone.
 
-**Status:** pending.
+- [ ] **(e) PDF backend swap — ONLY IF going closed-source.** Replace AGPL MuPDF with pdfium (BSD)
+      or a commercial MuPDF license. This is the single dependency blocking proprietary distribution;
+      every other bundled dep is already permissive (ImGui MIT, GLFW zlib, tinyfiledialogs zlib, GLAD
+      MIT/PD, DejaVu Sans Bitstream Vera). Sizeable port (raster + text-extraction + search paths in
+      `pdf_loader.cpp`).
+- [ ] **Stable page/document IDs (replace raw `Page*` identity).** Selection, drag, undo, hover, and
+      thread ordering all store raw `Page*` into `std::vector<Page>`, which reallocates on add/remove
+      — the root cause of the whole class of pointer-invalidation bugs patched over time (undo-scrub
+      on doc removal, `clear_selection` on `set_documents`, relink carry-over). Introduce integer
+      handles + lookup. Also gives the file format a real stable key (helps the note-migration story).
+- [ ] **Carve up `main.cpp` (~4,900 lines).** Extract input handling, the undo system, the sidebar/
+      panels, and the toolbar into their own translation units. Biggest maintainability win.
+- [ ] **Replace the hand-rolled tolerant JSON parser** (`project_io.cpp`) with a real JSON parser
+      (e.g. a single-header lib). Removes the substring-based section inference and per-record
+      `sscanf` brittleness (the fixed buffer-overflow was a symptom); enables a proper schema/
+      migration framework beyond the current `format:1` + tolerant reads.
+- [ ] **Distribution restructure** — installer (Windows `.scholion` association, Start-menu entry),
+      auto-update mechanism (Sparkle on macOS / equivalent), and the signing pipeline from Tier 1b.
+
+---
+
+## Tier 3 — Smaller pending features
+
+- [ ] **Windows `.scholion` file association.** `argv[1]` handling already works; only the registry
+      association is missing (NSIS/WiX installer step or first-run `HKEY_CLASSES_ROOT` write).
+- [ ] **Icon upscaling for high-DPI / large formats.** Produce a 1024×1024+ master (we now have
+      `resources/scholion_icon_1024.png`); regenerate `.icns`/`.ico` via `scripts/make_icon.py`; add
+      256/512 PNGs for Linux `.desktop` launchers and include them in the Linux CI bundle.
+- [ ] **Performance for low-end hardware.** Frame-timing/idle was done in v1.3 (event-driven loop).
+      Still open: batch MuPDF calls, adaptive LOD by available VRAM, texture pooling/streaming,
+      batched draw calls, and reducing per-frame hit-test cost on large canvases (see robustness).
+
+---
+
+## Tier 4 — Robustness, QA & sustainability (recommended for future releases)
+
+- [ ] **Expand the test corpus.** The self-test covers a happy-path round-trip + overflow + note
+      migration. Add: a corpus of real/old `.scholion` files, more crafted-corrupt inputs, and light
+      fuzzing of the parser. (Largely subsumed by the "real JSON parser" refactor.)
+- [ ] **Spatial index for scale.** Every overlay iterates all documents/pages each frame (O(pages)).
+      Fine at the stated ~100-page ceiling; a spatial index is needed to scale materially beyond it.
+- [ ] **Keep MuPDF current.** MuPDF has a real CVE history; track upstream and bump the bundled
+      version periodically (calls are already `fz_try`/`fz_catch`-wrapped, so crashes are contained).
+- [ ] **`doc.hue` stability.** Document color is derived from load order, so a doc's hue (and its
+      group's boundary color) can shift if docs are added/removed between sessions. Persist the hue
+      per document to fix the cosmetic instability.
+- [ ] **Build-system dedup.** A new source file must be added to all three CMakeLists — a documented
+      footgun. Factor the shared source list into one `*.cmake` include.
+- [ ] **Repo consolidation / de-cruft before the next major push.** Sweep the whole repository and
+      keep only assets and files that are actively used: prune stale/duplicate docs (SESSION_SUMMARY,
+      redundant CLAUDE/README overlap), dead scripts, orphaned resources, leftover local backup
+      tarballs and `.icloud` stubs, and any unreferenced headers/assets. Goal: a lean tree where
+      everything present is built, shipped, or documented — nothing vestigial.
+- [ ] **Embedded-asset weight.** `include/font_data.h` (~1.6 MB) + `include/logo_data.h` (~230 KB)
+      are generated headers. Acceptable, but a subsetted font (fonttools) would shrink the font
+      embed substantially if compile time/repo size becomes a concern.
+- [ ] **Optional, longer-horizon:** localization/i18n (English-only today), an opt-in crash reporter
+      or update check, and accessibility passes beyond the Larger-UI toggle.
+
+---
+
+## Notes on IP protection (only relevant if you go closed-source)
+
+- The **only** legal blocker to proprietary distribution is MuPDF (AGPL) — swap it (Tier 2e). All
+  other bundled components are permissively licensed and bundle-able in a closed binary; keep their
+  license texts shipped (DejaVu's is in `third_party/fonts/DejaVu-LICENSE.txt`).
+- Until the swap, protect the IP simply by **keeping the repo private and restricting binary
+  distribution** — do not publish AGPL-linked binaries to a public release page.
+- Once closed: signed/notarized binaries (Tier 1b) double as authenticity/anti-tamper identity.
+  Heavy obfuscation is generally not worth the effort for a desktop app of this kind.
 
 ---
 
 ## Completed
 
+### ✓ Dev/benchmark code stripped — 2026-07-28
+Removed the `--benchmark` `run_benchmark()` block + arg handler, the CSV-logger/Developer-Mode code
+and its globals/includes (psapi, mach), and the `SCHOLION_DEV` CMake option + block in all three
+trees. No references remain; release binaries unaffected.
+
+### ✓ Parser buffer-overflow fix + headless round-trip self-test — v1.4
+Bounded the unbounded `sscanf("%[^\"]")` path/rel/note reads (`%4095[^\"]`). Added `src/selftest.cpp`
+(`--selftest`): headless save/load round-trip over every persisted field + an over-long-path overflow
+regression + a legacy note-migration case. Wired into CI (build-macos; non-zero exit fails the build).
+
+### ✓ Reference-note keying rewrite + bundled font — v1.4
+Notes now live on `AnnotHighlight::note` (was keyed by fragile list position → mis-keyed/orphaned).
+Editing tracks a stable `AnnotHighlight*`; serialized as per-highlight `rn`; pre-v1.4 files migrated.
+Bundled DejaVu Sans (embedded, ImGui-compressed) replacing the ProggyClean bitmap font → real Unicode
+(ellipsis, dashes, ·, °, Greek) + crisp Larger-UI scaling.
+
+### ✓ Cross-document page grouping — v1.4
+`group_id` on Page + a groups table; document-colored dim rounded boundary (concentric per doc);
+renamable label; frame/label-handle move; **Cmd/Ctrl+G** group, **Cmd/Ctrl+Shift+G** ungroup;
+drag-and-hold (~0.8s) to add; right-click **Remove Page from Group** (with a fading leave-group
+flash); nondestructive, undoable; back-compatible save/load; relink preserves membership.
+
+### ✓ Larger-UI toggle + startup-chooser centering + app logo — v1.4
+Settings → Appearance "Larger UI" scales all chrome (FontGlobalScale + ScaleAllSizes), persisted.
+Startup chooser re-centered (measures widest element) in both UI modes. Embedded app logo in the
+splash + settings footer.
+
+### ✓ Canvas z-layering fix — v1.4
+Text boxes + cursor icon moved from the Foreground to the Background draw list so context menus /
+tooltips / dialogs render on top of them (was: text boxes painted over the right-click menu).
+
+### ✓ Encrypted / password-protected PDF placeholder — v1.4
+`PdfLoader::load` checks `fz_needs_password`; a locked PDF stands in as a distinct indigo placeholder
+page labelled "Password-protected PDF" (context menu shows it too), skips rasterization, re-derived
+on load.
+
+### ✓ Rotation simplified to a single Rotate 90° — v1.4
+Replaced CW/CCW/180/Reset with one clockwise 90° step (repeat to reach any orientation). 45° confirmed
+infeasible without a cross-cutting rotated-geometry refactor.
+
+### ✓ References sidebar polish — v1.4
+Open Documents list always visible; document threads take the doc's hue when toggled from the sidebar;
+per-reference disclosure arrow; captured references preserve line breaks.
+
+### ✓ Normalize Size — v1.4
+Right-click a document → scale it to the median page height of the other docs (fallback Letter),
+about its centroid. New `UndoRecord::Type::DocScale`.
+
+### ✓ Canvas pen marks — v1.4
+Pen strokes started on empty canvas become world-locked `g_canvas_strokes` (drawn in front); page
+strokes unchanged. Own render pass, eraser, undo, and `.scholion` persistence (annots `doc=-1`).
+
+### ✓ Tool movement-lock — v1.4
+While any annotation/text tool is active, item drag/selection is suppressed so drag-creating a box no
+longer moves the page.
+
+### ✓ File compatibility + durability hardening — v1.4
+`.scholion` header gains `format`/`app`/`hash`; FNV-1a integrity verify + newer-format guard →
+suspect loads warn + suppress autosave (`g_load_ok`); portable relative `rel` paths; atomic write +
+`fsync` + one-deep `.bak` (removed on clean quit); standing save-status indicator.
+
 ### ✓ Highlighter Box/Freehand modes — v1.3
-Highlighter has a toolbar mode toggle (`g_hl_box_mode`, default Box). Box = rectangle drag;
-Freehand = marker swipe. BOTH capture glyphs via center-in-AABB (reliable) → References. Non-text:
-Box → plain highlight rect, Freehand → translucent marker stroke. `AnnotStroke` gained
-`width`/`alpha` (serialized `sw`/`sa`, back-compatible) for the marker.
+Toolbar mode toggle (default Box). Both capture glyphs via center-in-AABB → References. Non-text:
+Box → plain rect, Freehand → translucent marker. `AnnotStroke` gained `width`/`alpha` (serialized).
 
 ### ✓ Pen ortho-lock (Shift = straight line) — v1.3
-Holding Shift while drawing collapses the stroke to a straight segment from its start, snapped to
-the nearest 45° in world-aspect space. Shared `stroke_add_point()` helper; applies to pen + freehand
-highlighter. No serialization change.
+Shift collapses the stroke to a straight segment snapped to the nearest 45°. Shared
+`stroke_add_point()`; applies to pen + freehand highlighter.
 
 ### ✓ Per-box zoom-scaling text — v1.3
-`CanvasTextBox.zoom_scaled` + a "Scale" toggle in the text property strip: font and box scale
-with canvas zoom while stored `w/h/font_size` stay canonical at 100%. Shared `text_box_layout()`
-drives draw, hover, and hit-test so they never diverge. Serialized as `zs` (back-compatible).
-
-### ✓ Page rotation 180° / reset — v1.3
-Added "Rotate 180°" and "Reset Rotation" to the page context menu; fixed `apply_page_rotation`
-to swap `world_w/h` only on odd 90° turns (the old unconditional swap was wrong for 180°/reset).
+`CanvasTextBox.zoom_scaled` + a "Scale" toggle: font and box scale with zoom while stored values stay
+canonical at 100%. Shared `text_box_layout()`; serialized as `zs`.
 
 ### ✓ Event-driven render loop — v1.3
-Canvas renders on demand (`glfwWaitEventsTimeout` + worker `glfwPostEmptyEvent`) instead of
-continuously; idle CPU/GPU drop to near zero on macOS/Linux. Overlay shows an "idle" state.
-(Partial completion of the Performance item below — frame-timing/idle skipping.)
+Canvas renders on demand (`glfwWaitEventsTimeout` + `glfwPostEmptyEvent`); idle CPU/GPU near zero.
 
 ### ✓ Tool-exclusion + light-mode fixes — v1.3
-Synchronous text-box hit-test (`text_box_at`) so a click on a box can't also start an annotation
-on the page beneath it; double-click-to-edit disarms any active annotation tool; References notes
-are readable in Light mode (edit box pins light text on its dark background; note text theme-aware).
+Synchronous `text_box_at`; double-click-to-edit disarms annotation tools; References notes readable
+in Light mode.
 
-### ✓ Linux port — v1.1
-`scholion-lnx/` build tree; CI job on `ubuntu-22.04`; `Scholion-Linux.zip` release asset.
-Platform-specific: GLAD loader, `xdg-open` for reveal-in-file-manager, X11/GLFW.
+### ✓ Linux port — v1.1 · Windows port — v1.0
+`scholion-lnx/` + `scholion-win/` build trees, CI jobs, zipped release assets.
 
 ### ✓ Annotation coordinate fix on rotated pages — v1.1
-`screen_to_page_norm()` now inverts the rotation transform so pen strokes, highlight
-glyph collection, and eraser all operate in PDF-native normalized space regardless of
-page rotation. Single function change in `canvas_annot.cpp`.
+`screen_to_page_norm()` inverts the rotation transform so annotations operate in PDF-native space.
 
 ### ✓ Clean shutdown — v1.1
-`rast_cancel_all()` called before `rast_shutdown()` so the worker thread exits
-immediately on quit rather than draining the full task queue.
-
-### ✓ Windows port — v1.0
-`scholion-win/` build tree; CI job on `windows-2022` (MSYS2/MinGW64); `Scholion-Windows.zip`
-release asset with DLLs bundled. GLAD 3.3 Core, AppIcon.ico, DPI-awareness manifest,
-dark title bar via `DwmSetWindowAttribute`.
+`rast_cancel_all()` before `rast_shutdown()` so the worker exits immediately on quit.
 
 ### ✓ Text-snapping highlights + References tab — M29
-Highlight tool snaps to MuPDF character bounding boxes; captured text feeds the
-References sidebar tab with filename + page number; Markdown export via save dialog.
+Highlight snaps to MuPDF char boxes; captured text feeds the References tab; HTML export.
 
 ### ✓ Panel interaction redesign — M27
-Single-click selects, double-click opens panel, Space tap toggles panel.
-Text boxes no longer render over the open panel.
+Single-click selects, double-click opens panel, Space tap toggles; text boxes no longer over the panel.
 
-### ✓ Rubber-band select for text boxes — M23
-Rubber-band box now includes text boxes in the selection. Additive in Cmd+drag mode.
-
-### ✓ Modifier-click multi-select — M20–M22
-Cmd/Ctrl+click toggles pages and text boxes individually into a unified selection.
-Shift+click remains whole-document toggle. Group drag moves all selected items rigidly.
+### ✓ Modifier-click multi-select — M20–M22 · Rubber-band text boxes — M23
+Cmd/Ctrl+click toggles items into a unified selection; Shift+click = whole document; rigid group drag.
 
 ### ✓ Save / load hardening — M17–M18
-Text-box wipe on load fixed; missing-PDF index shift fixed; startup chooser;
-missing-PDF placeholders with relink; position/record-based parser (CRLF-tolerant).
+Text-box wipe fixed; missing-PDF index shift fixed; startup chooser; placeholders + relink;
+record-based CRLF-tolerant parser.
 
 ### ✓ Core milestones — M1–M16
-Canvas + pan/zoom, PDF rasterization, stacks, annotations, multi-select, save/load,
-autosave, VRAM optimization (350 MB budget, 3-tier LOD), text boxes, full-text search,
-status overlay, UX polish.
+Canvas + pan/zoom, PDF rasterization, stacks, annotations, multi-select, save/load, autosave, VRAM
+optimization (350 MB budget, 3-tier LOD), text boxes, full-text search, status overlay, UX polish.

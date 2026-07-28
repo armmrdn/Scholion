@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(Scholion VERSION 1.3.0 LANGUAGES C CXX)
+project(Scholion VERSION 1.4.0 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -68,7 +68,6 @@ target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 # MuPDF (Linux static libs — built from source in CI)
 # ---------------------------------------------------------------------------
 option(SCHOLION_WITH_MUPDF "Link MuPDF for PDF rasterization" OFF)
-option(SCHOLION_DEV        "Enable developer/diagnostic tools (benchmark, CSV logger)" OFF)
 
 if(SCHOLION_WITH_MUPDF)
     set(MUPDF_INC "${SHARED_3P}/mupdf/include")
@@ -99,6 +98,7 @@ add_executable(Scholion
     ${SHARED_SRC}/overlay.cpp
     ${SHARED_SRC}/pdf_loader.cpp
     ${SHARED_SRC}/texture_cache.cpp
+    ${SHARED_SRC}/selftest.cpp
     # ---- Linux-specific source ----------------------------------------------
     ${CMAKE_SOURCE_DIR}/src/platform_linux.cpp
     # ---- Shared third-party -------------------------------------------------
@@ -129,10 +129,6 @@ if(SCHOLION_WITH_MUPDF)
     target_compile_definitions(Scholion PRIVATE SCHOLION_HAVE_MUPDF)
 endif()
 
-if(SCHOLION_DEV)
-    target_compile_definitions(Scholion PRIVATE SCHOLION_DEV)
-    message(STATUS "SCHOLION_DEV: developer/diagnostic tools enabled")
-endif()
 
 message(STATUS "Scholion Linux build configured")
 message(STATUS "  Shared source : ${SHARED_SRC}")

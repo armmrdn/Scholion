@@ -46,6 +46,27 @@ bool PdfLoader::load(const std::string& path, Document& doc, Vec2 world_origin) 
         return false;
     }
 
+    // Encrypted / password-protected: the document opens but can't be rasterized or
+    // read without authentication. Present it as a single distinct placeholder page
+    // rather than a blank/failed load, so the user sees why nothing renders.
+    int needs_pw = 0;
+    fz_try(m_ctx)  { needs_pw = fz_needs_password(m_ctx, m_doc); }
+    fz_catch(m_ctx){ needs_pw = 0; }
+    if (needs_pw) {
+        fprintf(stderr, "PdfLoader: '%s' is password-protected\n", path.c_str());
+        doc.path         = path;
+        doc.stack_origin = world_origin;
+        doc.locked       = true;
+        doc.pages.clear();
+        Page page;
+        page.page_index = 0;
+        page.world_pos  = world_origin;
+        page.world_w    = 612.0f;   // US Letter placeholder (points = world units)
+        page.world_h    = 792.0f;
+        doc.pages.push_back(page);
+        return true;
+    }
+
     doc.path         = path;
     doc.stack_origin = world_origin;
     doc.pages.clear();
