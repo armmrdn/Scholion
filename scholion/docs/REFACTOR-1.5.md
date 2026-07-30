@@ -160,11 +160,40 @@ Carves landed (each: build green + self-test PASSED, one-line add to `cmake/sour
 
 Running total: **main.cpp 4,840 → 4,298 lines.**
 
-**Next candidate carves** (roughly increasing coupling): `references_panel.cpp` (sidebar; needs
-`s_editing_ref_hl` + `s_ref_note_buf` exposed) · `toolbar.cpp` (drags ~20 tool-state statics —
-do a tool-state consolidation pass first) · `text_boxes.cpp` (tangled: box-drag state is shared
-with the render-loop glue at the `g_box_dragging` reconciliation) · `dialogs.cpp` (url/startup/quit
-modals — each calls main-owned action fns) · `input_glue.cpp` (GLFW callbacks + drag loop).
+### Remaining plan (ordered; full strategy + coupling map in DEVLOG 2026-07-30 "carve strategy")
+
+> **Line numbers drift after every carve — key on symbols, re-grep at execution time.**
+> Two state classes decide where a static goes: *shared style/config read across TUs* → a
+> header-visible struct/extern (never into the carved module); *transient interaction state owned
+> by one subsystem* → a module-static exposed via accessors + a `reset()` hook.
+
+- **Step 5 — `text_boxes.cpp`** (highest value; tangled → 3 sub-commits):
+  - 5a: move the generic `imgui_dashed_rect` helper out to a shared util/renderer TU (de-interleaves
+    the region; `draw_locked_doc_labels` stays in main for now).
+  - 5b: split the two state classes — text-box **style defaults** (`g_tbox_r/g/b`,
+    `g_tbox_font_size`, `g_tbox_zoom_scaled`) are shared with the toolbar → promote to a
+    header (alongside the `canvas_annot.h` pen/hl style); text-box **transient** state
+    (`g_box_dragging`, `g_box_drag_states`, `g_box_drag_start_world`, `g_tbox_creating`,
+    `g_hovered_box`) will move into the module.
+  - 5c: move `text_box_layout` / `text_box_at` / `draw_canvas_text_boxes` + transient statics into
+    `text_boxes.cpp`. Replace the main-loop drag-init seam (the `if (!g_box_dragging &&
+    …selected_text_boxes()…)` block) with an exported `textboxes_begin_selection_drag()` so the loop
+    never touches box statics. Expose `textboxes_reset()` (drag + clipboard) for `new_project`.
+- **Step 6 — `side_panel.cpp`** (Viewer + References + Open Docs: `draw_panel_ui`,
+  `draw_references_tab`, `draw_panel_resize_handle`, `draw_panel_edge_tabs`; ~950 lines). Move the
+  references-edit statics (`s_editing_ref_hl`, `s_ref_note_buf`, `s_prev_editing_hl`) in; expose
+  `sidepanel_reset()`. Coupling is mostly outbound **action calls** (`relink_document`,
+  `reveal_in_file_manager`, `load_pdfs_from_selection`, zoom-to-page/doc, copy-text, export-refs) →
+  introduce a small **`actions.h`** declaring them.
+- **Step 7 — `toolbar.cpp`** (small — most state already externed in `canvas_annot.h`). Needs
+  `actions.h` (Step 6) + text-box style defaults header-visible (Step 5b), then it's a clean move of
+  `draw_toolbar_ui` (+ `s_toolbar_bottom`).
+- **Step 8 — `dialogs.cpp`** (optional, lowest value): `draw_url_modal`, `draw_startup_chooser`,
+  `draw_quit_dialog`. Thin modals over `actions.h`. Defensible to leave in main as app-shell.
+- **Step 9 — stop at the shell.** After 5–7, main.cpp = platform/GL/GLFW init + the GLFW callbacks +
+  the frame loop + `new_project`/`app_wants_animation`. Target **~1,500–2,000 lines**. Extracting the
+  callbacks into `input_glue.cpp` is possible but highest-risk/lowest-value (they touch every
+  subsystem) — do it only if there's appetite; otherwise declare Phase 3 done.
 
 <details><summary>Original plan</summary>
 
