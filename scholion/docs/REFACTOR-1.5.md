@@ -153,8 +153,18 @@ Carves landed (each: build green + self-test PASSED, one-line add to `cmake/sour
   promoting three `main.cpp` statics to `app_state.h` externs: `g_settings_open`, `g_search_open`,
   and `selected_pages()`.
 
-**Next candidate carves:** `text_boxes.cpp` · `references_panel.cpp` · `toolbar.cpp` · `dialogs.cpp`
-· `input_glue.cpp` (the GLFW callbacks + drag-reconciliation loop).
+- **Step 4 — `settings.cpp` (+ `include/settings.h`):** the Settings modal (`draw_settings_popup`,
+  ~163 lines). Cleanest possible carve — `g_settings`, `g_settings_open`, `save_prefs()`,
+  `apply_appearance()` were already header-visible; only `g_logo_tex` needed promoting to an
+  `app_state.h` extern (`unsigned int`, the repo's "GLuint = unsigned int" convention).
+
+Running total: **main.cpp 4,840 → 4,298 lines.**
+
+**Next candidate carves** (roughly increasing coupling): `references_panel.cpp` (sidebar; needs
+`s_editing_ref_hl` + `s_ref_note_buf` exposed) · `toolbar.cpp` (drags ~20 tool-state statics —
+do a tool-state consolidation pass first) · `text_boxes.cpp` (tangled: box-drag state is shared
+with the render-loop glue at the `g_box_dragging` reconciliation) · `dialogs.cpp` (url/startup/quit
+modals — each calls main-owned action fns) · `input_glue.cpp` (GLFW callbacks + drag loop).
 
 <details><summary>Original plan</summary>
 

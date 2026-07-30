@@ -52,4 +52,5 @@ Page* page_by_id(uint64_t id);   // resolve a stable page id to a live Page* (nu
 // extracted modules such as groups.cpp).
 extern bool g_settings_open;
 extern bool g_search_open;
+extern unsigned int g_logo_tex;        // GLuint app-logo texture (settings/startup UI)
 std::vector<Page*> selected_pages();   // live Page* for every id in the current selection

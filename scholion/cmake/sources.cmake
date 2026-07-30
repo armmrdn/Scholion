@@ -5,6 +5,7 @@ set(SCHOLION_SHARED_SOURCES
     main.cpp
     undo.cpp
     groups.cpp
+    settings.cpp
     rast_pipeline.cpp
     canvas_annot.cpp
     project_io.cpp
