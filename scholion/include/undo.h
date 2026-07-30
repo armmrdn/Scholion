@@ -58,4 +58,5 @@ struct UndoRecord {
 };
 
 void push_undo(UndoRecord r);
-void undo_last();   // pop + revert the most recent undo record
+void undo_last();        // pop + revert the most recent undo record
+void clear_undo_stack(); // discard all undo history (new/loaded project)

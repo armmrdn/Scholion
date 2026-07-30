@@ -3,6 +3,7 @@
 # Add a new shared .cpp HERE ONCE — not in all three CMakeLists.
 set(SCHOLION_SHARED_SOURCES
     main.cpp
+    undo.cpp
     rast_pipeline.cpp
     canvas_annot.cpp
     project_io.cpp
