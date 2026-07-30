@@ -602,7 +602,6 @@ void load_project_from_path(const std::string& path) {
     std::vector<AnnotStroke>   saved_canvas_strokes;   // doc=-1 sentinel strokes
 
     float vx = 0.0f, vy = 0.0f, vz = 0.6f;
-    int   cur = -1;
 
     enum class Section { Docs, TextBoxes, Annots, RefNotes, Groups, Other };
 
@@ -671,195 +670,162 @@ void load_project_from_path(const std::string& path) {
     }
 
     size_t doc_key = content.find("\"documents\":");
-    size_t tb_key  = content.find("\"text_boxes\":");
-    size_t an_key  = content.find("\"annots\":");
-    size_t rn_key  = content.find("\"ref_notes\":");
-    size_t gr_key  = content.find("\"groups\":");
-    auto section_at = [&](size_t at) -> Section {
-        Section sec = Section::Other;
-        if (doc_key != npos && at > doc_key) sec = Section::Docs;
-        if (tb_key  != npos && at > tb_key)  sec = Section::TextBoxes;
-        if (an_key  != npos && at > an_key)  sec = Section::Annots;
-        if (rn_key  != npos && at > rn_key)  sec = Section::RefNotes;
-        if (gr_key  != npos && at > gr_key)  sec = Section::Groups;
-        return sec;
-    };
-
-    enum Tok { T_VIEWPORT, T_NOTE_IDX, T_PATH, T_REL, T_STACK, T_INDEX, T_ID, T_DOC, T_POINT, T_AFTER, T_GROUP };
-    struct TokDef { const char* s; size_t len; Tok t; };
-    static const TokDef toks[] = {
-        {"\"viewport\":",     11, T_VIEWPORT},
-        {"\"note_idx\":",     11, T_NOTE_IDX},
-        {"\"path\":",          7, T_PATH},
-        {"\"rel\":",           6, T_REL},
-        {"\"stack_origin\":", 15, T_STACK},
-        {"\"index\":",         8, T_INDEX},
-        {"\"id\":",            5, T_ID},
-        {"\"doc\":",           6, T_DOC},
-        {"\"p\":",             4, T_POINT},
-        {"\"after\":",         8, T_AFTER},
-        {"\"group\":",         8, T_GROUP},
-    };
+    // Parse with a real JSON library (retires the substring/sscanf scanner). Fills the same
+    // intermediate structures the apply half below consumes; the on-disk layout is unchanged
+    // so v1.0–v1.4 files load identically. (The hash/format/heuristic checks above still run
+    // on the raw text, since the hash is computed over the file bytes.)
     bool note_idx_loaded = false;
-
-    size_t scan = 0;
-    while (scan < content.size()) {
-        size_t best = npos; const TokDef* bt = nullptr;
-        for (const auto& td : toks) {
-            size_t fnd = content.find(td.s, scan);
-            if (fnd < best) { best = fnd; bt = &td; }
+    picojson::value root_v;
+    {
+        std::string perr = picojson::parse(root_v, content);
+        if (!perr.empty() || !root_v.is<picojson::object>()) {
+            g_load_ok = false;
+            fprintf(stderr, "load: JSON parse error: %s\n", perr.empty() ? "root is not an object" : perr.c_str());
         }
-        if (!bt) break;
-        const char* at  = content.c_str() + best;
-        Section     sec = section_at(best);
-        float a, b, c, d; int n; char s[4096];
-
-        switch (bt->t) {
-            case T_VIEWPORT:
-                if (sscanf(at, "\"viewport\": { \"x\": %f, \"y\": %f, \"zoom\": %f }", &a, &b, &c) == 3) {
-                    vx = a; vy = b; vz = c;
-                }
-                break;
-            case T_NOTE_IDX:
-                if (sscanf(at, "\"note_idx\": %d", &n) == 1) {
-                    g_next_note_idx = n;
-                    note_idx_loaded = true;
-                }
-                break;
-            case T_PATH:
-                if (sec == Section::Docs && sscanf(at, "\"path\": \"%4095[^\"]\"", s) == 1) {
-                    saved.push_back({s, "", 0.0f, 0.0f, {}});
-                    cur = (int)saved.size() - 1;
-                }
-                break;
-            case T_REL:
-                if (sec == Section::Docs && cur >= 0 && sscanf(at, "\"rel\": \"%4095[^\"]\"", s) == 1)
-                    saved[cur].rel = s;
-                break;
-            case T_STACK:
-                if (sec == Section::Docs && cur >= 0 &&
-                    sscanf(at, "\"stack_origin\": [%f, %f]", &a, &b) == 2) {
-                    saved[cur].sox = a; saved[cur].soy = b;
-                }
-                break;
-            case T_INDEX:
-                if (sec == Section::Docs && cur >= 0) {
-                    float pw = 0.0f, ph = 0.0f; int prot = 0, pgrp = 0; unsigned long long pid = 0;
-                    int np = sscanf(at, "\"index\": %d, \"x\": %f, \"y\": %f, \"w\": %f, \"h\": %f, \"rot\": %d, \"grp\": %d, \"id\": %llu",
-                                    &n, &a, &b, &pw, &ph, &prot, &pgrp, &pid);
-                    if (np >= 3) saved[cur].pages.push_back({n, a, b, pw, ph, prot, pgrp, (uint64_t)pid});
-                }
-                break;
-            case T_GROUP:
-                if (sec == Section::Groups) {
-                    int gid; float gr = 0.63f, gg = 0.32f, gb = 0.75f; char gname[512] = "";
-                    int np = sscanf(at, "\"group\": %d, \"r\": %f, \"g\": %f, \"b\": %f",
-                                    &gid, &gr, &gg, &gb);
-                    if (np >= 1) {
-                        // Name is optional and parsed separately (may contain spaces/escapes).
-                        const char* nm = strstr(at, "\"name\": \"");
-                        if (nm) sscanf(nm, "\"name\": \"%511[^\"]\"", gname);
-                        saved_groups.push_back({gid, gr, gg, gb, gname});
-                    }
-                }
-                break;
-            case T_ID:
-                if (sec == Section::TextBoxes) {
-                    int id; float x, y, tr = 0.82f, tg = 0.06f, tb2 = 0.06f, tfs = 16.0f, tw = 0.0f, th = 0.0f;
-                    int tzs = 0;
-                    int np = sscanf(at,
-                        "\"id\": %d, \"x\": %f, \"y\": %f, \"r\": %f, \"g\": %f, \"b\": %f, \"fs\": %f, \"w\": %f, \"h\": %f, \"zs\": %d",
-                        &id, &x, &y, &tr, &tg, &tb2, &tfs, &tw, &th, &tzs);
-                    if (np >= 3) {
-                        CanvasTextBox tb; tb.id = id; tb.world_pos = {x, y}; tb.text[0] = '\0';
-                        if (np >= 7) { tb.r = tr; tb.g = tg; tb.b = tb2; tb.font_size = tfs; }
-                        if (np >= 9) { tb.w = tw; tb.h = th; }
-                        if (np >= 10) tb.zoom_scaled = (tzs != 0);  // older files omit "zs" → false
-                        extract_json_text(at, tb.text, sizeof(tb.text));
-                        saved_boxes.push_back(tb);
-                    }
-                }
-                break;
-            case T_DOC:
-                if (sec == Section::Annots) {
-                    int di, pi; float sw, sa; int npx;
-                    if (sscanf(at, "\"doc\": %d, \"page\": %d, \"hl\": [%f, %f, %f, %f]",
-                               &di, &pi, &a, &b, &c, &d) == 6) {
-                        flush_stroke();
-                        AnnotHighlight parsed_hl{a, b, c, d, {}};
-                        // Decode a JSON-escaped string field (\n \" \\) starting just after
-                        // the opening quote into `dst`.
-                        auto decode_str = [](const char* p, std::string& dst) {
-                            while (*p && *p != '"') {
-                                if (*p == '\\' && *(p + 1)) {
-                                    ++p;
-                                    switch (*p) {
-                                        case 'n':  dst += '\n'; break;
-                                        case '"':  dst += '"';  break;
-                                        case '\\': dst += '\\'; break;
-                                        default:   dst += *p;   break;
-                                    }
-                                } else { dst += *p; }
-                                ++p;
-                            }
-                        };
-                        // Bound field search to THIS record (before the next annot record)
-                        // so a highlight lacking a field can't grab a later record's one.
-                        const char* next_rec = strstr(at + 6, "\"doc\":");
-                        auto within = [&](const char* p){ return p && (!next_rec || p < next_rec); };
-                        const char* ht = strstr(at, "\"ht\": \"");
-                        if (within(ht)) decode_str(ht + 7, parsed_hl.text);
-                        const char* rn = strstr(at, "\"rn\": \"");   // per-highlight research note
-                        if (within(rn)) decode_str(rn + 7, parsed_hl.note);
-                        saved_hls.push_back({di, pi, std::move(parsed_hl)});
-                    } else if (sscanf(at, "\"doc\": %d, \"page\": %d, \"note\": \"%4095[^\"]\"",
-                                      &di, &pi, s) == 3) {
-                        flush_stroke(); saved_notes.push_back({di, pi, s});
-                    } else if ((npx = sscanf(at,
-                                   "\"doc\": %d, \"page\": %d, \"sr\": %f, \"sg\": %f, \"sb\": %f, \"sw\": %f, \"sa\": %f",
-                                   &di, &pi, &a, &b, &c, &sw, &sa)) >= 5) {
-                        flush_stroke();
-                        stroke_doc = di; stroke_page = pi;
-                        building_stroke = {};  // struct defaults width=1.2, alpha=0.88
-                        building_stroke.r = a; building_stroke.g = b; building_stroke.b = c;
-                        if (npx >= 6) building_stroke.width = sw;  // older files omit sw/sa → defaults
-                        if (npx >= 7) building_stroke.alpha = sa;
-                        building = true;
-                    }
-                }
-                break;
-            case T_POINT:
-                if (sec == Section::Annots && building &&
-                    sscanf(at, "\"p\": [%f, %f]", &a, &b) == 2) {
-                    building_stroke.pts.push_back({a, b});
-                }
-                break;
-            case T_AFTER:
-                if (sec == Section::RefNotes && sscanf(at, "\"after\": %d", &n) == 1) {
-                    RefNote rn; rn.after_idx = n;
-                    const char* tp = strstr(at, "\"text\": \"");
-                    if (tp) {
-                        tp += 9;
-                        while (*tp && *tp != '"') {
-                            if (*tp == '\\' && *(tp+1)) {
-                                ++tp;
-                                switch (*tp) {
-                                    case 'n':  rn.text += '\n'; break;
-                                    case '"':  rn.text += '"';  break;
-                                    case '\\': rn.text += '\\'; break;
-                                    default:   rn.text += *tp;  break;
-                                }
-                            } else { rn.text += *tp; }
-                            ++tp;
-                        }
-                    }
-                    saved_ref_notes.push_back(std::move(rn));
-                }
-                break;
-        }
-        scan = best + bt->len;
     }
-    flush_stroke();
+    if (root_v.is<picojson::object>()) {
+        const picojson::object& root = root_v.get<picojson::object>();
+        auto num = [](const picojson::object& o, const char* k, double def) -> double {
+            auto it = o.find(k);
+            if (it == o.end()) return def;
+            if (it->second.is<int64_t>()) return (double)it->second.get<int64_t>();
+            if (it->second.is<double>())  return it->second.get<double>();
+            return def;
+        };
+        auto u64 = [](const picojson::object& o, const char* k) -> uint64_t {
+            auto it = o.find(k);
+            if (it == o.end()) return 0;
+            if (it->second.is<int64_t>()) return (uint64_t)it->second.get<int64_t>();
+            if (it->second.is<double>())  return (uint64_t)it->second.get<double>();
+            return 0;
+        };
+        auto sstr = [](const picojson::object& o, const char* k) -> std::string {
+            auto it = o.find(k);
+            return (it != o.end() && it->second.is<std::string>()) ? it->second.get<std::string>() : std::string();
+        };
+        auto obj_at = [](const picojson::value& v) -> const picojson::object* {
+            return v.is<picojson::object>() ? &v.get<picojson::object>() : nullptr;
+        };
+        auto arr_at = [](const picojson::object& o, const char* k) -> const picojson::array* {
+            auto it = o.find(k);
+            return (it != o.end() && it->second.is<picojson::array>()) ? &it->second.get<picojson::array>() : nullptr;
+        };
+        auto anum = [](const picojson::array& a, size_t i) -> double {
+            if (i >= a.size()) return 0.0;
+            if (a[i].is<int64_t>()) return (double)a[i].get<int64_t>();
+            if (a[i].is<double>())  return a[i].get<double>();
+            return 0.0;
+        };
+
+        // Viewport + note counter
+        if (auto it = root.find("viewport"); it != root.end() && it->second.is<picojson::object>()) {
+            const auto& vp = it->second.get<picojson::object>();
+            vx = (float)num(vp, "x", 0.0); vy = (float)num(vp, "y", 0.0); vz = (float)num(vp, "zoom", 0.6);
+        }
+        if (auto it = root.find("note_idx");
+            it != root.end() && (it->second.is<int64_t>() || it->second.is<double>())) {
+            g_next_note_idx = (int)num(root, "note_idx", 0);
+            note_idx_loaded = true;
+        }
+
+        // Documents + pages
+        if (const picojson::array* docs = arr_at(root, "documents")) {
+            for (const auto& dv : *docs) {
+                const picojson::object* d = obj_at(dv); if (!d) continue;
+                SavedDoc sd;
+                sd.path = sstr(*d, "path");
+                sd.rel  = sstr(*d, "rel");
+                sd.sox = sd.soy = 0.0f;
+                if (const picojson::array* so = arr_at(*d, "stack_origin"); so && so->size() == 2) {
+                    sd.sox = (float)anum(*so, 0); sd.soy = (float)anum(*so, 1);
+                }
+                if (const picojson::array* pgs = arr_at(*d, "pages")) {
+                    for (const auto& pv : *pgs) {
+                        const picojson::object* p = obj_at(pv); if (!p) continue;
+                        SavedPage sp;
+                        sp.idx = (int)num(*p, "index", 0);
+                        sp.x = (float)num(*p, "x", 0.0); sp.y = (float)num(*p, "y", 0.0);
+                        sp.w = (float)num(*p, "w", 0.0); sp.h = (float)num(*p, "h", 0.0);
+                        sp.rot = (int)num(*p, "rot", 0); sp.grp = (int)num(*p, "grp", 0);
+                        sp.id  = u64(*p, "id");
+                        sd.pages.push_back(sp);
+                    }
+                }
+                saved.push_back(std::move(sd));
+            }
+        }
+
+        // Text boxes
+        if (const picojson::array* tbs = arr_at(root, "text_boxes")) {
+            for (const auto& tv : *tbs) {
+                const picojson::object* t = obj_at(tv); if (!t) continue;
+                CanvasTextBox tb;
+                tb.id = (int)num(*t, "id", 0);
+                tb.world_pos = { (float)num(*t, "x", 0.0), (float)num(*t, "y", 0.0) };
+                tb.r = (float)num(*t, "r", 0.82); tb.g = (float)num(*t, "g", 0.06); tb.b = (float)num(*t, "b", 0.06);
+                tb.font_size = (float)num(*t, "fs", 16.0);
+                tb.w = (float)num(*t, "w", 0.0); tb.h = (float)num(*t, "h", 0.0);
+                tb.zoom_scaled = (num(*t, "zs", 0.0) != 0.0);   // serialized as 0/1 integer
+                std::string txt = sstr(*t, "text");
+                strncpy(tb.text, txt.c_str(), sizeof(tb.text) - 1);
+                tb.text[sizeof(tb.text) - 1] = '\0';
+                saved_boxes.push_back(tb);
+            }
+        }
+
+        // Annotations — a flat array in order: highlights, note flags, and strokes (a stroke
+        // header object followed by its "p" point objects). Mirror the streaming stroke build.
+        if (const picojson::array* an = arr_at(root, "annots")) {
+            for (const auto& av : *an) {
+                const picojson::object* o = obj_at(av); if (!o) continue;
+                if (const picojson::array* hl = arr_at(*o, "hl"); hl && hl->size() == 4) {
+                    flush_stroke();
+                    AnnotHighlight h;
+                    h.x0 = (float)anum(*hl, 0); h.y0 = (float)anum(*hl, 1);
+                    h.x1 = (float)anum(*hl, 2); h.y1 = (float)anum(*hl, 3);
+                    h.text = sstr(*o, "ht"); h.note = sstr(*o, "rn");
+                    saved_hls.push_back({ (int)num(*o, "doc", 0), (int)num(*o, "page", 0), std::move(h) });
+                } else if (o->count("note")) {
+                    flush_stroke();
+                    saved_notes.push_back({ (int)num(*o, "doc", 0), (int)num(*o, "page", 0), sstr(*o, "note") });
+                } else if (o->count("sr")) {
+                    flush_stroke();
+                    stroke_doc = (int)num(*o, "doc", 0); stroke_page = (int)num(*o, "page", 0);
+                    building_stroke = {};
+                    building_stroke.r = (float)num(*o, "sr", 0.0);
+                    building_stroke.g = (float)num(*o, "sg", 0.0);
+                    building_stroke.b = (float)num(*o, "sb", 0.0);
+                    building_stroke.width = (float)num(*o, "sw", 1.2);
+                    building_stroke.alpha = (float)num(*o, "sa", 0.88);
+                    building = true;
+                } else if (const picojson::array* pp = arr_at(*o, "p"); pp && pp->size() == 2) {
+                    if (building) building_stroke.pts.push_back({ (float)anum(*pp, 0), (float)anum(*pp, 1) });
+                }
+            }
+            flush_stroke();
+        }
+
+        // Legacy positional reference notes (pre-v1.4; migrated onto highlights in the apply half)
+        if (const picojson::array* rns = arr_at(root, "ref_notes")) {
+            for (const auto& rv : *rns) {
+                const picojson::object* r = obj_at(rv); if (!r) continue;
+                RefNote rn; rn.after_idx = (int)num(*r, "after", 0); rn.text = sstr(*r, "text");
+                saved_ref_notes.push_back(std::move(rn));
+            }
+        }
+
+        // Page groups
+        if (const picojson::array* grs = arr_at(root, "groups")) {
+            for (const auto& gv : *grs) {
+                const picojson::object* g = obj_at(gv); if (!g) continue;
+                SavedGroup sg;
+                sg.id = (int)num(*g, "group", 0);
+                sg.r = (float)num(*g, "r", 0.63); sg.g = (float)num(*g, "g", 0.32); sg.b = (float)num(*g, "b", 0.75);
+                sg.name = sstr(*g, "name");
+                saved_groups.push_back(std::move(sg));
+            }
+        }
+    }
 
     // Heuristic for legacy files (no integrity hash): a documents section that clearly had
     // entries but parsed to nothing signals truncation/corruption → suspect load.

@@ -104,7 +104,17 @@ tests green.
 
 ---
 
-## Phase 2 — Real JSON parser (retire the hand-rolled scanner)
+## Phase 2 — Real JSON parser (retire the hand-rolled scanner)  ◑ PARSER DONE (2026-07-29)
+
+Vendored PicoJSON (`include/picojson.h`, BSD-2). `load_project_from_path` now parses via a picojson
+tree that fills the same intermediate structures — the scanner (Tok/section_at/while-loop/`sscanf`/
+`char s[4096]`) is gone, killing the buffer-overflow class and the substring section-inference. Apply
+half untouched; hash/format/heuristic still run on raw bytes. Self-test PASSED (found + fixed a `zs`
+int-vs-bool round-trip bug). **Remaining (optional):** rewrite the serializer to emit via picojson too
+(the manual emitter already produces valid JSON, so this is cleanup, not correctness); remove the now-
+dead `extract_json_text`.
+
+<details><summary>Original plan</summary>
 
 **Why:** `project_io.cpp` parses with a substring-section-inference + per-record `sscanf` scanner —
 brittle (the fixed buffer-overflow was a symptom; section detection can be fooled by token-like
@@ -124,6 +134,7 @@ substrings in user text) and impossible to evolve. A real parser removes the ent
 **Risk:** medium (all persistence flows through here) — but fully covered by the round-trip test.
 **Files:** `project_io.cpp`, `third_party/<json>/`, all three `CMakeLists` (new include path).
 **Exit:** no `sscanf`/substring parsing remains; old files load; self-test green.
+</details>
 
 ---
 
