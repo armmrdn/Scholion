@@ -44,18 +44,11 @@ target_link_libraries(imgui PUBLIC glfw OpenGL::GL)
 
 # --- Main Executable --------------------------------------------------------
 
+include(${CMAKE_SOURCE_DIR}/cmake/sources.cmake)
+list(TRANSFORM SCHOLION_SHARED_SOURCES PREPEND "src/" OUTPUT_VARIABLE SCHOLION_MAC_SOURCES)
+
 add_executable(scholion
-    src/main.cpp
-    src/rast_pipeline.cpp
-    src/canvas_annot.cpp
-    src/project_io.cpp
-    src/canvas.cpp
-    src/input.cpp
-    src/renderer.cpp
-    src/overlay.cpp
-    src/pdf_loader.cpp
-    src/texture_cache.cpp
-    src/selftest.cpp
+    ${SCHOLION_MAC_SOURCES}
     third_party/tinyfiledialogs/tinyfiledialogs.c
 )
 

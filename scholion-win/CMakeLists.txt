@@ -101,19 +101,12 @@ set(WIN_RC "${CMAKE_SOURCE_DIR}/resources/scholion.rc")
 # ---------------------------------------------------------------------------
 # Main executable
 # ---------------------------------------------------------------------------
+include(${SHARED}/cmake/sources.cmake)
+list(TRANSFORM SCHOLION_SHARED_SOURCES PREPEND "${SHARED_SRC}/" OUTPUT_VARIABLE SCHOLION_WIN_SOURCES)
+
 add_executable(Scholion WIN32
-    # ---- Shared source (cross-platform, lives in ../scholion/src/) ----------
-    ${SHARED_SRC}/main.cpp
-    ${SHARED_SRC}/rast_pipeline.cpp
-    ${SHARED_SRC}/canvas_annot.cpp
-    ${SHARED_SRC}/project_io.cpp
-    ${SHARED_SRC}/canvas.cpp
-    ${SHARED_SRC}/input.cpp
-    ${SHARED_SRC}/renderer.cpp
-    ${SHARED_SRC}/overlay.cpp
-    ${SHARED_SRC}/pdf_loader.cpp
-    ${SHARED_SRC}/texture_cache.cpp
-    ${SHARED_SRC}/selftest.cpp
+    # ---- Shared source (cross-platform, from ../scholion/cmake/sources.cmake) -
+    ${SCHOLION_WIN_SOURCES}
     # ---- Windows-specific source --------------------------------------------
     ${CMAKE_SOURCE_DIR}/src/platform_win.cpp
     # ---- Shared third-party -------------------------------------------------

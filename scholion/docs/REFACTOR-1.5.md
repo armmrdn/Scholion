@@ -138,7 +138,14 @@ substrings in user text) and impossible to evolve. A real parser removes the ent
 
 ---
 
-## Phase 3 — Decompose `main.cpp` (~4,900 lines)
+## Phase 3 — Decompose `main.cpp` (~4,900 lines)  ◔ STARTED (2026-07-30)
+
+Step 1 done: **CMake dedup** — shared source list factored into `cmake/sources.cmake`; all three
+CMakeLists `include` it + `list(TRANSFORM PREPEND)`. Adding a shared `.cpp` is now a one-line change,
+so each extraction below is cheap. Build green, self-test PASSED. **Next:** first real carve = undo →
+`src/undo.cpp` (analysis + steps in DEVLOG).
+
+<details><summary>Original plan</summary>
 
 **Why:** the single biggest maintainability liability; every feature currently touches one file.
 Purely **mechanical** once Phases 1–2 have loosened the coupling.
@@ -154,6 +161,7 @@ include" dedup first so it's a single edit). Candidate seams, roughly in depende
 
 **Risk:** low–medium (link/visibility churn), but mechanical and individually verifiable.
 **Exit:** `main.cpp` is init + loop; each subsystem is its own TU; builds on all three trees.
+</details>
 
 ---
 
