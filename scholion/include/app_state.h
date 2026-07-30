@@ -47,3 +47,9 @@ extern bool  g_edit_was_new;
 void remove_document(int doc_idx);
 struct Page;
 Page* page_by_id(uint64_t id);   // resolve a stable page id to a live Page* (nullptr if gone)
+
+// Overlay/search flags + selection helper (defined in main.cpp; consumed by
+// extracted modules such as groups.cpp).
+extern bool g_settings_open;
+extern bool g_search_open;
+std::vector<Page*> selected_pages();   // live Page* for every id in the current selection

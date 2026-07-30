@@ -138,12 +138,23 @@ substrings in user text) and impossible to evolve. A real parser removes the ent
 
 ---
 
-## Phase 3 — Decompose `main.cpp` (~4,900 lines)  ◔ STARTED (2026-07-30)
+## Phase 3 — Decompose `main.cpp`  ◑ IN PROGRESS (2026-07-30)  — 4,840 → 4,461 lines so far
 
-Step 1 done: **CMake dedup** — shared source list factored into `cmake/sources.cmake`; all three
-CMakeLists `include` it + `list(TRANSFORM PREPEND)`. Adding a shared `.cpp` is now a one-line change,
-so each extraction below is cheap. Build green, self-test PASSED. **Next:** first real carve = undo →
-`src/undo.cpp` (analysis + steps in DEVLOG).
+Carves landed (each: build green + self-test PASSED, one-line add to `cmake/sources.cmake`):
+- **Step 1 — CMake dedup:** shared source list factored into `cmake/sources.cmake`; all three
+  CMakeLists `include` it + `list(TRANSFORM PREPEND)`. Adding a shared `.cpp` is now a one-line change.
+- **Step 2 — `undo.cpp`:** the undo stack + `push_undo` / `undo_last` / `clear_undo_stack`.
+- **Step 3 — `groups.cpp` (+ `include/groups.h`, ~405 lines):** the whole page-group subsystem —
+  constants, `g_editing_group` / drag-add / remove-flash statics, and every group function
+  (`group_pages`, `group_handle_at`, `draw_page_groups`, `create_group_from_selection`,
+  `ungroup_group`, `remove_page_from_group`, `update_group_drag_add`, `draw_group_remove_flashes`).
+  Exposed two lifecycle hooks — `groups_reset()` (called from `new_project`) and `groups_animating()`
+  (called from `app_wants_animation`) — so no group static leaks back into `main.cpp`. Required
+  promoting three `main.cpp` statics to `app_state.h` externs: `g_settings_open`, `g_search_open`,
+  and `selected_pages()`.
+
+**Next candidate carves:** `text_boxes.cpp` · `references_panel.cpp` · `toolbar.cpp` · `dialogs.cpp`
+· `input_glue.cpp` (the GLFW callbacks + drag-reconciliation loop).
 
 <details><summary>Original plan</summary>
 
