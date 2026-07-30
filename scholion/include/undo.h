@@ -25,10 +25,12 @@ struct UndoRecord {
     int page_idx        = -1;
     int note_idx_before = -1;
 
-    struct PagePos { Page* page; Vec2 old_pos; float old_w = 0.0f; float old_h = 0.0f; };
+    // Pages are referenced by stable id (not raw Page*), so undo records survive vector
+    // reallocation — a page that's since been removed simply resolves to nullptr on undo.
+    struct PagePos { uint64_t page_id; Vec2 old_pos; float old_w = 0.0f; float old_h = 0.0f; };
     std::vector<PagePos> page_moves;
 
-    struct PageRot { Page* page; int old_rot; float old_w; float old_h; };
+    struct PageRot { uint64_t page_id; int old_rot; float old_w; float old_h; };
     std::vector<PageRot> page_rots;
 
     int           box_id      = -1;
@@ -50,9 +52,10 @@ struct UndoRecord {
     // Page grouping (Group / Ungroup). group_members records each affected page and
     // its group_id before the change; group_row is the group added (Group) or removed
     // (Ungroup) from g_groups. Undo reverts the members and reverses the table change.
-    struct GroupMember { Page* page; int old_group; };
+    struct GroupMember { uint64_t page_id; int old_group; };
     std::vector<GroupMember> group_members;
     PageGroup                group_row = {};
 };
 
 void push_undo(UndoRecord r);
+void undo_last();   // pop + revert the most recent undo record

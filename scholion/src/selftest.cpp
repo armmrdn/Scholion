@@ -13,18 +13,160 @@
 #include "project_io.h"
 #include "canvas_annot.h"
 #include "document.h"
+#include "undo.h"
 
 #include <cstdio>
 #include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <utility>
 
 static int s_fail = 0;
 
 #define CHECK(cond, ...) do { if (!(cond)) { printf("  FAIL: " __VA_ARGS__); printf("\n"); ++s_fail; } } while (0)
 
 static bool approx(float a, float b, float eps) { return std::fabs(a - b) <= eps; }
+
+// --- Undo coverage (headless) ----------------------------------------------
+// Drives the REAL push_undo/undo_last on placeholder documents (no GL/MuPDF), covering the
+// data-model operations that the 1.5 stable-ID refactor will migrate off raw Page*. Each
+// case pushes one record then undoes it, so the shared undo stack stays balanced.
+
+static void reset_docs_for_undo() {
+    g_documents.clear();
+    g_loaders.clear();
+    g_text_boxes.clear();
+    g_groups.clear();
+    g_canvas_strokes.clear();
+    g_next_box_id   = 0;
+    g_next_group_id = 1;
+    auto add = [&](const char* path, int n) {
+        Document d; d.path = path;
+        for (int i = 0; i < n; ++i) {
+            Page p; p.id = g_next_page_id++;   // undo records reference pages by id
+            p.page_index = i;
+            p.world_pos = {100.0f * i, 50.0f * i};
+            p.world_w = 600.0f; p.world_h = 800.0f;
+            d.pages.push_back(p);
+        }
+        g_documents.push_back(std::move(d));
+        g_loaders.push_back(nullptr);   // keep g_loaders in lockstep with g_documents
+    };
+    add("/nonexistent/undo_a.pdf", 2);
+    add("/nonexistent/undo_b.pdf", 1);
+    g_input.set_documents(&g_documents);
+}
+
+static void test_undo() {
+    printf("Scholion self-test — undo of data-model operations\n");
+
+    reset_docs_for_undo();
+    { // PageMove
+        Page* p = &g_documents[0].pages[0];
+        Vec2 old = p->world_pos;
+        UndoRecord r; r.type = UndoRecord::Type::PageMove; r.page_moves.push_back({p->id, old});
+        push_undo(r);
+        p->world_pos = {999.0f, 999.0f};
+        undo_last();
+        CHECK(approx(p->world_pos.x, old.x, 0.001f) && approx(p->world_pos.y, old.y, 0.001f),
+              "undo PageMove did not restore position");
+    }
+
+    reset_docs_for_undo();
+    { // PageRotate (with the odd-turn w/h swap)
+        Page* p = &g_documents[0].pages[0];
+        int old_rot = p->rotation; float ow = p->world_w, oh = p->world_h;
+        UndoRecord r; r.type = UndoRecord::Type::PageRotate;
+        r.page_rots.push_back({p->id, old_rot, ow, oh});
+        push_undo(r);
+        p->rotation = (p->rotation + 90) % 360; std::swap(p->world_w, p->world_h);
+        undo_last();
+        CHECK(p->rotation == old_rot && approx(p->world_w, ow, 0.01f) && approx(p->world_h, oh, 0.01f),
+              "undo PageRotate did not restore rotation/size");
+    }
+
+    reset_docs_for_undo();
+    { // DocScale
+        auto& pages = g_documents[0].pages;
+        UndoRecord r; r.type = UndoRecord::Type::DocScale;
+        for (auto& pg : pages) r.page_moves.push_back({pg.id, pg.world_pos, pg.world_w, pg.world_h});
+        push_undo(r);
+        for (auto& pg : pages) { pg.world_pos.x *= 2; pg.world_w *= 2; pg.world_h *= 2; }
+        undo_last();
+        CHECK(approx(pages[0].world_w, 600.0f, 0.01f), "undo DocScale did not restore size");
+    }
+
+    reset_docs_for_undo();
+    { // Group / Ungroup / GroupJoin
+        Page* p = &g_documents[0].pages[0];
+        UndoRecord g; g.type = UndoRecord::Type::Group;
+        PageGroup row; row.id = 1; row.name = "T"; g.group_row = row;
+        g.group_members.push_back({p->id, p->group_id});
+        p->group_id = 1; g_groups.push_back(row);
+        push_undo(g); undo_last();
+        CHECK(p->group_id == 0 && g_groups.empty(), "undo Group did not revert membership + row");
+
+        PageGroup row2; row2.id = 2; row2.name = "T2";
+        p->group_id = 2; g_groups.push_back(row2);
+        UndoRecord u; u.type = UndoRecord::Type::Ungroup; u.group_row = row2;
+        u.group_members.push_back({p->id, 2});
+        p->group_id = 0; g_groups.pop_back();
+        push_undo(u); undo_last();
+        CHECK(p->group_id == 2 && !g_groups.empty(), "undo Ungroup did not restore membership + row");
+
+        int before = p->group_id;
+        UndoRecord j; j.type = UndoRecord::Type::GroupJoin;
+        j.group_members.push_back({p->id, before});
+        p->group_id = 99;
+        push_undo(j); undo_last();
+        CHECK(p->group_id == before, "undo GroupJoin did not revert membership");
+    }
+
+    reset_docs_for_undo();
+    { // TextBoxCreate / TextBoxDelete
+        CanvasTextBox b; b.id = g_next_box_id++; b.world_pos = {10, 10};
+        snprintf(b.text, sizeof(b.text), "x");
+        g_text_boxes.push_back(b);
+        UndoRecord c; c.type = UndoRecord::Type::TextBoxCreate; c.box_id = b.id;
+        push_undo(c); undo_last();
+        CHECK(g_text_boxes.empty(), "undo TextBoxCreate did not remove the box");
+
+        CanvasTextBox b2; b2.id = g_next_box_id++; snprintf(b2.text, sizeof(b2.text), "y");
+        UndoRecord d; d.type = UndoRecord::Type::TextBoxDelete; d.deleted_box = b2;
+        push_undo(d); undo_last();
+        CHECK(g_text_boxes.size() == 1 && std::strcmp(g_text_boxes[0].text, "y") == 0,
+              "undo TextBoxDelete did not restore the box");
+    }
+
+    reset_docs_for_undo();
+    { // Annotation (Note flag)
+        Page* p = &g_documents[0].pages[0];
+        p->annots.notes.push_back({"A"});
+        UndoRecord r; r.type = UndoRecord::Type::Note;
+        r.doc_idx = 0; r.page_idx = p->page_index; r.note_idx_before = g_next_note_idx;
+        push_undo(r); undo_last();
+        CHECK(p->annots.notes.empty(), "undo Note did not remove the flag");
+    }
+
+    reset_docs_for_undo();
+    { // DocumentRemove: a pushed record referencing the removed doc's page must be scrubbed,
+      // and a later undo must not crash (the exact raw-Page* fragility Phase 1 replaces).
+        Page* p = &g_documents[1].pages[0];
+        UndoRecord r; r.type = UndoRecord::Type::PageMove; r.page_moves.push_back({p->id, p->world_pos});
+        push_undo(r);
+        size_t before = g_documents.size();
+        remove_document(1);
+        CHECK(g_documents.size() == before - 1, "remove_document did not drop the document");
+        undo_last();   // must be safe: the dangling record was scrubbed
+        CHECK(g_documents.size() == before - 1, "undo after remove_document corrupted the doc set");
+    }
+
+    // Leave globals clean for anything after.
+    g_documents.clear(); g_loaders.clear();
+    g_text_boxes.clear(); g_groups.clear();
+    g_input.set_documents(nullptr);
+}
 
 int run_selftest() {
     printf("Scholion self-test — save/load round-trip\n");
@@ -39,10 +181,12 @@ int run_selftest() {
     g_next_box_id   = 0;
     g_next_group_id = 1;
 
+    uint64_t next_id = 1001;
     auto make_doc = [&](const char* path, int npages, float ox, float oy) {
         Document d; d.path = path;
         for (int i = 0; i < npages; ++i) {
             Page p;
+            p.id         = next_id++;   // explicit stable ids to verify they round-trip
             p.page_index = i;
             p.world_pos  = { ox + i * 30.0f, oy + i * 15.0f };
             p.world_w    = 600.0f + i;
@@ -95,6 +239,11 @@ int run_selftest() {
         CHECK(g_documents[0].pages.size() == 2, "doc0 pages %zu != 2", g_documents[0].pages.size());
         CHECK(g_documents[1].pages.size() == 1, "doc1 pages %zu != 1", g_documents[1].pages.size());
         const Page& p00 = g_documents[0].pages[0];
+        CHECK(p00.id == 1001 && g_documents[0].pages[1].id == 1002 && g_documents[1].pages[0].id == 1003,
+              "page ids not restored (%llu, %llu, %llu)",
+              (unsigned long long)p00.id,
+              (unsigned long long)g_documents[0].pages[1].id,
+              (unsigned long long)g_documents[1].pages[0].id);
         CHECK(approx(p00.world_pos.x, 100.0f, 0.01f) && approx(p00.world_pos.y, 200.0f, 0.01f),
               "page0 position not restored");
         CHECK(approx(p00.world_w, 600.0f, 0.05f) && approx(p00.world_h, 800.0f, 0.05f),
@@ -188,6 +337,9 @@ int run_selftest() {
         }
         fs::remove(tmp3);
     }
+
+    // ----- Undo of data-model operations -----
+    test_undo();
 
     if (s_fail == 0) { printf("Self-test PASSED\n"); return 0; }
     printf("Self-test FAILED — %d check(s)\n", s_fail);

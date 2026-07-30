@@ -16,8 +16,8 @@ struct DrawHints {
     const Page*     hovered_page = nullptr;
     const Page*     dragged_page = nullptr;
 
-    // Multi-page selection
-    const std::unordered_set<Page*>* selection = nullptr;
+    // Multi-page selection (by stable page id)
+    const std::unordered_set<uint64_t>* selection = nullptr;
 
     // Rubber-band box
     bool box_selecting   = false;

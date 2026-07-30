@@ -96,6 +96,7 @@ GLFWwindow*                              g_window  = nullptr;
 std::vector<Document>                    g_documents;
 std::vector<PageGroup>                   g_groups;
 int                                      g_next_group_id = 1;
+uint64_t                                 g_next_page_id  = 1;   // monotonic; 0 = unassigned
 std::vector<std::shared_ptr<PdfLoader>>  g_loaders;
 TextureCache                             g_cache;
 float                                    g_content_scale = 1.0f;
@@ -176,6 +177,28 @@ static float g_style_r0 = 0, g_style_g0 = 0, g_style_b0 = 0, g_style_fs0 = 0;
 static std::vector<UndoRecord> g_undo_stack;
 static constexpr int           UNDO_LIMIT = 60;
 
+// Resolve a stable page id to a live Page* (nullptr if id==0 or not found). Linear scan —
+// fine at the ~100-page target scale; resolves happen only on discrete events (undo, drag
+// grab), never per-frame per-page. This is what makes stored ids safe across reallocation:
+// a stale id simply resolves to nullptr and is skipped.
+Page* page_by_id(uint64_t id) {
+    if (id == 0) return nullptr;
+    for (auto& doc : g_documents)
+        for (auto& p : doc.pages)
+            if (p.id == id) return &p;
+    return nullptr;
+}
+
+// The current page selection resolved to live Page* (skipping any stale ids). Use this to
+// iterate the selection; use g_input.selection().count(page->id) for membership tests.
+static std::vector<Page*> selected_pages() {
+    std::vector<Page*> out;
+    out.reserve(g_input.selection().size());
+    for (uint64_t id : g_input.selection())
+        if (Page* p = page_by_id(id)) out.push_back(p);
+    return out;
+}
+
 void push_undo(UndoRecord r) {
     g_dirty = true;   // any undoable edit marks the project modified since last save
     g_undo_stack.push_back(std::move(r));
@@ -183,7 +206,7 @@ void push_undo(UndoRecord r) {
         g_undo_stack.erase(g_undo_stack.begin());
 }
 
-static void undo_last() {
+void undo_last() {
     if (g_undo_stack.empty()) return;
     g_dirty = true;   // undoing is itself a change to the working state
     UndoRecord r = std::move(g_undo_stack.back());
@@ -213,23 +236,23 @@ static void undo_last() {
             break;
         case UndoRecord::Type::PageMove:
             for (auto& pm : r.page_moves)
-                if (pm.page) pm.page->world_pos = pm.old_pos;
+                if (Page* p = page_by_id(pm.page_id)) p->world_pos = pm.old_pos;
             break;
         case UndoRecord::Type::PageResize:
             for (auto& pm : r.page_moves)
-                if (pm.page) { pm.page->world_w = pm.old_w; pm.page->world_h = pm.old_h; }
+                if (Page* p = page_by_id(pm.page_id)) { p->world_w = pm.old_w; p->world_h = pm.old_h; }
             break;
         case UndoRecord::Type::DocScale:
             for (auto& pm : r.page_moves)
-                if (pm.page) { pm.page->world_pos = pm.old_pos;
-                               pm.page->world_w = pm.old_w; pm.page->world_h = pm.old_h; }
+                if (Page* p = page_by_id(pm.page_id)) { p->world_pos = pm.old_pos;
+                                                        p->world_w = pm.old_w; p->world_h = pm.old_h; }
             break;
         case UndoRecord::Type::PageRotate:
             for (auto& pr : r.page_rots)
-                if (pr.page) {
-                    pr.page->rotation = pr.old_rot;
-                    pr.page->world_w  = pr.old_w;
-                    pr.page->world_h  = pr.old_h;
+                if (Page* p = page_by_id(pr.page_id)) {
+                    p->rotation = pr.old_rot;
+                    p->world_w  = pr.old_w;
+                    p->world_h  = pr.old_h;
                 }
             break;
         case UndoRecord::Type::TextBoxCreate:
@@ -300,20 +323,20 @@ static void undo_last() {
         }
         case UndoRecord::Type::Group:
             // Undo a group creation: revert members' group_id, then drop the group row.
-            for (auto& gm : r.group_members) if (gm.page) gm.page->group_id = gm.old_group;
+            for (auto& gm : r.group_members) if (Page* p = page_by_id(gm.page_id)) p->group_id = gm.old_group;
             g_groups.erase(std::remove_if(g_groups.begin(), g_groups.end(),
                            [&](const PageGroup& g){ return g.id == r.group_row.id; }),
                            g_groups.end());
             break;
         case UndoRecord::Type::Ungroup:
             // Undo an ungroup: restore members' group_id and re-add the group row.
-            for (auto& gm : r.group_members) if (gm.page) gm.page->group_id = gm.old_group;
+            for (auto& gm : r.group_members) if (Page* p = page_by_id(gm.page_id)) p->group_id = gm.old_group;
             if (r.group_row.id != 0) g_groups.push_back(r.group_row);
             break;
         case UndoRecord::Type::GroupJoin:
             // Undo a drag-to-add: revert members to their prior group (no row change —
             // the target group already existed and keeps its original members).
-            for (auto& gm : r.group_members) if (gm.page) gm.page->group_id = gm.old_group;
+            for (auto& gm : r.group_members) if (Page* p = page_by_id(gm.page_id)) p->group_id = gm.old_group;
             break;
     }
 }
@@ -430,6 +453,10 @@ void load_pdf(const std::string& path) {
     auto& c = DOC_PALETTE[idx % PALETTE_SIZE];
     doc.hue_r = c[0]; doc.hue_g = c[1]; doc.hue_b = c[2];
 
+    // Assign a stable id to every freshly-loaded page. A project load calls this too, then
+    // restores the saved ids over these (see load_project_from_path).
+    for (auto& page : doc.pages) page.id = g_next_page_id++;
+
     // Register document immediately so it appears on canvas; pages show as
     // warm-white placeholders until background rasterization completes. A locked
     // (password-protected) doc can't be rasterized — skip it; it renders as a
@@ -504,7 +531,7 @@ static Page* next_page_in_order(Page* from, int dir) {
     return nullptr;
 }
 
-static void remove_document(int doc_idx) {
+void remove_document(int doc_idx) {
     if (doc_idx < 0 || doc_idx >= (int)g_documents.size()) return;
 
     // Collect raw Page* addresses before the vector is erased so we can purge
@@ -513,21 +540,13 @@ static void remove_document(int doc_idx) {
     for (const auto& page : g_documents[doc_idx].pages)
         removing.insert(&page);
 
-    // Undo records of type PageMove/PageResize store raw Page*.  If any entry in
-    // a record points into the document being removed the whole record is unsafe —
-    // drop it rather than leaving a dangling pointer that would crash on Cmd+Z.
-    g_undo_stack.erase(
-        std::remove_if(g_undo_stack.begin(), g_undo_stack.end(),
-            [&](const UndoRecord& r) {
-                for (const auto& pm : r.page_moves)
-                    if (removing.count(pm.page)) return true;
-                for (const auto& gm : r.group_members)
-                    if (removing.count(gm.page)) return true;
-                return false;
-            }),
-        g_undo_stack.end());
+    // Undo records now reference pages by stable id, so a removed page's records need no
+    // scrubbing — they simply resolve to nullptr on undo (see page_by_id). This deletes the
+    // old dangling-pointer hazard entirely.
 
-    // Per-frame drag-snapshot globals also hold raw Page* — clear them.
+    // Per-frame drag-snapshot globals hold raw Page*, but only for the lifetime of an active
+    // drag (which can't span a document add/remove), so they never dangle. Cleared here as
+    // belt-and-suspenders in case a removal ever races an in-flight drag.
     if (removing.count(g_drag_snap_page)) g_drag_snap_page = nullptr;
     g_multi_drag_snaps.erase(
         std::remove_if(g_multi_drag_snaps.begin(), g_multi_drag_snaps.end(),
@@ -568,15 +587,19 @@ static bool relink_document(int doc_idx, const std::string& new_path) {
         return false;
     }
 
-    // Carry over saved positions + annotations + group membership onto the matching real pages.
+    // Carry over saved positions + annotations + group membership + stable id onto the
+    // matching real pages, so page identity (selection, undo, groups) survives the relink.
     for (auto& fp : fresh.pages)
         for (auto& op : old.pages)
             if (op.page_index == fp.page_index) {
+                fp.id        = op.id;         // preserve stable identity across the relink
                 fp.world_pos = op.world_pos;
                 fp.group_id  = op.group_id;   // keep the page in its group across a relink
                 fp.annots    = std::move(op.annots);
                 break;
             }
+    // Any fresh page with no old counterpart (new PDF has more pages) gets a new id.
+    for (auto& fp : fresh.pages) if (fp.id == 0) fp.id = g_next_page_id++;
 
     fresh.stack_origin = old.stack_origin;
     fresh.hue_r = old.hue_r; fresh.hue_g = old.hue_g; fresh.hue_b = old.hue_b;
@@ -905,7 +928,7 @@ static void mouse_button_callback(GLFWwindow* w, int button, int action, int mod
     if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE) {
         const auto& sel = g_input.selection();
         if (sel.size() == 1 && !g_input.panel_open()) {
-            g_nav_focus = *sel.begin();
+            g_nav_focus = page_by_id(*sel.begin());
         }
     }
 }
@@ -1070,14 +1093,14 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
             Page* next = next_page_in_order(g_nav_focus, +1);
             if (next) {
                 g_input.clear_selection();
-                const_cast<std::unordered_set<Page*>&>(g_input.selection()).insert(next);
+                const_cast<std::unordered_set<uint64_t>&>(g_input.selection()).insert(next->id);
                 g_nav_focus = next;
             }
         } else if (key == GLFW_KEY_UP || key == GLFW_KEY_LEFT) {
             Page* next = next_page_in_order(g_nav_focus, -1);
             if (next) {
                 g_input.clear_selection();
-                const_cast<std::unordered_set<Page*>&>(g_input.selection()).insert(next);
+                const_cast<std::unordered_set<uint64_t>&>(g_input.selection()).insert(next->id);
                 g_nav_focus = next;
             }
         }
@@ -1109,7 +1132,7 @@ static void key_callback(GLFWwindow* w, int key, int scancode, int action, int m
         bool shift = (mods & GLFW_MOD_SHIFT) != 0;
         if (shift) {
             std::unordered_set<int> gids;
-            for (Page* p : g_input.selection()) if (p->group_id) gids.insert(p->group_id);
+            for (Page* p : selected_pages()) if (p->group_id) gids.insert(p->group_id);
             for (int gid : gids) ungroup_group(gid);
         } else {
             create_group_from_selection();
@@ -1586,8 +1609,8 @@ static void create_group_from_selection() {
     grp.col_r = cv[0]; grp.col_g = cv[1]; grp.col_b = cv[2];
 
     UndoRecord r; r.type = UndoRecord::Type::Group; r.group_row = grp;
-    for (Page* p : sel) {
-        r.group_members.push_back({p, p->group_id});
+    for (Page* p : selected_pages()) {
+        r.group_members.push_back({p->id, p->group_id});
         p->group_id = gid;
     }
     g_groups.push_back(grp);
@@ -1605,7 +1628,7 @@ static void ungroup_group(int gid) {
     for (auto& doc : g_documents)
         for (auto& p : doc.pages)
             if (p.group_id == gid) {
-                r.group_members.push_back({&p, gid});
+                r.group_members.push_back({p.id, gid});
                 p.group_id = 0;
                 any = true;
             }
@@ -1623,7 +1646,7 @@ static void add_pages_to_group(int gid, const std::vector<Page*>& pages) {
     bool any = false;
     for (Page* p : pages) {
         if (!p || p->group_id == gid) continue;
-        r.group_members.push_back({p, p->group_id});
+        r.group_members.push_back({p->id, p->group_id});
         p->group_id = gid;
         any = true;
     }
@@ -1638,7 +1661,7 @@ static void update_group_drag_add() {
     if (dragging) {
         g_dragadd_pages.clear();
         if (g_input.is_multi_dragging()) {
-            for (Page* p : g_input.selection()) g_dragadd_pages.push_back(p);
+            for (Page* p : selected_pages()) g_dragadd_pages.push_back(p);
         } else if (const Page* dp = g_input.dragged_page()) {
             g_dragadd_pages.push_back(const_cast<Page*>(dp));
         }
@@ -1676,7 +1699,7 @@ static void update_group_drag_add() {
 static void remove_page_from_group(Page* p) {
     if (!p || p->group_id == 0) return;
     UndoRecord r; r.type = UndoRecord::Type::GroupJoin;   // GroupJoin = revert membership only
-    r.group_members.push_back({p, p->group_id});
+    r.group_members.push_back({p->id, p->group_id});
 
     float fr = 0.6f, fg = 0.6f, fb = 0.6f;                // flash color = owning document hue
     for (const auto& doc : g_documents) {
@@ -1784,7 +1807,7 @@ static void draw_canvas_text_boxes() {
                 std::set<int> docs_to_remove;
                 for (int d = 0; d < (int)g_documents.size(); ++d) {
                     for (const auto& p : g_documents[d].pages) {
-                        if (sel_pages.count(const_cast<Page*>(&p))) {
+                        if (sel_pages.count(p.id)) {
                             docs_to_remove.insert(d);
                             break;
                         }
@@ -1851,7 +1874,7 @@ static void draw_canvas_text_boxes() {
                 for (const auto& ps : g_page_drag_states)
                     if (ps.page->world_pos.x != ps.initial_pos.x ||
                         ps.page->world_pos.y != ps.initial_pos.y)
-                        r.page_moves.push_back({ps.page, ps.initial_pos});
+                        r.page_moves.push_back({ps.page->id, ps.initial_pos});
                 if (!r.page_moves.empty()) push_undo(r);
                 g_page_drag_states.clear();
             }
@@ -1969,7 +1992,7 @@ static void draw_canvas_text_boxes() {
                     }
                     // Record initial positions of selected pages so they move with the boxes
                     g_page_drag_states.clear();
-                    for (Page* p : g_input.selection())
+                    for (Page* p : selected_pages())
                         g_page_drag_states.push_back({p, p->world_pos});
                     g_box_dragging = true;
                 }
@@ -2194,7 +2217,7 @@ static void apply_page_rotation(Page* page, int delta_cw) {
     if (d == 0) return;                        // no-op (e.g. reset on an unrotated page)
     UndoRecord r;
     r.type = UndoRecord::Type::PageRotate;
-    r.page_rots.push_back({page, page->rotation, page->world_w, page->world_h});
+    r.page_rots.push_back({page->id, page->rotation, page->world_w, page->world_h});
     push_undo(r);
     page->rotation = (page->rotation + d) % 360;
     // Swap the page footprint only for odd 90° turns; a 180° (or 180° reset) keeps w/h.
@@ -2238,7 +2261,7 @@ static void normalize_document_size(Document& doc) {
 
     UndoRecord r; r.type = UndoRecord::Type::DocScale;
     for (auto& p : doc.pages) {
-        r.page_moves.push_back({&p, p.world_pos, p.world_w, p.world_h});
+        r.page_moves.push_back({p.id, p.world_pos, p.world_w, p.world_h});
         p.world_pos = { pivot.x + (p.world_pos.x - pivot.x) * scale,
                         pivot.y + (p.world_pos.y - pivot.y) * scale };
         p.world_w *= scale;
@@ -2295,7 +2318,7 @@ static void draw_context_menu() {
             if (ImGui::MenuItem("Return to Stack")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
-                r.page_moves.push_back({page, page->world_pos});
+                r.page_moves.push_back({page->id, page->world_pos});
                 push_undo(r);
                 page->world_pos = {
                     doc->stack_origin.x + page->page_index * PAGE_FAN_OFFSET,
@@ -2322,7 +2345,7 @@ static void draw_context_menu() {
             if (ImGui::MenuItem("Fan Pages Vertically")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
-                for (auto& p : doc->pages) r.page_moves.push_back({&p, p.world_pos});
+                for (auto& p : doc->pages) r.page_moves.push_back({p.id, p.world_pos});
                 push_undo(r);
                 float y = doc->stack_origin.y;
                 for (auto& p : doc->pages) { p.world_pos = {doc->stack_origin.x, y}; y += p.world_h + 20.0f; }
@@ -2330,7 +2353,7 @@ static void draw_context_menu() {
             if (ImGui::MenuItem("Fan Pages Horizontally")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
-                for (auto& p : doc->pages) r.page_moves.push_back({&p, p.world_pos});
+                for (auto& p : doc->pages) r.page_moves.push_back({p.id, p.world_pos});
                 push_undo(r);
                 float x = doc->stack_origin.x;
                 for (auto& p : doc->pages) { p.world_pos = {x, doc->stack_origin.y}; x += p.world_w + 20.0f; }
@@ -2338,7 +2361,7 @@ static void draw_context_menu() {
             if (ImGui::MenuItem("Stack Pages")) {
                 if (!doc->pages.empty()) doc->stack_origin = doc->pages[0].world_pos;
                 UndoRecord r; r.type = UndoRecord::Type::PageMove;
-                for (auto& p : doc->pages) r.page_moves.push_back({&p, p.world_pos});
+                for (auto& p : doc->pages) r.page_moves.push_back({p.id, p.world_pos});
                 push_undo(r);
                 for (auto& p : doc->pages) {
                     p.world_pos = {
@@ -2350,39 +2373,40 @@ static void draw_context_menu() {
             // Align + Normalize — only shown when ≥2 pages are selected and
             // the right-clicked page is part of that selection.
             const auto& sel = g_input.selection();
-            if (sel.size() >= 2 && sel.count(page)) {
+            std::vector<Page*> selp = selected_pages();   // resolved live pages for iteration
+            if (sel.size() >= 2 && sel.count(page->id)) {
                 ImGui::Separator();
 
                 // Helper: snapshot selection for undo, then call op()
                 auto with_move_undo = [&](auto op) {
                     UndoRecord r; r.type = UndoRecord::Type::PageMove;
-                    for (Page* p : sel) r.page_moves.push_back({p, p->world_pos});
+                    for (Page* p : selp) r.page_moves.push_back({p->id, p->world_pos});
                     push_undo(r);
                     op();
                 };
 
                 if (ImGui::BeginMenu("Align Selection")) {
                     if (ImGui::MenuItem("Left Edges")) with_move_undo([&]{
-                        for (Page* p : sel) p->world_pos.x = page->world_pos.x;
+                        for (Page* p : selp) p->world_pos.x = page->world_pos.x;
                     });
                     if (ImGui::MenuItem("Right Edges")) with_move_undo([&]{
                         float ref = page->world_pos.x + page->world_w;
-                        for (Page* p : sel) p->world_pos.x = ref - p->world_w;
+                        for (Page* p : selp) p->world_pos.x = ref - p->world_w;
                     });
                     if (ImGui::MenuItem("Top Edges")) with_move_undo([&]{
-                        for (Page* p : sel) p->world_pos.y = page->world_pos.y;
+                        for (Page* p : selp) p->world_pos.y = page->world_pos.y;
                     });
                     if (ImGui::MenuItem("Bottom Edges")) with_move_undo([&]{
                         float ref = page->world_pos.y + page->world_h;
-                        for (Page* p : sel) p->world_pos.y = ref - p->world_h;
+                        for (Page* p : selp) p->world_pos.y = ref - p->world_h;
                     });
                     if (ImGui::MenuItem("Centers Horizontal")) with_move_undo([&]{
                         float ref = page->world_pos.x + page->world_w * 0.5f;
-                        for (Page* p : sel) p->world_pos.x = ref - p->world_w * 0.5f;
+                        for (Page* p : selp) p->world_pos.x = ref - p->world_w * 0.5f;
                     });
                     if (ImGui::MenuItem("Centers Vertical")) with_move_undo([&]{
                         float ref = page->world_pos.y + page->world_h * 0.5f;
-                        for (Page* p : sel) p->world_pos.y = ref - p->world_h * 0.5f;
+                        for (Page* p : selp) p->world_pos.y = ref - p->world_h * 0.5f;
                     });
                     ImGui::EndMenu();
                 }
@@ -2390,10 +2414,10 @@ static void draw_context_menu() {
                 if (ImGui::MenuItem("Normalize Width to This")) {
                     if (page->world_w > 0.0f) {
                         UndoRecord r; r.type = UndoRecord::Type::PageResize;
-                        for (Page* p : sel)
-                            r.page_moves.push_back({p, p->world_pos, p->world_w, p->world_h});
+                        for (Page* p : selp)
+                            r.page_moves.push_back({p->id, p->world_pos, p->world_w, p->world_h});
                         push_undo(r);
-                        for (Page* p : sel) {
+                        for (Page* p : selp) {
                             if (p == page || p->world_w <= 0.0f) continue;
                             float scale   = page->world_w / p->world_w;
                             p->world_w    = page->world_w;
@@ -2404,7 +2428,7 @@ static void draw_context_menu() {
             }
 
             // Grouping — gather pages into an ad-hoc movable cluster, or dissolve one.
-            bool can_group   = sel.size() >= 2 && sel.count(page);
+            bool can_group   = sel.size() >= 2 && sel.count(page->id);
             bool can_ungroup = page->group_id != 0;
             if (can_group || can_ungroup) {
                 ImGui::Separator();
@@ -2479,6 +2503,7 @@ static void new_project() {
     s_ref_note_buf[0] = '\0';
     g_groups.clear();
     g_next_group_id = 1;
+    g_next_page_id  = 1;
     g_editing_group = 0;
     g_group_remove_flashes.clear();
     g_load_ok = true; g_dirty = false; g_last_save_wall = 0;   // fresh, unsaved state
@@ -2896,6 +2921,16 @@ static void draw_references_tab() {
             for (int hi = 0; hi < (int)g_documents[di].pages[pi].annots.highlights.size(); ++hi)
                 if (!g_documents[di].pages[pi].annots.highlights[hi].text.empty())
                     entries.push_back({di, pi, hi});
+
+    // Drop a stale note-editing pointer if its highlight is gone (e.g., its document was
+    // removed mid-edit). Runs before any use of s_editing_ref_hl this frame, so the pointer
+    // is never dereferenced dangling.
+    if (s_editing_ref_hl) {
+        bool live = false;
+        for (const auto& e : entries)
+            if (&g_documents[e.di].pages[e.pi].annots.highlights[e.hi] == s_editing_ref_hl) { live = true; break; }
+        if (!live) s_editing_ref_hl = nullptr;
+    }
 
     // Right-aligned export button
     float avail = ImGui::GetContentRegionAvail().x;
@@ -3854,7 +3889,7 @@ static void draw_page_tooltip() {
     if (now - s_hover_t0 < DELAY) return;
 
     // Only show when the hovered page belongs to the current selection.
-    if (!g_input.selection().count(const_cast<Page*>(hov_page))) return;
+    if (!g_input.selection().count(hov_page->id)) return;
 
     namespace fs = std::filesystem;
     std::string fname = fs::path(hov_doc->path).filename().string();
@@ -4600,7 +4635,7 @@ int main(int argc, char* argv[]) {
                 if (new_pos.x != g_drag_snap_pos.x || new_pos.y != g_drag_snap_pos.y) {
                     UndoRecord r;
                     r.type = UndoRecord::Type::PageMove;
-                    r.page_moves.push_back({const_cast<Page*>(g_drag_snap_page), g_drag_snap_pos});
+                    r.page_moves.push_back({g_drag_snap_page->id, g_drag_snap_pos});
                     push_undo(r);
                 }
                 g_drag_snap_page = nullptr;
@@ -4610,7 +4645,7 @@ int main(int argc, char* argv[]) {
             // Multi-page drag: snapshot all selected pages when drag begins
             if (!g_was_multi_drag && cur_multi) {
                 g_multi_drag_snaps.clear();
-                for (Page* p : g_input.selection())
+                for (Page* p : selected_pages())
                     g_multi_drag_snaps.push_back({p, p->world_pos});
                 // If drag started from a page (not a text box), also track text boxes.
                 // g_page_drag_states is not needed here — pages move via on_cursor_move.
@@ -4635,7 +4670,7 @@ int main(int argc, char* argv[]) {
                 for (auto& snap : g_multi_drag_snaps)
                     if (snap.page->world_pos.x != snap.old_pos.x ||
                         snap.page->world_pos.y != snap.old_pos.y)
-                        r.page_moves.push_back({snap.page, snap.old_pos});
+                        r.page_moves.push_back({snap.page->id, snap.old_pos});
                 if (!r.page_moves.empty()) push_undo(r);
                 g_multi_drag_snaps.clear();
             }
@@ -4738,8 +4773,7 @@ int main(int argc, char* argv[]) {
                         if (&g_documents[i] == sel_doc) {
                             int scroll_page = -1;
                             for (int pi = 0; pi < (int)sel_doc->pages.size(); ++pi) {
-                                if (g_input.selection().count(
-                                        const_cast<Page*>(&sel_doc->pages[pi]))) {
+                                if (g_input.selection().count(sel_doc->pages[pi].id)) {
                                     scroll_page = pi;
                                     break;
                                 }

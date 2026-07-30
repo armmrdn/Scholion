@@ -95,6 +95,7 @@ struct PageAnnotations {
 /// A single PDF page with its world-space geometry and per-tier GL textures.
 /// Textures are populated lazily by TextureCache; 0 means not yet uploaded.
 struct Page {
+    uint64_t id      = 0;           // stable identity, survives vector reallocation (0 = unassigned)
     int   page_index = 0;           // 0-based within parent document
     Vec2  world_pos  = {0.0f, 0.0f};
     float world_w    = 0.0f;        // derived from PDF media box (points → world units)

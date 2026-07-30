@@ -30,6 +30,7 @@ extern std::vector<CanvasTextBox>                g_text_boxes;
 extern int                                       g_next_box_id;
 extern std::vector<PageGroup>                    g_groups;
 extern int                                       g_next_group_id;
+extern uint64_t                                  g_next_page_id;   // stable page id counter
 extern bool                                      g_debug;
 extern GLFWwindow*                               g_window;
 extern float                                     g_panel_w;
@@ -41,3 +42,8 @@ extern int   g_prev_selected_box;
 extern int   g_prev_editing_box;
 extern bool  g_just_created;
 extern bool  g_edit_was_new;
+
+// App-state actions defined in main.cpp (exposed for the self-test + future extraction).
+void remove_document(int doc_idx);
+struct Page;
+Page* page_by_id(uint64_t id);   // resolve a stable page id to a live Page* (nullptr if gone)

@@ -50,7 +50,7 @@ public:
     void begin_group_drag(const std::vector<Page*>& pages, Vec2 grab_screen) {
         m_selection.clear();
         m_selected_text_boxes.clear();
-        for (Page* p : pages) m_selection.insert(p);
+        for (Page* p : pages) m_selection.insert(p->id);
         start_multi_drag(grab_screen);
     }
 
@@ -60,9 +60,11 @@ public:
     const Page*     dragged_page()        const { return m_dragged_page; }
     const Page*     pending_drag_page()   const { return m_drag_pending_page; }
 
-    // Multi-page selection + text-box selection (unified model)
-    const std::unordered_set<Page*>& selection() const { return m_selection; }
-    const std::unordered_set<int>&   selected_text_boxes() const { return m_selected_text_boxes; }
+    // Multi-page selection (by stable page id) + text-box selection (unified model).
+    // Ids (not raw Page*) so a selected page survives vector reallocation; resolve with
+    // resolve_page() at point of use.
+    const std::unordered_set<uint64_t>& selection() const { return m_selection; }
+    const std::unordered_set<int>&      selected_text_boxes() const { return m_selected_text_boxes; }
     void clear_selection() {
         m_selection.clear();
         m_selected_text_boxes.clear();
@@ -175,8 +177,10 @@ private:
     Vec2 m_box_start_world = {};
     Vec2 m_box_cur_world   = {};
 
-    // Page selection set (raw pointers; cleared whenever documents change)
-    std::unordered_set<Page*> m_selection;
+    // Page selection set (stable ids; a stale id simply resolves to nullptr)
+    std::unordered_set<uint64_t> m_selection;
+    // Resolve a page id to a live Page* within the current document set (nullptr if gone).
+    Page* resolve_page(uint64_t id) const;
 
     // Text-box selection set (IDs; unified with page selection)
     std::unordered_set<int> m_selected_text_boxes;

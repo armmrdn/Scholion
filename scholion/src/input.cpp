@@ -33,26 +33,26 @@ void InputHandler::on_mouse_button(GLFWwindow* window, int button, int action, i
                     // Toggle entire document in/out of selection
                     bool all_in = true;
                     for (auto& page : hit.doc->pages) {
-                        if (!m_selection.count(&page)) { all_in = false; break; }
+                        if (!m_selection.count(page.id)) { all_in = false; break; }
                     }
                     for (auto& page : hit.doc->pages) {
-                        if (all_in) m_selection.erase(&page);
-                        else        m_selection.insert(&page);
+                        if (all_in) m_selection.erase(page.id);
+                        else        m_selection.insert(page.id);
                     }
                     m_selected_doc = hit.doc;
                     if (!m_selection.empty())
                         start_multi_drag(m_current_mouse);
                 } else if (cmd) {
                     // Toggle individual page in/out of selection
-                    if (m_selection.count(hit.page))
-                        m_selection.erase(hit.page);
+                    if (m_selection.count(hit.page->id))
+                        m_selection.erase(hit.page->id);
                     else {
-                        m_selection.insert(hit.page);
+                        m_selection.insert(hit.page->id);
                         m_selected_doc = hit.doc;
                     }
                     if (!m_selection.empty())
                         start_multi_drag(m_current_mouse);
-                } else if (m_selection.count(hit.page)) {
+                } else if (m_selection.count(hit.page->id)) {
                     // Clicked a page already in the selection — drag the whole group
                     m_selected_doc = hit.doc;
                     start_multi_drag(m_current_mouse);
@@ -93,7 +93,7 @@ void InputHandler::on_mouse_button(GLFWwindow* window, int button, int action, i
             } else if (m_drag_pending_page && !m_drag_active) {
                 // Pure click (no drag) — add the clicked page to the selection so threads
                 // and the selection border show. Panel stays closed; double-click opens it.
-                m_selection.insert(m_drag_pending_page);
+                m_selection.insert(m_drag_pending_page->id);
             }
             m_dragged_page      = nullptr;
             m_drag_active       = false;
@@ -193,7 +193,7 @@ void InputHandler::on_key(GLFWwindow* /*window*/, int key, int /*scancode*/, int
         m_selection.clear();
         for (auto& doc : *m_documents)
             for (auto& page : doc.pages)
-                m_selection.insert(&page);
+                m_selection.insert(page.id);
     }
 }
 
@@ -221,6 +221,14 @@ void InputHandler::update(GLFWwindow* window) {
     }
 }
 
+Page* InputHandler::resolve_page(uint64_t id) const {
+    if (id == 0 || !m_documents) return nullptr;
+    for (auto& doc : *m_documents)
+        for (auto& p : doc.pages)
+            if (p.id == id) return &p;
+    return nullptr;
+}
+
 InputHandler::HitResult InputHandler::hit_test(Vec2 screen_pos) const {
     if (!m_documents) return {nullptr, nullptr};
     Vec2 world = m_canvas.screen_to_world(screen_pos);
@@ -240,8 +248,9 @@ void InputHandler::start_multi_drag(Vec2 grab_screen) {
     Vec2 grab_world = m_canvas.screen_to_world(grab_screen);
     m_multi_drag_grab_world = grab_world;
     m_drag_origins.clear();
-    for (Page* page : m_selection)
-        m_drag_origins.push_back({page, page->world_pos - grab_world});
+    for (uint64_t id : m_selection)
+        if (Page* page = resolve_page(id))
+            m_drag_origins.push_back({page, page->world_pos - grab_world});
     m_multi_drag_active = true;
     // Pressing on an item supersedes any rubber-band that began in the same click.
     m_box_selecting     = false;
@@ -262,7 +271,7 @@ void InputHandler::finalize_box_selection() {
             if (page.world_pos.x >= x0 && page.world_pos.y >= y0 &&
                 page.world_pos.x + page.world_w <= x1 &&
                 page.world_pos.y + page.world_h <= y1)
-                m_selection.insert(&page);
+                m_selection.insert(page.id);
         }
     }
 }

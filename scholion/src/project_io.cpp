@@ -1,5 +1,10 @@
 #include "project_io.h"
 #include "app_state.h"
+// Vendored JSON library (BSD-2, header-only) — Phase 2 will migrate the hand-rolled parser
+// onto it. Included now (unused) to verify it compiles in our toolchain. INT64 support so page
+// ids parse exactly rather than through double.
+#define PICOJSON_USE_INT64
+#include "picojson.h"
 #include "version.h"
 #include "canvas_annot.h"
 #include "save_feedback.h"
@@ -317,9 +322,10 @@ static std::string build_project_json() {
         for (int pi = 0; pi < (int)doc.pages.size(); ++pi) {
             const Page& page = doc.pages[pi];
             snprintf(b, sizeof(b),
-                     "        { \"index\": %d, \"x\": %.4f, \"y\": %.4f, \"w\": %.2f, \"h\": %.2f, \"rot\": %d, \"grp\": %d }%s\n",
+                     "        { \"index\": %d, \"x\": %.4f, \"y\": %.4f, \"w\": %.2f, \"h\": %.2f, \"rot\": %d, \"grp\": %d, \"id\": %llu }%s\n",
                      page.page_index, page.world_pos.x, page.world_pos.y,
                      page.world_w, page.world_h, page.rotation, page.group_id,
+                     (unsigned long long)page.id,
                      pi + 1 < (int)doc.pages.size() ? "," : "");
             out += b;
         }
@@ -578,7 +584,7 @@ void load_project_from_path(const std::string& path) {
     FILE* f = fopen(path.c_str(), "r");
     if (!f) { fprintf(stderr, "load_project: cannot open %s\n", path.c_str()); return; }
 
-    struct SavedPage { int idx; float x, y; float w = 0.0f, h = 0.0f; int rot = 0; int grp = 0; };
+    struct SavedPage { int idx; float x, y; float w = 0.0f, h = 0.0f; int rot = 0; int grp = 0; uint64_t id = 0; };
     struct SavedDoc  { std::string path; std::string rel; float sox, soy; std::vector<SavedPage> pages; };
     struct SavedGroup { int id; float r, g, b; std::string name; };
     std::vector<SavedGroup> saved_groups;
@@ -738,10 +744,10 @@ void load_project_from_path(const std::string& path) {
                 break;
             case T_INDEX:
                 if (sec == Section::Docs && cur >= 0) {
-                    float pw = 0.0f, ph = 0.0f; int prot = 0, pgrp = 0;
-                    int np = sscanf(at, "\"index\": %d, \"x\": %f, \"y\": %f, \"w\": %f, \"h\": %f, \"rot\": %d, \"grp\": %d",
-                                    &n, &a, &b, &pw, &ph, &prot, &pgrp);
-                    if (np >= 3) saved[cur].pages.push_back({n, a, b, pw, ph, prot, pgrp});
+                    float pw = 0.0f, ph = 0.0f; int prot = 0, pgrp = 0; unsigned long long pid = 0;
+                    int np = sscanf(at, "\"index\": %d, \"x\": %f, \"y\": %f, \"w\": %f, \"h\": %f, \"rot\": %d, \"grp\": %d, \"id\": %llu",
+                                    &n, &a, &b, &pw, &ph, &prot, &pgrp, &pid);
+                    if (np >= 3) saved[cur].pages.push_back({n, a, b, pw, ph, prot, pgrp, (uint64_t)pid});
                 }
                 break;
             case T_GROUP:
@@ -868,6 +874,7 @@ void load_project_from_path(const std::string& path) {
     g_canvas_strokes.clear();
     g_groups.clear();
     g_next_group_id = 1;
+    g_next_page_id  = 1;   // load_pdf assigns fresh ids; saved ids are restored below
     g_selected_box = g_editing_box = -1;
     g_prev_selected_box = g_prev_editing_box = -1;
     g_just_created = g_edit_was_new = false;
@@ -913,6 +920,7 @@ void load_project_from_path(const std::string& path) {
                 p.world_h    = sp.h > 0.0f ? sp.h : PLACEHOLDER_PAGE_H;
                 p.rotation   = sp.rot;
                 p.group_id   = sp.grp;
+                p.id         = sp.id ? sp.id : g_next_page_id++;   // placeholder path (no load_pdf)
                 d.pages.push_back(p);
             }
             doc_map[si] = (int)g_documents.size();
@@ -933,6 +941,7 @@ void load_project_from_path(const std::string& path) {
                 if (pg.page_index == sp.idx) {
                     pg.world_pos = {sp.x, sp.y};
                     pg.group_id  = sp.grp;
+                    if (sp.id) pg.id = sp.id;   // restore saved id over load_pdf's fresh one
                     if (sp.rot != 0) {
                         pg.rotation = sp.rot;
                         pg.world_w  = sp.w;
@@ -943,6 +952,14 @@ void load_project_from_path(const std::string& path) {
             }
         }
     }
+
+    // Normalize page ids: assign a fresh id to any page still unassigned (legacy files),
+    // and advance the counter past every id so future imports can't collide.
+    for (auto& doc : g_documents)
+        for (auto& pg : doc.pages) {
+            if (pg.id == 0) pg.id = g_next_page_id++;
+            if (pg.id >= g_next_page_id) g_next_page_id = pg.id + 1;
+        }
 
     // Rebuild the group table. Only keep groups that at least one loaded page
     // references, so a group whose pages all went missing doesn't linger.

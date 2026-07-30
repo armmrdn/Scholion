@@ -580,7 +580,7 @@ void Renderer::draw_pdf_pages(const Canvas& canvas, const std::vector<Document>&
 
             // Selection outline — thin dotted grey border, offset outside the page,
             // marking items in the selection (also covers a whole document).
-            if (hints.selection && hints.selection->count(const_cast<Page*>(&page))) {
+            if (hints.selection && hints.selection->count(page.id)) {
                 draw_rect_dashed(canvas,
                                  page.world_pos.x, page.world_pos.y,
                                  page.world_w,      page.world_h,
