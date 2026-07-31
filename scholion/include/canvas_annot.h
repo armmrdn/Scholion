@@ -17,6 +17,7 @@ struct RefNote { int after_idx; std::string text; };
 
 // Annotation input state — defined in canvas_annot.cpp
 extern AnnotTool   g_annot_tool;
+extern bool        g_text_tool;   // text-box tool active (mutually exclusive with g_annot_tool)
 extern bool        g_ann_drawing;
 extern float       g_pen_r, g_pen_g, g_pen_b;
 extern float       g_hl_r, g_hl_g, g_hl_b;   // highlighter (marker) color

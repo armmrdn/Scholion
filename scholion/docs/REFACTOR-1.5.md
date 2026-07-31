@@ -158,36 +158,91 @@ Carves landed (each: build green + self-test PASSED, one-line add to `cmake/sour
   `apply_appearance()` were already header-visible; only `g_logo_tex` needed promoting to an
   `app_state.h` extern (`unsigned int`, the repo's "GLuint = unsigned int" convention).
 
-Running total: **main.cpp 4,840 → 4,298 lines.**
+- **Step 5a (prep, 2026-07-30) — text-box style defaults → `canvas_text_box.h`:** promoted
+  `g_tbox_r/g/b`, `g_tbox_font_size`, `g_tbox_zoom_scaled` to externs (shared by the toolbar +
+  text-box creation). Header/def-only change; permanently removed the toolbar↔text-box style seam.
+- **Step 7 (pulled forward, 2026-07-30) — `toolbar.cpp` (+ `include/toolbar.h`, ~200 lines):**
+  `draw_toolbar_ui`. Unblocked by 5a (its tbox-style dep is now header-visible) and by
+  `canvas_annot.h` (pen/hl/tool state was already externed). Introduced **`include/actions.h`** (the
+  planned cross-cutting action header): `scholion_open_file`/`scholion_select_folder` pickers,
+  `load_pdfs_from_selection`/`_folder`, `draw_url_modal`. Also exposed `g_text_tool` (→
+  `canvas_annot.h`) and renamed the shared `s_toolbar_bottom` → `g_toolbar_bottom` (→ `app_state.h`,
+  since the panel reads it for its top edge).
 
-### Remaining plan (ordered; full strategy + coupling map in DEVLOG 2026-07-30 "carve strategy")
+Running total: **main.cpp 4,840 → 4,109 lines.**
+
+### ⚠ Finding (2026-07-30): `draw_canvas_text_boxes` is NOT a clean module — decompose in place first
+
+Audited before attempting Step 5's main move: `draw_canvas_text_boxes` (~420 lines) is a
+mega-function that fuses three unrelated concerns — (1) the **global "delete selected items"**
+handler, *including document removal* (`remove_document`, `DocumentRemove` undo, `g_documents`);
+(2) **unified page+box drag reconciliation** (`g_page_drag_states`, `PageMove` undo, `selected_pages`);
+(3) the actual **text-box render + per-box hit/click/drag**. Extracting it wholesale would drag half
+the canvas-interaction model across the TU boundary. **Revised Step 5 → do it as an in-place
+decomposition first** (split into e.g. `handle_selection_delete()`, `update_unified_item_drag()`,
+`draw_text_boxes_render()`, all still in main.cpp, behavior-preserving, one green commit), THEN carve
+only the genuinely text-box part into `text_boxes.cpp`. The transient statics
+(`g_box_dragging`/`_states`/`_start_world`, `g_tbox_creating`, `g_hovered_box` → accessor) and the
+drag-init seam at the main loop's `if (!g_box_dragging && …selected_text_boxes()…)` block still apply.
+Note `g_clip_box` (Cmd+C/V clipboard) is used **only** by `key_callback` — it stays in main, not part
+of the text-box carve.
+
+### Remaining plan (ordered; full strategy + coupling map in DEVLOG 2026-07-30 entries)
 
 > **Line numbers drift after every carve — key on symbols, re-grep at execution time.**
 > Two state classes decide where a static goes: *shared style/config read across TUs* → a
 > header-visible struct/extern (never into the carved module); *transient interaction state owned
 > by one subsystem* → a module-static exposed via accessors + a `reset()` hook.
 
-- **Step 5 — `text_boxes.cpp`** (highest value; tangled → 3 sub-commits):
-  - 5a: move the generic `imgui_dashed_rect` helper out to a shared util/renderer TU (de-interleaves
-    the region; `draw_locked_doc_labels` stays in main for now).
-  - 5b: split the two state classes — text-box **style defaults** (`g_tbox_r/g/b`,
-    `g_tbox_font_size`, `g_tbox_zoom_scaled`) are shared with the toolbar → promote to a
-    header (alongside the `canvas_annot.h` pen/hl style); text-box **transient** state
-    (`g_box_dragging`, `g_box_drag_states`, `g_box_drag_start_world`, `g_tbox_creating`,
-    `g_hovered_box`) will move into the module.
-  - 5c: move `text_box_layout` / `text_box_at` / `draw_canvas_text_boxes` + transient statics into
-    `text_boxes.cpp`. Replace the main-loop drag-init seam (the `if (!g_box_dragging &&
-    …selected_text_boxes()…)` block) with an exported `textboxes_begin_selection_drag()` so the loop
-    never touches box statics. Expose `textboxes_reset()` (drag + clipboard) for `new_project`.
-- **Step 6 — `side_panel.cpp`** (Viewer + References + Open Docs: `draw_panel_ui`,
-  `draw_references_tab`, `draw_panel_resize_handle`, `draw_panel_edge_tabs`; ~950 lines). Move the
-  references-edit statics (`s_editing_ref_hl`, `s_ref_note_buf`, `s_prev_editing_hl`) in; expose
-  `sidepanel_reset()`. Coupling is mostly outbound **action calls** (`relink_document`,
-  `reveal_in_file_manager`, `load_pdfs_from_selection`, zoom-to-page/doc, copy-text, export-refs) →
-  introduce a small **`actions.h`** declaring them.
-- **Step 7 — `toolbar.cpp`** (small — most state already externed in `canvas_annot.h`). Needs
-  `actions.h` (Step 6) + text-box style defaults header-visible (Step 5b), then it's a clean move of
-  `draw_toolbar_ui` (+ `s_toolbar_bottom`).
+- **Step 5-decomp — DONE (2026-07-30):** factored `draw_canvas_text_boxes` (418 lines) into three
+  concerns called in order from the render loop: `reconcile_selection_and_delete()` (sync +
+  global delete of selected pages/boxes/**documents**) and `update_item_drag_reconcile()` (unified
+  page+box drag continue/finish) — both **stay in main.cpp** — leaving `draw_canvas_text_boxes` as
+  text-box render/create/edit only. Behavior-preserving (same order, same settings/search early-out);
+  build green, selftest PASSED.
+- **Step 5-carve — DONE (2026-07-30):** moved into `text_boxes.cpp` (+ `text_boxes.h`, 493 lines):
+  helpers `text_box_layout` / `text_box_at` / `imgui_dashed_rect` (the last text-box-only → module
+  static), `draw_canvas_text_boxes`, `update_item_drag_reconcile`, plus all transient statics
+  (`g_box_dragging`, `g_box_drag_states`, `g_box_drag_start_world`, `g_page_drag_states`,
+  `TextBoxDragState`/`PageDragState`, `g_tbox_creating`, `g_tbox_create_start`, `g_hovered_box`,
+  `g_edit_text0`, `g_style_{r,g,b,fs}0`). `reconcile_selection_and_delete` stayed in main (owns
+  `remove_document`); `g_clip_box`/`g_clip_valid` (Cmd+C/V) stayed in main. Exports:
+  `text_box_at`, `draw_canvas_text_boxes`, `update_item_drag_reconcile`, `textbox_hovered()` (the
+  `main()` double-click guard), `textboxes_begin_page_initiated_drag()` (replaces the seam's box-setup
+  block; leaves `g_page_drag_states` empty), `textboxes_reset()` (wired into `new_project`). Persistent
+  box data (`g_text_boxes`, `g_selected_box`/`g_editing_box`/`g_prev_*`/`g_just_created`/
+  `g_edit_was_new`/`g_next_box_id`) stayed defined in main (app_state.h externs). Build green, selftest
+  PASSED; no moved static lingers in main (only stale-free doc comments, updated).
+
+- **Step 6-references — DONE (2026-07-30):** carved the **References tab** (`draw_references_tab`,
+  414 lines, cohesive) into `references_panel.cpp` (+ `references_panel.h`, 451 lines). Moved its
+  `s_editing_ref_hl` + `s_ref_note_buf` note-edit statics and the `RefEntry` helper struct in;
+  function-local statics (`s_prev_editing_hl`, `s_expanded_refs`, `s_note`) rode along. Exposed hooks
+  `references_note_editing()` / `references_commit_note()` (key_callback's ESC-commit + input
+  suppression) and `references_reset()` (new_project). Extended **`actions.h`** with `zoom_to_rect`,
+  `relink_document`, `reveal_in_file_manager`, `scholion_save_file`. `draw_references_tab` is still
+  called from `draw_panel_ui` (main) via the header.
+
+Running total: **main.cpp 4,840 → 3,237 lines** (extracted: undo, groups, settings, toolbar,
+text_boxes, references_panel).
+
+### `draw_panel_ui` fused mega-function — DECOMPOSED in place (2026-07-30)
+It fused panel chrome + Viewer page-render/LOD + annotation-input on the panel page. Split
+behavior-preserving (build green + selftest PASSED after each pass), all still in main.cpp:
+- `panel_page_annotation_input(page, doc_idx, pi, img_pos, img_w, img_h, dl)` — the Note/Pen/Highlight/
+  Eraser input block that mutates the `g_ann_*` subsystem (`stroke_add_point`, `push_undo`, …).
+- `draw_panel_page(doc_idx, pi, avail_w, scroll_to)` — per-page Viewer render (LOD `enqueue_rast`/
+  `tex_for_lod`, image/placeholder, search-hit highlights, saved annotations, note badges); calls the
+  input helper.
+- `draw_panel_ui()` — now **101 lines** (was 293): pure chrome (window, tab bar, page-nav, References
+  tab dispatch to the already-carved `draw_references_tab`).
+**Step 6-rest carve → NEXT:** move the panel chrome into `side_panel.cpp` — `draw_panel_ui` +
+`draw_panel_resize_handle` + `draw_panel_edge_tabs` + `draw_panel_page` + panel statics
+(`s_panel_nav_page`, `s_last_panel_doc`, `g_panel_open_to_refs`, `s_panel_ann_active`, …). Decide where
+`panel_page_annotation_input` lives (annotation logic — could stay in main or go to canvas_annot.cpp);
+extend actions.h / expose the panel-nav + rasterization hooks it needs (`enqueue_rast`, `open_panel`,
+`panel_scroll_page`, …). Audit each remaining panel fn for its own coupling first.
+- **Step 7 — `toolbar.cpp`** — DONE (pulled forward, see above).
 - **Step 8 — `dialogs.cpp`** (optional, lowest value): `draw_url_modal`, `draw_startup_chooser`,
   `draw_quit_dialog`. Thin modals over `actions.h`. Defensible to leave in main as app-shell.
 - **Step 9 — stop at the shell.** After 5–7, main.cpp = platform/GL/GLFW init + the GLFW callbacks +

@@ -53,4 +53,5 @@ Page* page_by_id(uint64_t id);   // resolve a stable page id to a live Page* (nu
 extern bool g_settings_open;
 extern bool g_search_open;
 extern unsigned int g_logo_tex;        // GLuint app-logo texture (settings/startup UI)
+extern float g_toolbar_bottom;         // toolbar's measured bottom edge (px); panel sits below it
 std::vector<Page*> selected_pages();   // live Page* for every id in the current selection

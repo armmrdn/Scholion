@@ -6,6 +6,9 @@ set(SCHOLION_SHARED_SOURCES
     undo.cpp
     groups.cpp
     settings.cpp
+    toolbar.cpp
+    text_boxes.cpp
+    references_panel.cpp
     rast_pipeline.cpp
     canvas_annot.cpp
     project_io.cpp
