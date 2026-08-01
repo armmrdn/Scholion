@@ -52,14 +52,17 @@ High structural value, high regression risk — intentionally **not** in v1.4. G
       every other bundled dep is already permissive (ImGui MIT, GLFW zlib, tinyfiledialogs zlib, GLAD
       MIT/PD, DejaVu Sans Bitstream Vera). Sizeable port (raster + text-extraction + search paths in
       `pdf_loader.cpp`).
-- [ ] **Stable page/document IDs (replace raw `Page*` identity).** Selection, drag, undo, hover, and
+- [x] **Stable page/document IDs (replace raw `Page*` identity).** ✅ DONE (1.5 Phase 1): `uint64_t Page::id` + `page_by_id()` resolve-at-use; selection/undo/renderer keyed by id. Selection, drag, undo, hover, and
       thread ordering all store raw `Page*` into `std::vector<Page>`, which reallocates on add/remove
       — the root cause of the whole class of pointer-invalidation bugs patched over time (undo-scrub
       on doc removal, `clear_selection` on `set_documents`, relink carry-over). Introduce integer
       handles + lookup. Also gives the file format a real stable key (helps the note-migration story).
-- [ ] **Carve up `main.cpp` (~4,900 lines).** Extract input handling, the undo system, the sidebar/
+- [x] **Carve up `main.cpp` (~4,900 lines).** ✅ DONE (1.5 Phase 3): 4,840 → ~2,276 across 9 TUs —
+      undo, groups, settings, toolbar, text_boxes, references_panel, side_panel, dialogs, input_glue.
+      Extract input handling, the undo system, the sidebar/
       panels, and the toolbar into their own translation units. Biggest maintainability win.
-- [ ] **Replace the hand-rolled tolerant JSON parser** (`project_io.cpp`) with a real JSON parser
+- [x] **Replace the hand-rolled tolerant JSON parser** ✅ DONE (1.5 Phase 2): PicoJSON tree parser +
+      serializer; retired the sscanf scanner and the snprintf writer. (`project_io.cpp`) with a real JSON parser
       (e.g. a single-header lib). Removes the substring-based section inference and per-record
       `sscanf` brittleness (the fixed buffer-overflow was a symptom); enables a proper schema/
       migration framework beyond the current `format:1` + tolerant reads.

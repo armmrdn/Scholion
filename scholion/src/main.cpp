@@ -21,6 +21,10 @@
 #include "actions.h"
 #include "text_boxes.h"
 #include "references_panel.h"
+#include "search.h"
+#include "side_panel.h"
+#include "dialogs.h"
+#include "input_glue.h"
 
 #ifdef __APPLE__
 #define GL_SILENCE_DEPRECATION
@@ -122,17 +126,10 @@ static GLuint g_vignette_tex = 0;  // elliptical gradient texture, created once 
 GLuint g_logo_tex     = 0;  // app logo (embedded); non-static: read by settings.cpp
 
 // --- Quit confirmation -------------------------------------------------------
-static bool g_quit_requested = false;
-enum class QuitState { None, Waiting, Confirmed };
-static QuitState g_quit_state = QuitState::None;
 
 // --- Panel width (shared between panel and resize handle) -------------------
 float g_panel_w = 360.0f;   // also exposed as extern in app_state.h
-static int  s_panel_nav_page    = 0;     // current page index in open panel (0-based)
-static int   s_last_panel_doc    = 0;      // last doc shown in panel — used by edge tabs to reopen
-static bool  g_panel_open_to_refs = false; // true = next panel open should land on References tab
 float g_toolbar_bottom     = 51.0f; // measured each frame by draw_toolbar_ui()
-static Page* g_nav_focus = nullptr; // focused page for arrow navigation (when panel closed)
 
 // --- Canvas text boxes -------------------------------------------------------
 // w/h are the box's on-screen size in pixels (0 = auto-size to text, used by
@@ -151,8 +148,6 @@ bool  g_tbox_zoom_scaled = false;  // template for new boxes: scale text with zo
 bool g_just_created      = false; // set on create; consumed by edit-session tracking
 
 // Entity clipboard for Cmd+C / Cmd+V duplication of selected boxes
-static CanvasTextBox g_clip_box   = {};
-static bool          g_clip_valid = false;
 
 // Undo session tracking — one record per editing session (text) and per
 // selection session (style). Snapshots taken on begin, compared on end.
@@ -236,31 +231,16 @@ static std::string      g_dl_error;
 static std::thread      g_dl_thread;
 
 // --- Search state -----------------------------------------------------------
-static bool s_panel_ann_active = false;  // true while annotating from the sidebar panel
 bool g_search_open    = false;   // non-static: read by extracted modules (groups.cpp)
 static std::atomic<bool> g_search_running{false};
 static char g_search_buf[256] = {};
-struct SearchResult {
-    int         doc_idx;
-    int         page_idx;
-    std::string excerpt;
-    std::string doc_name;
-    std::vector<std::array<float,4>> hit_rects;  // normalized [0,1] quads from MuPDF
-};
-static std::vector<SearchResult> g_search_results;
+std::vector<SearchResult> g_search_results;
 static std::mutex                g_search_results_mutex;
 static std::thread               g_search_thread;
-static int g_highlighted_search_result = -1;
+int g_highlighted_search_result = -1;
 static std::string g_last_search_term;
 
-// Transient canvas highlight for the currently selected search result.
-struct SearchHighlight {
-    int doc_idx  = -1;
-    int page_idx = -1;
-    std::vector<std::array<float,4>> rects;
-    bool active() const { return doc_idx >= 0 && !rects.empty(); }
-};
-static SearchHighlight g_search_highlight;
+SearchHighlight g_search_highlight;
 
 // --- Helpers ----------------------------------------------------------------
 
@@ -338,7 +318,7 @@ void zoom_to_rect(float x0, float y0, float x1, float y1) {
     g_canvas.set_offset({(x0 + x1) * 0.5f, (y0 + y1) * 0.5f});
 }
 
-static void zoom_to_fit() {
+void zoom_to_fit() {
     if (g_documents.empty()) return;
     float x0 = 1e30f, y0 = 1e30f, x1 = -1e30f, y1 = -1e30f;
     for (const auto& doc : g_documents)
@@ -353,7 +333,7 @@ static void zoom_to_fit() {
 
 // Arrow key selection navigation: find next/prev page in document order.
 // Iterates all docs sorted by z_layer, flattens pages, finds current page, returns ±1 neighbor.
-static Page* next_page_in_order(Page* from, int dir) {
+Page* next_page_in_order(Page* from, int dir) {
     if (!from) return nullptr;
     std::vector<int> order(g_documents.size());
     std::iota(order.begin(), order.end(), 0);
@@ -637,346 +617,16 @@ static LONG WINAPI scholion_seh_filter(EXCEPTION_POINTERS*) {
 
 // --- GLFW callbacks ---------------------------------------------------------
 
-static void glfw_error_callback(int error, const char* description) {
-    fprintf(stderr, "GLFW Error %d: %s\n", error, description);
-}
-
-static int g_doc_z_counter = 0;
-
-
-static void mouse_button_callback(GLFWwindow* w, int button, int action, int mods) {
-    if (ImGui::GetIO().WantCaptureMouse) return;
-    // A text box under the cursor owns this click, so no annotation (pen/highlight/note)
-    // starts on the page beneath it. Synchronous hit-test replaces the old g_hovered_box
-    // guard, which was set one frame late in draw_canvas_text_boxes — a same-frame
-    // move-then-click could slip past it (e.g. dropping a stray Note flag under a box).
-    {
-        double hcx, hcy; glfwGetCursorPos(w, &hcx, &hcy);
-        if (text_box_at((float)hcx, (float)hcy) >= 0) return;
-    }
-
-    // Annotation tool: intercept LMB press on a page before InputHandler sees it.
-    // The page owns the click — InputHandler does not receive it, so no drag/select starts.
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS
-            && g_annot_tool != AnnotTool::None) {
-        double cx, cy;
-        glfwGetCursorPos(w, &cx, &cy);
-        int doc_idx = -1;
-        Page* page = hit_test_page((float)cx, (float)cy, &doc_idx);
-        if (page) {
-            Vec2 norm = screen_to_page_norm(*page, (float)cx, (float)cy);
-            if (g_annot_tool == AnnotTool::Note) {
-                int snap = g_next_note_idx;
-                page->annots.notes.push_back({note_label(g_next_note_idx++)});
-                UndoRecord r;
-                r.type            = UndoRecord::Type::Note;
-                r.doc_idx         = doc_idx;
-                r.page_idx        = page->page_index;
-                r.note_idx_before = snap;
-                push_undo(r);
-            } else {
-                g_ann_drawing  = true;
-                g_ann_doc_idx  = doc_idx;
-                g_ann_page_idx = page->page_index;
-                // Pen and the freehand highlighter capture a point path; the box highlighter
-                // (and eraser) just track the start/current corner via g_ann_hl_start/cur_norm.
-                if (g_annot_tool == AnnotTool::Pen ||
-                    (g_annot_tool == AnnotTool::Highlight && !g_hl_box_mode)) {
-                    g_ann_cur_stroke = {};
-                    if (g_annot_tool == AnnotTool::Pen) {
-                        g_ann_cur_stroke.r = g_pen_r; g_ann_cur_stroke.g = g_pen_g; g_ann_cur_stroke.b = g_pen_b;
-                    } else {
-                        g_ann_cur_stroke.r = g_hl_r; g_ann_cur_stroke.g = g_hl_g; g_ann_cur_stroke.b = g_hl_b;
-                        g_ann_cur_stroke.width = MARKER_HALF_W; g_ann_cur_stroke.alpha = MARKER_ALPHA;
-                    }
-                    g_ann_cur_stroke.pts.push_back(norm);
-                }
-                g_ann_hl_start = norm;   // box highlighter / eraser radius origin
-                g_ann_cur_norm = norm;
-            }
-            return; // page owns this click — don't pass to InputHandler
-        } else if (g_annot_tool == AnnotTool::Pen) {
-            // Pen started on empty canvas → a world-locked canvas stroke (drawn in front).
-            g_ann_drawing = true; g_ann_canvas = true;
-            g_ann_doc_idx = -1; g_ann_page_idx = -1;
-            g_ann_cur_stroke = {};
-            g_ann_cur_stroke.r = g_pen_r; g_ann_cur_stroke.g = g_pen_g; g_ann_cur_stroke.b = g_pen_b;
-            g_ann_cur_stroke.pts.push_back(g_canvas.screen_to_world({(float)cx, (float)cy}));
-            return;
-        }
-    }
-
-    bool was_box_sel = g_input.box_selecting();
-    bool tools_active = g_text_tool || g_annot_tool != AnnotTool::None;
-
-    // Group frame handle: a left-press on a group's frame outline or label grabs the
-    // whole group and moves it as a unit. Opt-in and gated on no tool active / not
-    // panning, so dragging a page interior or a document (Shift+drag) is unchanged.
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS
-            && !tools_active && !g_input.is_space_held()) {
-        double gcx, gcy; glfwGetCursorPos(w, &gcx, &gcy);
-        int gid = group_handle_at((float)gcx, (float)gcy);
-        if (gid != 0) {
-            std::vector<Page*> pages = group_pages(gid);
-            if (!pages.empty()) {
-                g_input.begin_group_drag(pages, {(float)gcx, (float)gcy});
-                return;   // group handle owns this press
-            }
-        }
-    }
-
-    g_input.on_mouse_button(w, button, action, mods, tools_active);
-
-    // Bring clicked page's document to front
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_PRESS) {
-        const Page* pressed = g_input.pending_drag_page();
-        if (pressed) {
-            for (auto& doc : g_documents) {
-                for (const auto& page : doc.pages) {
-                    if (&page == pressed) {
-                        doc.z_layer = ++g_doc_z_counter;
-                        goto done_z;
-                    }
-                }
-            }
-            done_z:;
-        }
-    }
-
-    // After rubber-band ends, also add text boxes whose world rect is inside the selection rect.
-    // box_start/cur_world remain valid after finalize_box_selection clears m_box_selecting.
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE
-            && was_box_sel && !g_input.box_selecting()) {
-        float x0 = std::min(g_input.box_start_world().x, g_input.box_cur_world().x);
-        float y0 = std::min(g_input.box_start_world().y, g_input.box_cur_world().y);
-        float x1 = std::max(g_input.box_start_world().x, g_input.box_cur_world().x);
-        float y1 = std::max(g_input.box_start_world().y, g_input.box_cur_world().y);
-        float zoom = g_canvas.get_zoom();
-        auto& sel = const_cast<std::unordered_set<int>&>(g_input.selected_text_boxes());
-        for (const auto& box : g_text_boxes) {
-            float bx0 = box.world_pos.x,  by0 = box.world_pos.y;
-            // box.w/h are screen px; world extent = screen px / zoom.
-            // h==0 means auto-height (unknown without rendering) — check top-left only.
-            float bx1 = (box.w > 0.0f) ? bx0 + box.w / zoom : bx0;
-            float by1 = (box.h > 0.0f) ? by0 + box.h / zoom : by0;
-            if (bx0 >= x0 && by0 >= y0 && bx1 <= x1 && by1 <= y1)
-                sel.insert(box.id);
-        }
-    }
-
-    // Update g_nav_focus when selection becomes a single page
-    if (button == GLFW_MOUSE_BUTTON_LEFT && action == GLFW_RELEASE) {
-        const auto& sel = g_input.selection();
-        if (sel.size() == 1 && !g_input.panel_open()) {
-            g_nav_focus = page_by_id(*sel.begin());
-        }
-    }
-}
-
-static void cursor_pos_callback(GLFWwindow* w, double x, double y) {
-    if (ImGui::GetIO().WantCaptureMouse) { g_input.clear_hover(); return; }
-    g_input.on_cursor_move(w, x, y);
-    // Canvas (world-space) pen stroke — accumulate world points.
-    if (g_ann_drawing && g_ann_canvas && g_annot_tool == AnnotTool::Pen) {
-        bool ortho = (glfwGetKey(w, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS) ||
-                     (glfwGetKey(w, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
-        stroke_add_point_world(g_canvas.screen_to_world({(float)x, (float)y}), ortho);
-    }
-    // Accumulate pen / freehand-highlighter-swipe points at mouse-move rate (smoother path).
-    // Box-mode highlight tracks a rectangle instead (via g_ann_cur_norm), so it's excluded.
-    if (g_ann_drawing && !s_panel_ann_active
-            && (g_annot_tool == AnnotTool::Pen ||
-                (g_annot_tool == AnnotTool::Highlight && !g_hl_box_mode))
-            && g_ann_doc_idx >= 0 && g_ann_doc_idx < (int)g_documents.size()
-            && g_ann_page_idx >= 0) {
-        bool ortho = (glfwGetKey(w, GLFW_KEY_LEFT_SHIFT)  == GLFW_PRESS) ||
-                     (glfwGetKey(w, GLFW_KEY_RIGHT_SHIFT) == GLFW_PRESS);
-        const Document& doc = g_documents[g_ann_doc_idx];
-        for (const auto& pg : doc.pages) {
-            if (pg.page_index == g_ann_page_idx) {
-                stroke_add_point(pg, screen_to_page_norm(pg, (float)x, (float)y), ortho);
-                break;
-            }
-        }
-    }
-}
-
-static void scroll_callback(GLFWwindow* w, double xoff, double yoff) {
-    if (ImGui::GetIO().WantCaptureMouse) return;
-    g_input.on_scroll(w, xoff, yoff);
-}
 
 // Opens a fresh per-call PdfLoader to extract text — avoids racing with the
 // background rast thread which owns the shared g_loaders instances.
-static std::string extract_page_text(const std::string& path, int page_idx) {
+std::string extract_page_text(const std::string& path, int page_idx) {
     PdfLoader tmp;
     Document  dummy;
     if (!tmp.load(path, dummy)) return {};
     return tmp.extract_text(page_idx);
 }
 
-static void key_callback(GLFWwindow* w, int key, int scancode, int action, int mods) {
-    bool super = (mods & GLFW_MOD_SUPER) != 0;
-    bool ctrl  = (mods & GLFW_MOD_CONTROL) != 0;
-
-    // These shortcuts fire on PRESS only and are allowed even when ImGui has focus.
-    if (action == GLFW_PRESS) {
-        if (key == GLFW_KEY_F && (super || ctrl)) { g_search_open = !g_search_open; return; }
-        // Cmd+S: allowed mid text-box edit so you can save without closing the editor.
-        if (key == GLFW_KEY_S && (super || ctrl)) { save_project_current(); return; }
-        // Cmd+0 / Ctrl+0: zoom-to-fit regardless of active tool or text editing state.
-        if (key == GLFW_KEY_0 && (super || ctrl)) { zoom_to_fit(); return; }
-
-        // Tool keys: suppressed while any ImGui widget has keyboard focus (text input, etc.)
-        bool cmd = super || ctrl;
-        if (!cmd && !g_search_open && g_editing_box < 0
-                && !ImGui::GetIO().WantCaptureKeyboard) {
-            if (key == GLFW_KEY_P) {
-                bool was_pen = (g_annot_tool == AnnotTool::Pen);
-                g_annot_tool = was_pen ? AnnotTool::None : AnnotTool::Pen;
-                g_ann_drawing = false;
-                if (!was_pen) { g_text_tool = false; g_editing_box = -1; }
-                return;
-            }
-            if (key == GLFW_KEY_H) {
-                bool was_hl = (g_annot_tool == AnnotTool::Highlight);
-                g_annot_tool = was_hl ? AnnotTool::None : AnnotTool::Highlight;
-                g_ann_drawing = false;
-                if (!was_hl) { g_text_tool = false; g_editing_box = -1; }
-                return;
-            }
-            if (key == GLFW_KEY_F && !super && !ctrl) {
-                bool was_note = (g_annot_tool == AnnotTool::Note);
-                g_annot_tool = was_note ? AnnotTool::None : AnnotTool::Note;
-                g_ann_drawing = false;
-                if (!was_note) { g_text_tool = false; g_editing_box = -1; }
-                return;
-            }
-            if (key == GLFW_KEY_E) {
-                bool was_eraser = (g_annot_tool == AnnotTool::Eraser);
-                g_annot_tool = was_eraser ? AnnotTool::None : AnnotTool::Eraser;
-                g_ann_drawing = false;
-                if (!was_eraser) { g_text_tool = false; g_editing_box = -1; }
-                return;
-            }
-            if (key == GLFW_KEY_T) {
-                bool was_text = g_text_tool;
-                g_text_tool   = !g_text_tool;
-                g_editing_box = -1;
-                if (!was_text) { g_annot_tool = AnnotTool::None; g_ann_drawing = false; }
-                return;
-            }
-            // ESC: deactivate active tool even when panel has keyboard focus.
-            if (key == GLFW_KEY_ESCAPE && !g_search_open) {
-                if (g_editing_box >= 0) {
-                    g_editing_box = -1;
-                    return;
-                }
-                if (g_text_tool) { g_text_tool = false; return; }
-                if (g_annot_tool != AnnotTool::None) {
-                    g_annot_tool = AnnotTool::None;
-                    g_ann_drawing = false;
-                    return;
-                }
-            }
-        }
-    }
-
-    // While a ref-note is being edited in the panel, suppress all shortcuts and
-    // canvas input — only Escape is allowed (to confirm and close the note).
-    if (references_note_editing()) {
-        if (key == GLFW_KEY_ESCAPE && action == GLFW_PRESS)
-            references_commit_note();
-        return;
-    }
-
-    // Space key must reach on_key even when the panel has keyboard focus so that
-    // the press→release tap sequence that toggles the panel is always detected.
-    // WantCaptureKeyboard is true whenever any ImGui window is active — but we
-    // must NOT route space to on_key when the user is actually typing (text box,
-    // search field, ref-note editor). WantTextInput is specifically true only when
-    // a text input widget has keyboard focus and wants character input.
-    if (ImGui::GetIO().WantCaptureKeyboard) {
-        if (key == GLFW_KEY_SPACE && g_editing_box < 0 && !ImGui::GetIO().WantTextInput)
-            g_input.on_key(w, key, scancode, action, mods);
-        return;
-    }
-
-    // InputHandler needs PRESS, REPEAT, and RELEASE so that m_space_held is cleared
-    // on key-up. The early "action != GLFW_PRESS" return that used to sit above this
-    // call was silently swallowing the space key-up, leaving m_space_held = true
-    // forever and causing all subsequent left-drags to pan instead of move items.
-    g_input.on_key(w, key, scancode, action, mods);
-
-    if (action != GLFW_PRESS && action != GLFW_REPEAT) return;
-
-    if (key == GLFW_KEY_Z && (super || ctrl)) undo_last();
-
-    // Arrow key navigation in panel or selection
-    if (g_input.panel_open()) {
-        int doc_idx = g_input.panel_doc_index();
-        if (doc_idx >= 0 && doc_idx < (int)g_documents.size()) {
-            int total = (int)g_documents[doc_idx].pages.size();
-            if (key == GLFW_KEY_DOWN || key == GLFW_KEY_RIGHT) {
-                s_panel_nav_page = std::min(s_panel_nav_page + 1, total - 1);
-                g_input.open_panel(doc_idx, s_panel_nav_page);
-            } else if (key == GLFW_KEY_UP || key == GLFW_KEY_LEFT) {
-                s_panel_nav_page = std::max(s_panel_nav_page - 1, 0);
-                g_input.open_panel(doc_idx, s_panel_nav_page);
-            }
-        }
-    } else if (!g_input.selection().empty()) {
-        // Arrow key selection navigation (when panel is closed)
-        if (key == GLFW_KEY_DOWN || key == GLFW_KEY_RIGHT) {
-            Page* next = next_page_in_order(g_nav_focus, +1);
-            if (next) {
-                g_input.clear_selection();
-                const_cast<std::unordered_set<uint64_t>&>(g_input.selection()).insert(next->id);
-                g_nav_focus = next;
-            }
-        } else if (key == GLFW_KEY_UP || key == GLFW_KEY_LEFT) {
-            Page* next = next_page_in_order(g_nav_focus, -1);
-            if (next) {
-                g_input.clear_selection();
-                const_cast<std::unordered_set<uint64_t>&>(g_input.selection()).insert(next->id);
-                g_nav_focus = next;
-            }
-        }
-    }
-
-    if (action != GLFW_PRESS) return;
-
-    bool cmd = super || ctrl;
-
-    // Text-box entity copy/paste. Only reachable when no ImGui text field has
-    // focus (guarded above), so copy/paste inside an open box goes to the text
-    // field via ImGui instead. Here it duplicates the selected box.
-    if (cmd && key == GLFW_KEY_C && g_selected_box >= 0 && g_editing_box < 0) {
-        for (const auto& b : g_text_boxes)
-            if (b.id == g_selected_box) { g_clip_box = b; g_clip_valid = true; break; }
-    }
-    if (cmd && key == GLFW_KEY_V && g_clip_valid) {
-        CanvasTextBox nb = g_clip_box;
-        nb.id        = g_next_box_id++;
-        nb.world_pos = nb.world_pos + Vec2{16.0f, 16.0f};  // offset so the copy is visible
-        g_text_boxes.push_back(nb);
-        g_selected_box = nb.id;
-        g_editing_box  = -1;
-        UndoRecord r; r.type = UndoRecord::Type::TextBoxCreate; r.box_id = nb.id; push_undo(r);
-    }
-
-    // Cmd/Ctrl+G groups the selected pages; Cmd/Ctrl+Shift+G ungroups them.
-    if (cmd && key == GLFW_KEY_G) {
-        bool shift = (mods & GLFW_MOD_SHIFT) != 0;
-        if (shift) {
-            std::unordered_set<int> gids;
-            for (Page* p : selected_pages()) if (p->group_id) gids.insert(p->group_id);
-            for (int gid : gids) ungroup_group(gid);
-        } else {
-            create_group_from_selection();
-        }
-    }
-}
 
 static void framebuffer_size_callback(GLFWwindow* w, int width, int height) {
     glViewport(0, 0, width, height);
@@ -985,24 +635,6 @@ static void framebuffer_size_callback(GLFWwindow* w, int width, int height) {
     g_canvas.set_viewport_size(static_cast<float>(win_w), static_cast<float>(win_h));
 }
 
-static void focus_callback(GLFWwindow* /*w*/, int focused) {
-    // When the window loses focus, key-up events for held keys are never delivered.
-    // Clear panning state so space+drag doesn't stay active after a cmd-tab.
-    if (!focused) g_input.clear_held_keys();
-}
-
-static void drop_callback(GLFWwindow* /*w*/, int count, const char** paths) {
-    namespace fs = std::filesystem;
-    for (int i = 0; i < count; ++i) {
-        fs::path p(paths[i]);
-        if (fs::is_directory(p))
-            load_pdfs_from_folder(paths[i]);
-        else if (p.extension() == ".scholion")
-            load_project_from_path(paths[i]);
-        else
-            load_pdf(paths[i]);
-    }
-}
 
 // --- URL modal --------------------------------------------------------------
 
@@ -1558,144 +1190,11 @@ static void new_project() {
 // --- Startup chooser (bare/native launch only) ------------------------------
 // Shown when the app is opened with no document. Lets the user open a saved
 // project, load PDF file(s), or load a whole folder of PDFs — or start blank.
-static bool g_startup_chooser = false;
 
-static void draw_startup_chooser() {
-    if (!g_startup_chooser) return;
-    if (!ImGui::IsPopupOpen("##startup")) ImGui::OpenPopup("##startup");
-
-    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
-    ImGui::SetNextWindowPos(center, ImGuiCond_Always, {0.5f, 0.5f});
-    if (ImGui::BeginPopupModal("##startup", nullptr,
-            ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
-            ImGuiWindowFlags_NoTitleBar)) {
-        // Button width tracks the UI scale so labels fit in Larger-UI mode.
-        const float ui        = ImGui::GetIO().FontGlobalScale;
-        const float btn_w     = 260.0f * ui;
-        const char* app_title = "Scholion " SCHOLION_VERSION;
-        const char* subtitle  = "Open a project or add PDFs to begin";
-
-        // Measure widths up front (the title is drawn at 1.5x window font scale), then
-        // center everything within a single content width so nothing goes off-center
-        // no matter which element is widest — holds in both normal and Larger-UI modes.
-        ImGui::SetWindowFontScale(1.5f);
-        float title_w = ImGui::CalcTextSize(app_title).x;
-        ImGui::SetWindowFontScale(1.0f);
-        float sub_w   = ImGui::CalcTextSize(subtitle).x;
-        float content_w = std::max({btn_w, title_w, sub_w});
-
-        auto center_in = [&](float w) {
-            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (content_w - w) * 0.5f));
-        };
-
-        // App logo — kept small (fixed size) in both UI modes, centered above the title.
-        if (g_logo_tex) {
-            const float logo = 72.0f;
-            center_in(logo);
-            ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(g_logo_tex)), {logo, logo});
-            ImGui::Spacing();
-        }
-
-        ImGui::SetWindowFontScale(1.5f);
-        center_in(title_w);
-        ImGui::TextUnformatted(app_title);
-        ImGui::SetWindowFontScale(1.0f);
-        ImGui::Spacing();
-
-        center_in(sub_w);
-        ImGui::TextUnformatted(subtitle);
-        ImGui::Spacing();
-
-        const ImVec2 bsz = {btn_w, 0.0f};
-        auto centered_button = [&](const char* label) {
-            center_in(btn_w);
-            return ImGui::Button(label, bsz);
-        };
-
-        if (centered_button("Open Project File")) {
-            g_startup_chooser = false; ImGui::CloseCurrentPopup();
-            load_project();
-        }
-        if (centered_button("Add PDF File(s)")) {
-            const char* pats[] = {"*.pdf", "*.PDF"};
-#ifdef __APPLE__
-            const char* r = scholion_open_file("Select PDF files", pats, 2, 1);
-#else
-            before_file_dialog();
-            const char* r = tinyfd_openFileDialog("Select PDF files", nullptr, 2, pats, "PDF Documents", 1);
-            after_file_dialog();
-#endif
-            g_startup_chooser = false; ImGui::CloseCurrentPopup();
-            if (r) load_pdfs_from_selection(r);
-        }
-        if (centered_button("Add Folder of PDFs")) {
-#ifdef __APPLE__
-            const char* d = scholion_select_folder("Select PDF folder");
-#else
-            before_file_dialog();
-            const char* d = tinyfd_selectFolderDialog("Select PDF folder", nullptr);
-            after_file_dialog();
-#endif
-            g_startup_chooser = false; ImGui::CloseCurrentPopup();
-            if (d) load_pdfs_from_folder(d);
-        }
-        ImGui::Separator();
-        if (centered_button("Start with Blank Canvas")) {
-            g_startup_chooser = false; ImGui::CloseCurrentPopup();
-        }
-        ImGui::EndPopup();
-    }
-}
 
 
 // --- Quit confirmation dialog -----------------------------------------------
 
-static void draw_quit_dialog() {
-    if (g_quit_requested && g_quit_state == QuitState::None) {
-        g_quit_state = QuitState::Waiting;
-        ImGui::OpenPopup("Quit Scholion?");
-    }
-
-    ImVec2 vp = ImGui::GetMainViewport()->Size;
-    ImGui::SetNextWindowPos({vp.x * 0.5f, vp.y * 0.5f}, ImGuiCond_Appearing, {0.5f, 0.5f});
-
-    if (ImGui::BeginPopupModal("Quit Scholion?", nullptr,
-                               ImGuiWindowFlags_AlwaysAutoResize |
-                               ImGuiWindowFlags_NoCollapse)) {
-        ImGui::TextWrapped("Do you want to save your project before quitting?");
-        ImGui::Spacing();
-
-        // Button layout
-        float button_width = 100.0f;
-        float spacing = 10.0f;
-        float total_width = (button_width * 3) + (spacing * 2);
-        ImGui::SetCursorPosX(ImGui::GetWindowWidth() / 2 - total_width / 2);
-
-        if (ImGui::Button("Save", {button_width, 0})) {
-            save_project_current();
-            g_quit_state = QuitState::Confirmed;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SetItemTooltip("Save the project and quit");
-
-        ImGui::SameLine(0, spacing);
-        if (ImGui::Button("Discard", {button_width, 0})) {
-            g_quit_state = QuitState::Confirmed;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SetItemTooltip("Quit without saving");
-
-        ImGui::SameLine(0, spacing);
-        if (ImGui::Button("Cancel", {button_width, 0})) {
-            g_quit_requested = false;
-            g_quit_state = QuitState::None;
-            ImGui::CloseCurrentPopup();
-        }
-        ImGui::SetItemTooltip("Go back to the app");
-
-        ImGui::EndPopup();
-    }
-}
 
 // --- Canvas context menu (right-click on empty canvas) ---------------------
 
@@ -1780,312 +1279,6 @@ static void draw_canvas_context_menu() {
 
 // --- Panel viewer -----------------------------------------------------------
 
-// Annotation input (Note / Pen / Highlight / Eraser) on one panel page. Mirrors the canvas
-// annotation handling: writes the shared g_ann_* state + page.annots and pushes undo records.
-// finalize_annotation() is called by the main draw loop when the stroke ends.
-static void panel_page_annotation_input(Page& page, int doc_idx, int pi,
-                                        ImVec2 img_pos, float img_w, float img_h, ImDrawList* dl) {
-    ImVec2 mouse  = ImGui::GetMousePos();
-    float  nx     = std::clamp((mouse.x - img_pos.x) / img_w, 0.0f, 1.0f);
-    float  ny     = std::clamp((mouse.y - img_pos.y) / img_h, 0.0f, 1.0f);
-    Vec2   pnorm  = {nx, ny};
-    bool   hov    = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenBlockedByActiveItem);
-
-    if (g_annot_tool == AnnotTool::Note && hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        int snap = g_next_note_idx;
-        page.annots.notes.push_back({note_label(g_next_note_idx++)});
-        UndoRecord r; r.type = UndoRecord::Type::Note;
-        r.doc_idx = doc_idx; r.page_idx = pi; r.note_idx_before = snap;
-        push_undo(r);
-    }
-
-    if ((g_annot_tool == AnnotTool::Highlight || g_annot_tool == AnnotTool::Pen)
-            && !g_ann_drawing && hov && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
-        g_ann_drawing      = true;
-        g_ann_doc_idx      = doc_idx;
-        g_ann_page_idx     = pi;
-        s_panel_ann_active = true;
-        if (g_annot_tool == AnnotTool::Pen ||
-            (g_annot_tool == AnnotTool::Highlight && !g_hl_box_mode)) {
-            g_ann_cur_stroke = {};
-            if (g_annot_tool == AnnotTool::Pen) {
-                g_ann_cur_stroke.r = g_pen_r; g_ann_cur_stroke.g = g_pen_g; g_ann_cur_stroke.b = g_pen_b;
-            } else {
-                g_ann_cur_stroke.r = g_hl_r; g_ann_cur_stroke.g = g_hl_g; g_ann_cur_stroke.b = g_hl_b;
-                g_ann_cur_stroke.width = MARKER_HALF_W; g_ann_cur_stroke.alpha = MARKER_ALPHA;
-            }
-            g_ann_cur_stroke.pts.push_back(pnorm);
-        }
-        g_ann_hl_start = pnorm;
-        g_ann_cur_norm = pnorm;
-    }
-
-    if (g_ann_drawing && s_panel_ann_active &&
-            g_ann_doc_idx == doc_idx && g_ann_page_idx == pi) {
-        if ((g_annot_tool == AnnotTool::Pen ||
-             (g_annot_tool == AnnotTool::Highlight && !g_hl_box_mode))
-                && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-            stroke_add_point(page, pnorm, ImGui::GetIO().KeyShift);  // Shift = ortho-lock
-            const auto& pts = g_ann_cur_stroke.pts;
-            bool  hlt   = (g_annot_tool == AnnotTool::Highlight);
-            ImU32 col   = hlt
-                ? IM_COL32((int)(g_hl_r*255),(int)(g_hl_g*255),(int)(g_hl_b*255),(int)(MARKER_ALPHA*255))
-                : IM_COL32((int)(g_pen_r*255),(int)(g_pen_g*255),(int)(g_pen_b*255),220);
-            float thick = hlt ? MARKER_HALF_W * 2.0f : 2.0f;
-            for (int si = 1; si < (int)pts.size(); ++si) {
-                ImVec2 a = {img_pos.x + pts[si-1].x * img_w, img_pos.y + pts[si-1].y * img_h};
-                ImVec2 b = {img_pos.x + pts[si  ].x * img_w, img_pos.y + pts[si  ].y * img_h};
-                dl->AddLine(a, b, col, thick);
-            }
-        } else if (g_annot_tool == AnnotTool::Highlight && g_hl_box_mode) {
-            // Box mode — track the rectangle and preview it in yellow.
-            g_ann_cur_norm = pnorm;
-            float x0 = std::min(g_ann_hl_start.x, pnorm.x), y0 = std::min(g_ann_hl_start.y, pnorm.y);
-            float x1 = std::max(g_ann_hl_start.x, pnorm.x), y1 = std::max(g_ann_hl_start.y, pnorm.y);
-            dl->AddRectFilled(
-                {img_pos.x + x0 * img_w, img_pos.y + y0 * img_h},
-                {img_pos.x + x1 * img_w, img_pos.y + y1 * img_h},
-                IM_COL32(255, 224, 0, 80));
-        }
-        if (!ImGui::IsMouseDown(ImGuiMouseButton_Left))
-            s_panel_ann_active = false;
-            // finalize_annotation() is called by the main draw loop
-    }
-
-    if (g_annot_tool == AnnotTool::Eraser && hov && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
-        constexpr float ER = 0.025f;
-        for (int hi = (int)page.annots.highlights.size() - 1; hi >= 0; --hi) {
-            const auto& hl = page.annots.highlights[hi];
-            float cx = std::clamp(nx, hl.x0, hl.x1), cy = std::clamp(ny, hl.y0, hl.y1);
-            if ((nx-cx)*(nx-cx) + (ny-cy)*(ny-cy) <= ER*ER) {
-                UndoRecord r; r.type = UndoRecord::Type::ErasedHighlight;
-                r.doc_idx = doc_idx; r.page_idx = pi; r.erased_highlight = hl;
-                push_undo(r);
-                page.annots.highlights.erase(page.annots.highlights.begin() + hi);
-            }
-        }
-        for (int si = (int)page.annots.strokes.size() - 1; si >= 0; --si) {
-            bool hit = false;
-            for (const auto& pt : page.annots.strokes[si].pts) {
-                float dx = nx - pt.x, dy = ny - pt.y;
-                if (dx*dx + dy*dy <= ER*ER) { hit = true; break; }
-            }
-            if (hit) {
-                UndoRecord r; r.type = UndoRecord::Type::ErasedStroke;
-                r.doc_idx = doc_idx; r.page_idx = pi;
-                r.erased_stroke = page.annots.strokes[si];
-                push_undo(r);
-                page.annots.strokes.erase(page.annots.strokes.begin() + si);
-            }
-        }
-    }
-}
-
-// Render one page in the panel Viewer: image/placeholder (+ Low-tier LOD request), search-hit
-// highlights, annotation input, saved annotations, and note badges.
-static void draw_panel_page(int doc_idx, int pi, float avail_w, int scroll_to) {
-    Document& doc = g_documents[doc_idx];
-    Page& page = doc.pages[pi];
-
-    // Panel uses Low tier (150 DPI); sufficient for the panel's ~360px display width.
-    // High-tier tiles are managed by stream_lod for canvas use only.
-    if (page.needs_lod(LodTier::Low) && g_loaders[doc_idx])
-        enqueue_rast(doc.path, g_loaders[doc_idx], page.page_index, LodTier::Low);
-    uint32_t tex = page.tex_for_lod(LodTier::Low);
-
-    float img_w = avail_w;
-    float img_h = (page.world_w > 0.0f)
-        ? page.world_h * (avail_w / page.world_w)
-        : avail_w * 1.41f;
-
-    ImVec2 img_pos = ImGui::GetCursorScreenPos();
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-
-    // Check if this page is the highlighted search result
-    bool is_highlighted = false;
-    if (g_highlighted_search_result >= 0 &&
-        g_highlighted_search_result < (int)g_search_results.size()) {
-        const auto& hit = g_search_results[g_highlighted_search_result];
-        is_highlighted = (hit.doc_idx == doc_idx && hit.page_idx == pi);
-    }
-
-    // Render image or placeholder
-    if (tex) {
-        ImGui::Image(static_cast<ImTextureID>(static_cast<uintptr_t>(tex)),
-                     {img_w, img_h});
-    } else {
-        dl->AddRectFilled(img_pos, {img_pos.x + img_w, img_pos.y + img_h},
-                          IM_COL32(55, 55, 58, 255));
-        ImGui::Dummy({img_w, img_h});
-    }
-
-    // Draw blue highlight border if this is the highlighted search result
-    if (is_highlighted) {
-        dl->AddRect(img_pos, {img_pos.x + img_w, img_pos.y + img_h},
-                   IM_COL32(100, 150, 255, 200), 0.0f, 0, 4.0f);
-    }
-
-    // Draw orange search hit rects (text-level, from g_search_highlight)
-    if (g_search_highlight.active() &&
-        g_search_highlight.doc_idx == doc_idx &&
-        g_search_highlight.page_idx == pi) {
-        for (const auto& r : g_search_highlight.rects) {
-            ImVec2 tl = {img_pos.x + r[0] * img_w, img_pos.y + r[1] * img_h};
-            ImVec2 br = {img_pos.x + r[2] * img_w, img_pos.y + r[3] * img_h};
-            dl->AddRectFilled(tl, br, IM_COL32(255, 128, 0, 130));
-        }
-    }
-
-    // Annotation tool interaction on this panel page.
-    panel_page_annotation_input(page, doc_idx, pi, img_pos, img_w, img_h, dl);
-
-    // Draw saved annotations on top of page
-    for (const auto& hl : page.annots.highlights) {
-        ImVec2 tl = {img_pos.x + hl.x0 * img_w, img_pos.y + hl.y0 * img_h};
-        ImVec2 br = {img_pos.x + hl.x1 * img_w, img_pos.y + hl.y1 * img_h};
-        dl->AddRectFilled(tl, br, IM_COL32(255, 224, 0, 80));
-    }
-    for (const auto& stroke : page.annots.strokes) {
-        int sa = (int)(stroke.alpha * 255.0f);
-        for (int si = 1; si < (int)stroke.pts.size(); ++si) {
-            ImVec2 a = {img_pos.x + stroke.pts[si-1].x * img_w,
-                        img_pos.y + stroke.pts[si-1].y * img_h};
-            ImVec2 b = {img_pos.x + stroke.pts[si  ].x * img_w,
-                        img_pos.y + stroke.pts[si  ].y * img_h};
-            dl->AddLine(a, b,
-                IM_COL32((int)(stroke.r*255), (int)(stroke.g*255), (int)(stroke.b*255), sa),
-                stroke.width * 2.0f);
-        }
-    }
-
-    // Note badges — stacked from top-right corner, left to right.
-    // When the Note tool is active, clicking a badge removes that flag.
-    {
-        constexpr float NBW = 16.0f, NBH = 16.0f, NGAP = 2.0f;
-        float nbx = img_pos.x + img_w;
-        int remove_idx = -1;
-        for (int ni = 0; ni < (int)page.annots.notes.size(); ++ni) {
-            nbx -= NBW + NGAP;
-            ImVec2 ntl = {nbx,        img_pos.y};
-            ImVec2 nbr = {nbx + NBW,  img_pos.y + NBH};
-            dl->AddRectFilled(ntl, nbr, IM_COL32(50, 110, 210, 230), 2.0f);
-            const auto& note = page.annots.notes[ni];
-            ImVec2 tsz = ImGui::CalcTextSize(note.label.c_str());
-            dl->AddText({ntl.x + (NBW - tsz.x) * 0.5f, ntl.y + (NBH - tsz.y) * 0.5f},
-                        IM_COL32(255, 255, 255, 255), note.label.c_str());
-        }
-    }
-
-    if (scroll_to == page.page_index) {
-        ImGui::SetScrollHereY(0.0f);
-        g_input.clear_panel_scroll();
-    }
-
-    ImGui::Spacing();
-}
-
-static void draw_panel_ui() {
-    if (!g_input.panel_open()) return;
-
-    int doc_idx = g_input.panel_doc_index();
-    if (doc_idx < 0 || doc_idx >= static_cast<int>(g_documents.size())) {
-        g_input.close_panel();
-        return;
-    }
-
-    Document& doc = g_documents[doc_idx];
-    s_last_panel_doc = doc_idx;  // remember for edge-tab re-open
-    ImVec2 vp = ImGui::GetMainViewport()->Size;
-
-    ImGui::SetNextWindowPos({vp.x - g_panel_w, 0.0f}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize({g_panel_w, vp.y}, ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.94f);
-
-    constexpr ImGuiWindowFlags kFlags =
-        ImGuiWindowFlags_NoTitleBar           |
-        ImGuiWindowFlags_NoResize             |
-        ImGuiWindowFlags_NoMove               |
-        ImGuiWindowFlags_NoCollapse           |
-        ImGuiWindowFlags_NoBringToFrontOnFocus |
-        ImGuiWindowFlags_NoSavedSettings;
-
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {10.0f, 10.0f});
-    ImGui::Begin("##panel", nullptr, kFlags);
-    ImGui::PopStyleVar();
-
-    // Track the "active" page for nav and copy (updated on scroll-to events)
-    int scroll_to_peek = g_input.panel_scroll_page();  // read before clear
-    if (ImGui::IsWindowAppearing()) s_panel_nav_page = std::max(0, scroll_to_peek);
-    else if (scroll_to_peek >= 0)  s_panel_nav_page = scroll_to_peek;
-
-    // Tab bar — "Viewer" / "References" — blue-themed, pinned at the top of the panel.
-    // On first appearance, honour g_panel_open_to_refs to select the right tab.
-    namespace fs = std::filesystem;
-    bool just_appeared = ImGui::IsWindowAppearing();
-    ImGuiTabItemFlags viewer_flags = (just_appeared && !g_panel_open_to_refs)
-                                     ? ImGuiTabItemFlags_SetSelected : 0;
-    ImGuiTabItemFlags ref_flags    = (just_appeared &&  g_panel_open_to_refs)
-                                     ? ImGuiTabItemFlags_SetSelected : 0;
-    if (just_appeared) g_panel_open_to_refs = false;
-
-    ImGui::PushStyleColor(ImGuiCol_Tab,                 ImVec4(0.14f, 0.33f, 0.65f, 0.85f));
-    ImGui::PushStyleColor(ImGuiCol_TabHovered,          ImVec4(0.20f, 0.42f, 0.78f, 0.96f));
-    ImGui::PushStyleColor(ImGuiCol_TabSelected,         ImVec4(0.27f, 0.51f, 0.88f, 1.00f));
-    ImGui::PushStyleColor(ImGuiCol_TabSelectedOverline, ImVec4(0.50f, 0.75f, 1.00f, 1.00f));
-    ImGui::PushStyleColor(ImGuiCol_TabDimmed,           ImVec4(0.10f, 0.24f, 0.50f, 0.70f));
-    ImGui::PushStyleColor(ImGuiCol_TabDimmedSelected,   ImVec4(0.18f, 0.40f, 0.72f, 0.90f));
-    ImGui::BeginTabBar("##panel_tabs");
-    ImGui::PopStyleColor(6);
-
-    if (ImGui::BeginTabItem("Viewer", nullptr, viewer_flags)) {
-        // Document name below tab bar
-        std::string fname = fs::path(doc.path).filename().string();
-        ImGui::PushStyleColor(ImGuiCol_Text, {doc.hue_r, doc.hue_g, doc.hue_b, 1.0f});
-        ImGui::TextUnformatted(fname.c_str());
-        ImGui::PopStyleColor();
-
-        // Page navigation  < p.N/Total >
-        {
-            int total = (int)doc.pages.size();
-            if (ImGui::SmallButton("<") && s_panel_nav_page > 0) {
-                s_panel_nav_page--;
-                g_input.open_panel(doc_idx, s_panel_nav_page);
-            }
-            ImGui::SetItemTooltip("Previous page");
-            ImGui::SameLine();
-            ImGui::Text("p.%d/%d", s_panel_nav_page + 1, total);
-            ImGui::SameLine();
-            if (ImGui::SmallButton(">") && s_panel_nav_page < total - 1) {
-                s_panel_nav_page++;
-                g_input.open_panel(doc_idx, s_panel_nav_page);
-            }
-            ImGui::SetItemTooltip("Next page");
-        }
-
-    // Child window fills the remaining panel height and is the only scrollable region.
-    ImGui::BeginChild("##panel_scroll", {0.0f, 0.0f}, false, ImGuiWindowFlags_None);
-    ImGui::Spacing();
-
-    float avail_w  = ImGui::GetContentRegionAvail().x;
-    int   scroll_to = g_input.panel_scroll_page();
-
-    for (int pi = 0; pi < (int)doc.pages.size(); ++pi)
-        draw_panel_page(doc_idx, pi, avail_w, scroll_to);
-
-    ImGui::EndChild();
-    ImGui::EndTabItem();
-    } // Viewer tab
-
-    if (ImGui::BeginTabItem("References", nullptr, ref_flags)) {
-        ImGui::BeginChild("##panel_ref_scroll", {0.0f, 0.0f}, false, ImGuiWindowFlags_None);
-        draw_references_tab();
-        ImGui::EndChild();
-        ImGui::EndTabItem();
-    }
-
-    ImGui::EndTabBar();
-    ImGui::End();
-}
 
 // --- Canvas (world-space) pen strokes -----------------------------------------
 // Drawn via BackgroundDrawList (above the GL page layer, below ImGui windows) so canvas
@@ -2170,172 +1363,6 @@ static void draw_canvas_note_badges() {
 
 // --- Panel resize handle ----------------------------------------------------
 
-static void draw_panel_resize_handle() {
-    if (!g_input.panel_open()) return;
-
-    ImVec2 vp = ImGui::GetMainViewport()->Size;
-    constexpr float STRIP_W = 12.0f;
-
-    ImGui::SetNextWindowPos({vp.x - g_panel_w - STRIP_W * 0.5f, 0.0f}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize({STRIP_W, vp.y}, ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.0f);
-
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0.0f, 0.0f});
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, {1.0f, 1.0f});
-    constexpr ImGuiWindowFlags kRFlags =
-        ImGuiWindowFlags_NoTitleBar          |
-        ImGuiWindowFlags_NoResize            |
-        ImGuiWindowFlags_NoMove              |
-        ImGuiWindowFlags_NoScrollbar         |
-        ImGuiWindowFlags_NoSavedSettings     |
-        ImGuiWindowFlags_NoBackground        |
-        ImGuiWindowFlags_NoFocusOnAppearing  |
-        ImGuiWindowFlags_NoBringToFrontOnFocus;
-    ImGui::Begin("##panel_resize", nullptr, kRFlags);
-    ImGui::PopStyleVar(2);
-
-    ImVec2 wp = ImGui::GetWindowPos();
-    ImGui::InvisibleButton("##drag", {STRIP_W, vp.y});
-    bool is_active  = ImGui::IsItemActive();
-    bool is_hovered = ImGui::IsItemHovered();
-
-    if (is_active) {
-        g_panel_w -= ImGui::GetIO().MouseDelta.x;
-        g_panel_w  = std::clamp(g_panel_w, 180.0f, vp.x - 30.0f);
-    } else if (ImGui::IsItemDeactivated()) {
-        g_settings.panel_w = g_panel_w;
-        save_prefs();
-    }
-    if (is_hovered || is_active)
-        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeEW);
-
-    // Blue divider line — brighter when hovered/dragged
-    float cx = wp.x + STRIP_W * 0.5f;
-    ImU32 line_col = is_active  ? IM_COL32(110, 165, 255, 230)
-                   : is_hovered ? IM_COL32(80, 140, 230, 200)
-                   :              IM_COL32(55, 108, 190, 150);
-    ImGui::GetWindowDrawList()->AddLine({cx, wp.y}, {cx, wp.y + vp.y}, line_col, 2.5f);
-
-    ImGui::End();
-}
-
-// --- Panel edge tabs (shown on right edge when sidebar is closed) -----------
-// Two vertical tab handles sitting flush on the right edge — characters are
-// rendered stacked top-to-bottom so the label reads downward without rotation.
-// They disappear once the sidebar is open.
-
-// Render text rotated 90° CCW, centered on 'center', using glyph quads so
-// the result is crisp at any size.  Reading direction: bottom → top.
-static void draw_text_ccw(ImDrawList* dl, ImVec2 center, const char* text, ImU32 col)
-{
-    ImFont*  font  = ImGui::GetFont();
-    float    scale = ImGui::GetFontSize() / font->FontSize;
-    ImVec2   tsz   = ImGui::CalcTextSize(text);
-    float    cx    = tsz.x * 0.5f;   // half text-width  → vertical offset
-    float    cy    = tsz.y * 0.5f;   // half text-height → horizontal offset
-
-    float cur_x = 0.0f;
-    for (const char* s = text; *s; ++s) {
-        const ImFontGlyph* g = font->FindGlyph((ImWchar)(unsigned char)*s);
-        if (!g) continue;
-        if (g->Visible) {
-            float x0 = cur_x + g->X0 * scale,  y0 = g->Y0 * scale;
-            float x1 = cur_x + g->X1 * scale,  y1 = g->Y1 * scale;
-            // 90° CCW in screen-space: (lx,ly) → (+ly - cy, cx - lx) + center
-            ImVec2 p1 = { center.x + y0 - cy, center.y + cx - x0 };
-            ImVec2 p2 = { center.x + y0 - cy, center.y + cx - x1 };
-            ImVec2 p3 = { center.x + y1 - cy, center.y + cx - x1 };
-            ImVec2 p4 = { center.x + y1 - cy, center.y + cx - x0 };
-            dl->AddImageQuad(ImGui::GetIO().Fonts->TexID,
-                p1, p2, p3, p4,
-                { g->U0, g->V0 }, { g->U1, g->V0 },
-                { g->U1, g->V1 }, { g->U0, g->V1 },
-                col);
-        }
-        cur_x += g->AdvanceX * scale;
-    }
-}
-
-static void draw_panel_edge_tabs() {
-    if (g_input.panel_open()) return;
-    if (g_documents.empty()) return;
-
-    ImVec2 vp      = ImGui::GetMainViewport()->Size;
-    float  lh      = ImGui::GetTextLineHeight();
-    // When rotated 90°, text width becomes the tab height and text height
-    // becomes the tab width.  Add padding in both axes.
-    const float PAD_H   = 10.0f;   // left/right padding → adds to STRIP_W
-    const float PAD_V   = 16.0f;   // top/bottom padding → adds to tab height
-    const float TAB_GAP =  6.0f;
-    float STRIP_W  = lh + PAD_H * 2.0f;
-    float viewer_h = ImGui::CalcTextSize("Viewer").x     + PAD_V * 2.0f;
-    float refs_h   = ImGui::CalcTextSize("References").x + PAD_V * 2.0f;
-    float total_h  = viewer_h + TAB_GAP + refs_h;
-    float origin_y = g_toolbar_bottom + 4.0f;
-
-    ImGui::SetNextWindowPos({vp.x - STRIP_W, origin_y}, ImGuiCond_Always);
-    ImGui::SetNextWindowSize({STRIP_W, total_h}, ImGuiCond_Always);
-    ImGui::SetNextWindowBgAlpha(0.0f);
-
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, {0.0f, 0.0f});
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowMinSize, {1.0f, 1.0f});
-    constexpr ImGuiWindowFlags kFlags =
-        ImGuiWindowFlags_NoTitleBar          |
-        ImGuiWindowFlags_NoResize            |
-        ImGuiWindowFlags_NoMove              |
-        ImGuiWindowFlags_NoScrollbar         |
-        ImGuiWindowFlags_NoSavedSettings     |
-        ImGuiWindowFlags_NoBackground        |
-        ImGuiWindowFlags_NoFocusOnAppearing  |
-        ImGuiWindowFlags_NoBringToFrontOnFocus;
-    ImGui::Begin("##edge_tabs", nullptr, kFlags);
-    ImGui::PopStyleVar(2);
-
-    ImDrawList* dl = ImGui::GetWindowDrawList();
-    ImVec2      wp = ImGui::GetWindowPos();
-
-    // --- "Viewer" tab ---
-    ImGui::InvisibleButton("##etab_viewer", {STRIP_W, viewer_h});
-    bool v_hov = ImGui::IsItemHovered();
-    bool v_act = ImGui::IsItemActive();
-    if (ImGui::IsItemClicked()) {
-        int di = (s_last_panel_doc >= 0 && s_last_panel_doc < (int)g_documents.size())
-                 ? s_last_panel_doc : 0;
-        g_panel_open_to_refs = false;
-        g_input.open_panel(di, -1);
-    }
-    ImU32 v_bg = v_act  ? IM_COL32(70, 130, 225, 240)
-               : v_hov  ? IM_COL32(50, 108, 200, 220)
-               :          IM_COL32(35,  85, 165, 190);
-    dl->AddRectFilled({wp.x, wp.y}, {wp.x + STRIP_W, wp.y + viewer_h},
-                      v_bg, 5.0f, ImDrawFlags_RoundCornersLeft);
-    draw_text_ccw(dl, {wp.x + STRIP_W * 0.5f, wp.y + viewer_h * 0.5f},
-                  "Viewer", IM_COL32(210, 225, 255, 245));
-
-    // Gap between tabs
-    ImGui::Dummy({STRIP_W, TAB_GAP});
-
-    // --- "References" tab ---
-    float refs_y = wp.y + viewer_h + TAB_GAP;
-    ImGui::InvisibleButton("##etab_refs", {STRIP_W, refs_h});
-    bool r_hov = ImGui::IsItemHovered();
-    bool r_act = ImGui::IsItemActive();
-    if (ImGui::IsItemClicked()) {
-        int di = (s_last_panel_doc >= 0 && s_last_panel_doc < (int)g_documents.size())
-                 ? s_last_panel_doc : 0;
-        g_panel_open_to_refs = true;
-        g_input.open_panel(di, -1);
-    }
-    ImU32 r_bg = r_act  ? IM_COL32(70, 130, 225, 240)
-               : r_hov  ? IM_COL32(50, 108, 200, 220)
-               :          IM_COL32(35,  85, 165, 190);
-    dl->AddRectFilled({wp.x, refs_y}, {wp.x + STRIP_W, refs_y + refs_h},
-                      r_bg, 5.0f, ImDrawFlags_RoundCornersLeft);
-    draw_text_ccw(dl, {wp.x + STRIP_W * 0.5f, refs_y + refs_h * 0.5f},
-                  "References", IM_COL32(210, 225, 255, 245));
-
-    ImGui::End();
-}
 
 // --- Page tooltip -----------------------------------------------------------
 

@@ -236,12 +236,49 @@ behavior-preserving (build green + selftest PASSED after each pass), all still i
   input helper.
 - `draw_panel_ui()` — now **101 lines** (was 293): pure chrome (window, tab bar, page-nav, References
   tab dispatch to the already-carved `draw_references_tab`).
-**Step 6-rest carve → NEXT:** move the panel chrome into `side_panel.cpp` — `draw_panel_ui` +
-`draw_panel_resize_handle` + `draw_panel_edge_tabs` + `draw_panel_page` + panel statics
-(`s_panel_nav_page`, `s_last_panel_doc`, `g_panel_open_to_refs`, `s_panel_ann_active`, …). Decide where
-`panel_page_annotation_input` lives (annotation logic — could stay in main or go to canvas_annot.cpp);
-extend actions.h / expose the panel-nav + rasterization hooks it needs (`enqueue_rast`, `open_panel`,
-`panel_scroll_page`, …). Audit each remaining panel fn for its own coupling first.
+**Step 6-rest carve — DONE (2026-07-30):** carved the whole panel into `side_panel.cpp`
+(+ `side_panel.h`, 492 lines): `draw_panel_ui`, `draw_panel_page`, `panel_page_annotation_input`,
+`draw_panel_resize_handle`, `draw_panel_edge_tabs`, the `draw_text_ccw` helper (edge-tab-only), and the
+panel statics (`s_last_panel_doc`, `s_panel_open_to_refs` renamed from `g_`, plus `g_panel_nav_page` /
+`g_panel_ann_active` which are `extern` in side_panel.h because main touches them at the arrow-key nav +
+stroke-gating sites). `panel_page_annotation_input` went into side_panel.cpp (its annotation deps were
+all header-visible in `canvas_annot.h`). Search-hit rendering forced a small new **`search.h`** (the
+`SearchResult`/`SearchHighlight` structs + `g_search_results`/`g_highlighted_search_result`/
+`g_search_highlight` externs — shared with the Cmd+F search UI that stays in main). `enqueue_rast` was
+already in `rast_pipeline.h`. Non-contiguous carve (canvas-stroke fns interleaved the panel cluster →
+two blocks). Build green, selftest PASSED; no panel/search-only static lingers in main.
+
+- **Step 8 — `dialogs.cpp` — DONE (2026-07-30):** carved `draw_startup_chooser` + `draw_quit_dialog`
+  (146 lines) behind `dialogs.h`, which also holds the `QuitState` enum + the three shared control
+  flags (`g_startup_chooser`, `g_quit_requested`, `g_quit_state`) as externs — main raises them from
+  the window-close/signal + bare-launch paths and reads `g_quit_state==Confirmed` in the frame loop.
+  Deps were already header-visible (`load_project`/`save_project_current` in project_io.h, pickers +
+  `load_pdfs_*` in actions.h). **`draw_url_modal` deliberately stayed in main** — it's the front-end of
+  an async download subsystem (`g_dl_*`, worker thread, `cancel_download`, cleanup/main-loop sites), not
+  a self-contained dialog. Build green, selftest PASSED.
+
+Running total: **main.cpp 4,840 → 2,626 lines** (extracted: undo, groups, settings, toolbar,
+text_boxes, references_panel, side_panel, dialogs; headers actions/search/side_panel/dialogs/… added).
+
+- **`input_glue.cpp` — DONE (2026-07-30, at user request):** carved the GLFW input callbacks
+  (`glfw_error`, `mouse_button`, `cursor_pos`, `scroll`, `key`, `focus`, `drop`) into `input_glue.cpp`
+  (373 lines) behind `input_glue.h` — registered from `main()` via `glfwSet*Callback`. Moved their
+  private statics (`g_nav_focus`, `g_clip_box`, `g_doc_z_counter`; `g_clip_valid` is `extern` in
+  input_glue.h so `new_project` can clear it). `framebuffer_size_callback` **stayed in main** (calls
+  `glViewport` — GL-coupled, and it's a window/GL handler, not input glue). Exposed three main helpers
+  the callbacks call via `actions.h`: `zoom_to_fit`, `next_page_in_order`, `extract_page_text` (the last
+  is shared with a Copy-Page-Text menu that stays in main), plus `load_pdf`. Most of the callbacks' deps
+  were already header-visible from prior carves (canvas_annot/groups/text_boxes/references_panel/
+  side_panel/input/project_io/undo/dialogs). Build green; selftest PASSED. **Caveat: the headless
+  selftest does NOT exercise input — this carve warrants a manual smoke test (clicks, drags, keyboard
+  shortcuts, file drop).** The move was mechanical (identical code + externs), so behavior is preserved.
+
+### Phase 3 status — COMPLETE
+main.cpp **2,276** (from 4,840 at Phase-3 start — ~53% reduction). 9 TUs extracted: undo, groups,
+settings, toolbar, text_boxes, references_panel, side_panel, dialogs, input_glue. What remains in main
+is the irreducible app shell: platform/GL/GLFW init, the frame loop, `new_project`/`app_wants_animation`,
+`framebuffer_size_callback`, canvas-stroke fns, the drag-reconcile glue, `draw_locked_doc_labels`, and
+the search + URL-download subsystems. **Phase 3 DONE.**
 - **Step 7 — `toolbar.cpp`** — DONE (pulled forward, see above).
 - **Step 8 — `dialogs.cpp`** (optional, lowest value): `draw_url_modal`, `draw_startup_chooser`,
   `draw_quit_dialog`. Thin modals over `actions.h`. Defensible to leave in main as app-shell.

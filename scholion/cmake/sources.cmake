@@ -9,6 +9,9 @@ set(SCHOLION_SHARED_SOURCES
     toolbar.cpp
     text_boxes.cpp
     references_panel.cpp
+    side_panel.cpp
+    dialogs.cpp
+    input_glue.cpp
     rast_pipeline.cpp
     canvas_annot.cpp
     project_io.cpp

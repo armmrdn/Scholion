@@ -39,6 +39,16 @@ void PerformanceOverlay::draw(const Canvas& canvas) {
         ImGuiWindowFlags_NoInputs;  // click-through so it never eats canvas clicks
 
     if (ImGui::Begin("##perf_overlay", nullptr, flags)) {
+        // The status overlay is a fixed HUD element — keep it at its default size regardless of the
+        // "Larger UI" setting. Neutralize the global font scale (SetWindowFontScale cancels
+        // io.FontGlobalScale for this window) and the scaled item spacing, so the readout doesn't
+        // grow with the rest of the chrome. No-op when Larger UI is off (inv == 1).
+        ImGuiIO& io = ImGui::GetIO();
+        float inv = (io.FontGlobalScale > 0.0f) ? 1.0f / io.FontGlobalScale : 1.0f;
+        ImGui::SetWindowFontScale(inv);
+        ImVec2 sp = ImGui::GetStyle().ItemSpacing;
+        ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(sp.x * inv, sp.y * inv));
+
         // --- Performance health dot ---
         // When idle (event-driven, no work), show a neutral grey dot and "idle"
         // rather than a red dot / low FPS: the app is intentionally not redrawing,
@@ -61,6 +71,7 @@ void PerformanceOverlay::draw(const Canvas& canvas) {
 
         ImGui::Text("%d/%d pages", m_pages_shown, m_pages_total);
         ImGui::Text("Zoom: %.0f%%", canvas.get_zoom_percentage());
+        ImGui::PopStyleVar();   // ItemSpacing (pushed inside this window)
     }
     ImGui::End();
 

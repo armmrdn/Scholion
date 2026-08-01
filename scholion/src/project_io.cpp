@@ -91,46 +91,6 @@ static std::atomic<bool> g_autosave_running{false};
 
 bool autosave_running() { return g_autosave_running.load(); }
 
-// --- JSON string helpers -----------------------------------------------------
-
-static std::string json_escape(const char* s) {
-    std::string out;
-    for (; *s; ++s) {
-        if      (*s == '\\') out += "\\\\";
-        else if (*s == '"')  out += "\\\"";
-        else if (*s == '\n') out += "\\n";
-        else if (*s == '\r') out += "\\r";
-        else                 out += *s;
-    }
-    return out;
-}
-
-static bool extract_json_text(const char* line, char* out, int out_sz) {
-    const char* p = strstr(line, "\"text\": \"");
-    if (!p) return false;
-    p += 9;
-    int j = 0;
-    while (*p && j < out_sz - 1) {
-        if (*p == '\\' && *(p + 1)) {
-            ++p;
-            switch (*p) {
-                case 'n':  out[j++] = '\n'; break;
-                case 'r':  out[j++] = '\r'; break;
-                case '"':  out[j++] = '"';  break;
-                case '\\': out[j++] = '\\'; break;
-                default:   out[j++] = *p;   break;
-            }
-        } else if (*p == '"') {
-            break;
-        } else {
-            out[j++] = *p;
-        }
-        ++p;
-    }
-    out[j] = '\0';
-    return true;
-}
-
 // --- Recent files ------------------------------------------------------------
 
 static std::string recents_file_path() {
@@ -255,10 +215,15 @@ void apply_theme(bool dark) {
     ImGui::GetStyle().WindowBorderSize = 0.0f;
 }
 
-// Apply the theme AND the UI scale together. apply_theme resets all size fields to
-// defaults (via StyleColorsDark/Light), so ScaleAllSizes must run right after it to
-// avoid compounding across calls. Use this everywhere theme or scale changes.
+// Apply the theme AND the UI scale together. Use this everywhere theme or scale changes.
+//
+// ScaleAllSizes() *multiplies* the current style metrics, so it compounds if called on an
+// already-scaled style. StyleColorsDark/Light only reset colors — NOT the size fields — so they
+// do not undo a prior scale. Toggling "Larger UI" on/off therefore used to cascade the UI larger
+// each cycle. Fix: reset the ENTIRE style to ImGui defaults first, so every call scales from a
+// clean 1.0 baseline exactly once. apply_theme then re-establishes our colors + rounding.
 void apply_appearance() {
+    ImGui::GetStyle() = ImGuiStyle();   // clean default metrics + colors (no accumulated scale)
     apply_theme(g_settings.dark_mode);
     float s = g_settings.large_ui ? SCHOLION_UI_SCALE_LARGE : 1.0f;
     ImGui::GetIO().FontGlobalScale = s;
@@ -280,175 +245,134 @@ void update_window_title() {
 // --- Serialization -----------------------------------------------------------
 
 static std::string build_project_json() {
-    std::string out;
-    out.reserve(128 * 1024);
-    char b[512];
+    using picojson::value;
+    using picojson::object;
+    using picojson::array;
+    auto jd = [](double x){ return value(x); };          // number (double; %.17g round-trips)
+    auto ji = [](int64_t x){ return value(x); };         // integer (int64)
+    auto js = [](const std::string& s){ return value(s); };  // string (picojson escapes it)
+
+    object root;
+    root["format"] = ji(SCHOLION_FORMAT);
+    root["app"]    = js(SCHOLION_VERSION);
+    root["hash"]   = js("0000000000000000");             // 16-char placeholder; patched at the end
 
     Vec2 offset = g_canvas.get_offset();
-    out += "{\n";
-    // Header: schema version, writing-app provenance, and a placeholder integrity hash
-    // (filled in at the end, computed over the whole document body).
-    snprintf(b, sizeof(b), "  \"format\": %d,\n  \"app\": \"%s\",\n  \"hash\": \"0000000000000000\",\n",
-             SCHOLION_FORMAT, SCHOLION_VERSION);
-    out += b;
-    snprintf(b, sizeof(b), "  \"viewport\": { \"x\": %.4f, \"y\": %.4f, \"zoom\": %.6f },\n",
-             offset.x, offset.y, g_canvas.get_zoom());
-    out += b;
-    snprintf(b, sizeof(b), "  \"note_idx\": %d,\n", g_next_note_idx);
-    out += b;
+    object vp;
+    vp["x"] = jd(offset.x); vp["y"] = jd(offset.y); vp["zoom"] = jd(g_canvas.get_zoom());
+    root["viewport"] = value(vp);
 
-    out += "  \"documents\": [\n";
-    for (int di = 0; di < (int)g_documents.size(); ++di) {
-        const Document& doc = g_documents[di];
-        out += "    {\n";
-        out += "      \"path\": \""; out += doc.path; out += "\",\n";
-        // Portable link: path relative to the .scholion's folder (forward slashes). Loader
-        // tries this first so a moved/shared project keeps its PDFs; absolute "path" is the
-        // fallback. Empty project path → rel == absolute.
-        {
-            std::string rel = doc.path;
+    root["note_idx"] = ji(g_next_note_idx);
+
+    array docs;
+    for (const Document& doc : g_documents) {
+        object d;
+        d["path"] = js(doc.path);
+        // Portable link: path relative to the .scholion's folder (loader tries "rel" first, then
+        // absolute "path"). Empty project path -> rel == absolute.
+        std::string rel = doc.path;
+        if (!g_project_path.empty()) {
             std::error_code ec;
-            if (!g_project_path.empty()) {
-                auto r = std::filesystem::relative(
-                    doc.path, std::filesystem::path(g_project_path).parent_path(), ec);
-                if (!ec && !r.empty()) rel = r.generic_string();
-            }
-            out += "      \"rel\": \""; out += rel; out += "\",\n";
+            auto r = std::filesystem::relative(
+                doc.path, std::filesystem::path(g_project_path).parent_path(), ec);
+            if (!ec && !r.empty()) rel = r.generic_string();
         }
-        snprintf(b, sizeof(b), "      \"stack_origin\": [%.4f, %.4f],\n",
-                 doc.stack_origin.x, doc.stack_origin.y);
-        out += b;
-        out += "      \"pages\": [\n";
-        for (int pi = 0; pi < (int)doc.pages.size(); ++pi) {
-            const Page& page = doc.pages[pi];
-            snprintf(b, sizeof(b),
-                     "        { \"index\": %d, \"x\": %.4f, \"y\": %.4f, \"w\": %.2f, \"h\": %.2f, \"rot\": %d, \"grp\": %d, \"id\": %llu }%s\n",
-                     page.page_index, page.world_pos.x, page.world_pos.y,
-                     page.world_w, page.world_h, page.rotation, page.group_id,
-                     (unsigned long long)page.id,
-                     pi + 1 < (int)doc.pages.size() ? "," : "");
-            out += b;
+        d["rel"] = js(rel);
+        array so; so.push_back(jd(doc.stack_origin.x)); so.push_back(jd(doc.stack_origin.y));
+        d["stack_origin"] = value(so);
+        array pages;
+        for (const Page& page : doc.pages) {
+            object pg;
+            pg["index"] = ji(page.page_index);
+            pg["x"] = jd(page.world_pos.x); pg["y"] = jd(page.world_pos.y);
+            pg["w"] = jd(page.world_w);     pg["h"] = jd(page.world_h);
+            pg["rot"] = ji(page.rotation);
+            pg["grp"] = ji(page.group_id);
+            pg["id"]  = ji((int64_t)page.id);
+            pages.push_back(value(pg));
         }
-        out += "      ]\n";
-        snprintf(b, sizeof(b), "    }%s\n", di + 1 < (int)g_documents.size() ? "," : "");
-        out += b;
+        d["pages"] = value(pages);
+        docs.push_back(value(d));
     }
-    out += "  ],\n";
+    root["documents"] = value(docs);
 
-    out += "  \"text_boxes\": [\n";
-    for (int i = 0; i < (int)g_text_boxes.size(); ++i) {
-        const auto& box = g_text_boxes[i];
-        snprintf(b, sizeof(b),
-                 "    { \"id\": %d, \"x\": %.4f, \"y\": %.4f, \"r\": %.3f, \"g\": %.3f, \"b\": %.3f, \"fs\": %.1f, \"w\": %.2f, \"h\": %.2f, \"zs\": %d, \"text\": \"",
-                 box.id, box.world_pos.x, box.world_pos.y, box.r, box.g, box.b, box.font_size,
-                 box.w, box.h, box.zoom_scaled ? 1 : 0);
-        out += b;
-        out += json_escape(box.text);
-        snprintf(b, sizeof(b), "\" }%s\n", i + 1 < (int)g_text_boxes.size() ? "," : "");
-        out += b;
+    array tboxes;
+    for (const auto& box : g_text_boxes) {
+        object t;
+        t["id"] = ji(box.id);
+        t["x"] = jd(box.world_pos.x); t["y"] = jd(box.world_pos.y);
+        t["r"] = jd(box.r); t["g"] = jd(box.g); t["b"] = jd(box.b);
+        t["fs"] = jd(box.font_size);
+        t["w"] = jd(box.w); t["h"] = jd(box.h);
+        t["zs"] = ji(box.zoom_scaled ? 1 : 0);
+        t["text"] = js(box.text);
+        tboxes.push_back(value(t));
     }
-    out += "  ],\n";
+    root["text_boxes"] = value(tboxes);
 
-    out += "  \"annots\": [\n";
-    bool first_annot = true;
-    auto sep = [&]{ if (!first_annot) out += ",\n"; first_annot = false; };
-
+    // Annotations: a heterogeneous array. Highlights / notes are single objects; a stroke is a
+    // header object followed by one { "p": [x,y] } object per point (matching the loader, which
+    // consumes trailing point objects into the preceding stroke). doc=-1 => canvas (world) stroke.
+    array annots;
+    auto push_stroke = [&](int di, int pi, const AnnotStroke& stroke) {
+        object s;
+        s["doc"] = ji(di); s["page"] = ji(pi);
+        s["sr"] = jd(stroke.r); s["sg"] = jd(stroke.g); s["sb"] = jd(stroke.b);
+        s["sw"] = jd(stroke.width); s["sa"] = jd(stroke.alpha);
+        annots.push_back(value(s));
+        for (const auto& pt : stroke.pts) {
+            object pp; array pa; pa.push_back(jd(pt.x)); pa.push_back(jd(pt.y));
+            pp["p"] = value(pa);
+            annots.push_back(value(pp));
+        }
+    };
     for (int di = 0; di < (int)g_documents.size(); ++di) {
         for (int pi = 0; pi < (int)g_documents[di].pages.size(); ++pi) {
             const PageAnnotations& an = g_documents[di].pages[pi].annots;
             for (const auto& hl : an.highlights) {
-                sep();
-                if (hl.text.empty()) {
-                    snprintf(b, sizeof(b),
-                             "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f] }",
-                             di, pi, hl.x0, hl.y0, hl.x1, hl.y1);
-                    out += b;
-                } else {
-                    snprintf(b, sizeof(b),
-                             "    { \"doc\": %d, \"page\": %d, \"hl\": [%.6f, %.6f, %.6f, %.6f], \"ht\": \"",
-                             di, pi, hl.x0, hl.y0, hl.x1, hl.y1);
-                    out += b;
-                    out += json_escape(hl.text.c_str());
-                    out += "\"";
-                    if (!hl.note.empty()) {   // "rn" = research note attached to this reference
-                        out += ", \"rn\": \"";
-                        out += json_escape(hl.note.c_str());
-                        out += "\"";
-                    }
-                    out += " }";
-                }
+                object h;
+                h["doc"] = ji(di); h["page"] = ji(pi);
+                array hr;
+                hr.push_back(jd(hl.x0)); hr.push_back(jd(hl.y0));
+                hr.push_back(jd(hl.x1)); hr.push_back(jd(hl.y1));
+                h["hl"] = value(hr);
+                if (!hl.text.empty()) h["ht"] = js(hl.text);   // captured quote
+                if (!hl.note.empty()) h["rn"] = js(hl.note);   // attached research note
+                annots.push_back(value(h));
             }
             for (const auto& note : an.notes) {
-                sep();
-                snprintf(b, sizeof(b),
-                         "    { \"doc\": %d, \"page\": %d, \"note\": \"%s\" }",
-                         di, pi, note.label.c_str());
-                out += b;
+                object n; n["doc"] = ji(di); n["page"] = ji(pi); n["note"] = js(note.label);
+                annots.push_back(value(n));
             }
-            for (const auto& stroke : an.strokes) {
-                sep();
-                snprintf(b, sizeof(b),
-                         "    { \"doc\": %d, \"page\": %d, \"sr\": %.5f, \"sg\": %.5f, \"sb\": %.5f, \"sw\": %.3f, \"sa\": %.4f }",
-                         di, pi, stroke.r, stroke.g, stroke.b, stroke.width, stroke.alpha);
-                out += b;
-                for (const auto& pt : stroke.pts) {
-                    snprintf(b, sizeof(b), ",\n    { \"p\": [%.6f, %.6f] }", pt.x, pt.y);
-                    out += b;
-                }
-            }
+            for (const auto& stroke : an.strokes) push_stroke(di, pi, stroke);
         }
     }
-    // Canvas (world-space) pen strokes: stored in the annots array with doc=-1 as the
-    // sentinel (points are world coords, not page-normalized).
-    for (const auto& stroke : g_canvas_strokes) {
-        sep();
-        snprintf(b, sizeof(b),
-                 "    { \"doc\": -1, \"page\": -1, \"sr\": %.5f, \"sg\": %.5f, \"sb\": %.5f, \"sw\": %.3f, \"sa\": %.4f }",
-                 stroke.r, stroke.g, stroke.b, stroke.width, stroke.alpha);
-        out += b;
-        for (const auto& pt : stroke.pts) {
-            snprintf(b, sizeof(b), ",\n    { \"p\": [%.3f, %.3f] }", pt.x, pt.y);
-            out += b;
-        }
-    }
-    if (!first_annot) out += "\n";
-    out += "  ],\n";
-    // Reference notes now live on each highlight ("rn" field above) — no separate section.
-    // Pre-v1.4 files still carry a "ref_notes" array, which the loader migrates onto the
-    // matching highlights.
+    for (const auto& stroke : g_canvas_strokes) push_stroke(-1, -1, stroke);
+    root["annots"] = value(annots);
 
-    // Page groups (ad-hoc cross-document clusters). Only groups with live members
-    // are written — an empty group carries no information.
-    out += "  \"groups\": [\n";
-    {
-        std::vector<const PageGroup*> live;
-        for (const auto& grp : g_groups) {
-            bool has = false;
-            for (const auto& doc : g_documents) {
-                for (const auto& pg : doc.pages) if (pg.group_id == grp.id) { has = true; break; }
-                if (has) break;
-            }
-            if (has) live.push_back(&grp);
+    // Page groups (ad-hoc cross-document clusters) — only groups with live members are written.
+    array groups;
+    for (const auto& grp : g_groups) {
+        bool has = false;
+        for (const auto& doc : g_documents) {
+            for (const auto& pg : doc.pages) if (pg.group_id == grp.id) { has = true; break; }
+            if (has) break;
         }
-        for (size_t i = 0; i < live.size(); ++i) {
-            const PageGroup* grp = live[i];
-            snprintf(b, sizeof(b),
-                     "    { \"group\": %d, \"r\": %.3f, \"g\": %.3f, \"b\": %.3f, \"name\": \"",
-                     grp->id, grp->col_r, grp->col_g, grp->col_b);
-            out += b;
-            out += json_escape(grp->name.c_str());
-            snprintf(b, sizeof(b), "\" }%s\n", i + 1 < live.size() ? "," : "");
-            out += b;
-        }
+        if (!has) continue;
+        object g;
+        g["group"] = ji(grp.id);
+        g["r"] = jd(grp.col_r); g["g"] = jd(grp.col_g); g["b"] = jd(grp.col_b);
+        g["name"] = js(grp.name);
+        groups.push_back(value(g));
     }
-    out += "  ]\n}\n";
-    // Integrity hash: FNV-1a over the whole document (with the placeholder still in place),
-    // then patch the placeholder. The loader blanks the field back to zeros and recomputes.
-    {
-        uint64_t h = fnv1a64(out.data(), out.size());
-        size_t hp = out.find("\"hash\": \"");
-        if (hp != std::string::npos) out.replace(hp + 9, 16, hex64(h));
-    }
+    root["groups"] = value(groups);
+
+    std::string out = value(root).serialize(true);
+    // Integrity hash: FNV-1a over the whole document (with the placeholder still in place), then
+    // patch the 16-char placeholder. The loader blanks it back to zeros and recomputes to verify.
+    uint64_t h = fnv1a64(out.data(), out.size());
+    size_t hp = out.find("\"hash\": \"");
+    if (hp != std::string::npos) out.replace(hp + 9, 16, hex64(h));
     return out;
 }
 
