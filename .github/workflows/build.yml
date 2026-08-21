@@ -4,6 +4,16 @@ on:
   push:
     branches: [main, develop]
     tags:     ['v*']
+  # Manual run from any branch — the way to get test binaries without pushing to a
+  # CI branch, cutting a tag, or publishing a release. Artifacts are attached to the
+  # run itself (private to repo members) and expire automatically.
+  workflow_dispatch:
+
+# Only one run per ref at a time; a newer push cancels a superseded run to save minutes.
+# Tag builds are never cancelled — a half-finished release would leave a broken draft.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/v') }}
 
 jobs:
 
@@ -129,6 +139,14 @@ jobs:
             -ov -o scholion/build/Scholion.dmg
           rm -f scholion/build/Scholion.rw.dmg
 
+      - name: Upload test binary (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scholion-macOS-${{ github.sha }}
+          path: scholion/build/Scholion.dmg
+          retention-days: 7
+
       - name: Create draft release with DMG
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -242,6 +260,14 @@ jobs:
       - name: Zip bundle
         run: zip -r Scholion-Linux.zip Scholion-Linux/
 
+      - name: Upload test binary (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scholion-Linux-${{ github.sha }}
+          path: Scholion-Linux.zip
+          retention-days: 7
+
       - name: Upload Linux zip to draft release
         if: startsWith(github.ref, 'refs/tags/v')
         env:
@@ -335,6 +361,14 @@ jobs:
       - name: Zip bundle
         shell: pwsh
         run: Compress-Archive -Path Scholion-Windows\* -DestinationPath Scholion-Windows.zip
+
+      - name: Upload test binary (manual runs only)
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Scholion-Windows-${{ github.sha }}
+          path: Scholion-Windows.zip
+          retention-days: 7
 
       - name: Upload Windows zip to draft release
         if: startsWith(github.ref, 'refs/tags/v')
