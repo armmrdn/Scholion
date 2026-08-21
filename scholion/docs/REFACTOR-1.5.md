@@ -343,3 +343,9 @@ user wins (e.g. persist `doc.hue`, an icon-DPI refresh) so 1.5 has a headline. D
 3. **Any user-facing wins** to fold into 1.5, or ship as a pure stability release?
 4. **Licensing (Tier 1a)** — not needed to start 1.5, but it unblocks Phase 4; worth deciding in
    parallel.
+
+### Post-Phase-3 cleanup (2026-08-21)
+- **`prefs.cpp`** — split app-level per-user state out of `project_io.cpp`: preferences, the
+  recent-projects list, and `apply_theme`/`apply_appearance`. Deduped the two near-identical
+  platform config-path functions into one helper. `project_io.cpp` 993 → 853; settings.cpp and
+  side_panel.cpp no longer include `project_io.h` at all. Build green, selftest exit 0.

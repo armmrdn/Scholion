@@ -8,6 +8,7 @@
 #include "canvas_text_box.h"
 #include "input.h"
 #include "project_io.h"
+#include "prefs.h"
 #include "rast_pipeline.h"
 #include "renderer.h"
 #include "overlay.h"

@@ -6,7 +6,6 @@
 
 // Globals owned by project_io.cpp
 extern std::string              g_project_path;
-extern std::vector<std::string> g_recents;
 extern std::chrono::steady_clock::time_point g_last_save_time;
 
 // Save-durability / status state (batch #3)
@@ -33,15 +32,8 @@ void load_project();
 void load_project_from_path(const std::string& path);
 
 // Preferences
-void save_prefs();
-void load_prefs();
 
 // Headless save/load round-trip self-test (src/selftest.cpp). Returns 0 = pass, 1 = fail.
 int run_selftest();
-void apply_theme(bool dark);
-void apply_appearance();   // theme + UI scale together
 
 // Recent files
-void add_to_recents(const std::string& path);
-void save_recents();
-void load_recents();

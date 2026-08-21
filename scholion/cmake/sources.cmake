@@ -15,6 +15,7 @@ set(SCHOLION_SHARED_SOURCES
     rast_pipeline.cpp
     canvas_annot.cpp
     project_io.cpp
+    prefs.cpp
     canvas.cpp
     input.cpp
     renderer.cpp

@@ -1,6 +1,6 @@
 #include "settings.h"
 #include "app_state.h"     // g_settings, g_settings_open, g_logo_tex
-#include "project_io.h"    // save_prefs, apply_appearance
+#include "prefs.h"    // save_prefs, apply_appearance
 #include "version.h"       // SCHOLION_VERSION
 #include "imgui.h"
 #include <algorithm>       // std::max

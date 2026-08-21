@@ -8,6 +8,7 @@
 #include "version.h"
 #include "canvas_annot.h"
 #include "save_feedback.h"
+#include "prefs.h"
 
 #ifdef __APPLE__
 #define GL_SILENCE_DEPRECATION
@@ -37,11 +38,13 @@ extern "C" const char* scholion_select_folder(const char* title);
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <unordered_set>
@@ -64,7 +67,6 @@ void clear_documents();
 
 std::string              g_project_path;
 std::chrono::steady_clock::time_point g_last_save_time;
-std::vector<std::string> g_recents;
 
 bool        g_load_ok        = true;
 bool        g_dirty          = false;
@@ -86,149 +88,9 @@ static std::string hex64(uint64_t h) {
     return std::string(buf, 16);
 }
 
-static constexpr int RECENTS_MAX = 10;
 static std::atomic<bool> g_autosave_running{false};
 
 bool autosave_running() { return g_autosave_running.load(); }
-
-// --- Recent files ------------------------------------------------------------
-
-static std::string recents_file_path() {
-#ifdef _WIN32
-    PWSTR wpath = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &wpath))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, nullptr, 0, nullptr, nullptr);
-        std::string appdata(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &appdata[0], len, nullptr, nullptr);
-        CoTaskMemFree(wpath);
-        std::string dir = appdata + "\\Scholion";
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        return dir + "\\recents";
-    }
-    return "";
-#else
-    const char* home = std::getenv("HOME");
-    return home ? std::string(home) + "/.scholion_recents" : "";
-#endif
-}
-
-void save_recents() {
-    std::string p = recents_file_path();
-    if (p.empty()) return;
-    FILE* f = fopen(p.c_str(), "w");
-    if (!f) return;
-    for (const auto& r : g_recents) fprintf(f, "%s\n", r.c_str());
-    fclose(f);
-}
-
-void load_recents() {
-    std::string p = recents_file_path();
-    if (p.empty()) return;
-    FILE* f = fopen(p.c_str(), "r");
-    if (!f) return;
-    char line[4096];
-    while (fgets(line, sizeof(line), f)) {
-        std::string s(line);
-        while (!s.empty() && (s.back() == '\n' || s.back() == '\r')) s.pop_back();
-        if (!s.empty()) g_recents.push_back(s);
-    }
-    fclose(f);
-}
-
-void add_to_recents(const std::string& path) {
-    g_recents.erase(std::remove(g_recents.begin(), g_recents.end(), path), g_recents.end());
-    g_recents.insert(g_recents.begin(), path);
-    if ((int)g_recents.size() > RECENTS_MAX) g_recents.resize(RECENTS_MAX);
-    save_recents();
-}
-
-// --- Application preferences -------------------------------------------------
-
-static std::string prefs_file_path() {
-#ifdef _WIN32
-    PWSTR wpath = nullptr;
-    if (SUCCEEDED(SHGetKnownFolderPath(FOLDERID_RoamingAppData, 0, nullptr, &wpath))) {
-        int len = WideCharToMultiByte(CP_UTF8, 0, wpath, -1, nullptr, 0, nullptr, nullptr);
-        std::string appdata(len - 1, '\0');
-        WideCharToMultiByte(CP_UTF8, 0, wpath, -1, &appdata[0], len, nullptr, nullptr);
-        CoTaskMemFree(wpath);
-        std::string dir = appdata + "\\Scholion";
-        std::error_code ec;
-        std::filesystem::create_directories(dir, ec);
-        return dir + "\\prefs";
-    }
-    return "";
-#else
-    const char* home = std::getenv("HOME");
-    return home ? std::string(home) + "/.scholion_prefs" : "";
-#endif
-}
-
-void save_prefs() {
-    std::string p = prefs_file_path();
-    if (p.empty()) return;
-    FILE* f = fopen(p.c_str(), "w");
-    if (!f) return;
-    fprintf(f, "dark_mode=%d\n",   g_settings.dark_mode   ? 1 : 0);
-    fprintf(f, "grid_mode=%d\n",   (int)g_settings.grid_mode);
-    fprintf(f, "compat_mode=%d\n", g_settings.compat_mode ? 1 : 0);
-    fprintf(f, "vignette_on=%d\n", g_settings.vignette_on ? 1 : 0);
-    fprintf(f, "panel_w=%.1f\n",   g_settings.panel_w);
-    fprintf(f, "large_ui=%d\n",    g_settings.large_ui   ? 1 : 0);
-    fclose(f);
-}
-
-void load_prefs() {
-    std::string p = prefs_file_path();
-    if (p.empty()) return;
-    FILE* f = fopen(p.c_str(), "r");
-    if (!f) return;
-    char key[64];
-    float fval;
-    while (fscanf(f, " %63[^=]=%f", key, &fval) == 2) {
-        int ival = (int)fval;
-        if      (!strcmp(key, "dark_mode"))   g_settings.dark_mode   = ival;
-        else if (!strcmp(key, "grid_mode"))   g_settings.grid_mode   = (GridMode)ival;
-        else if (!strcmp(key, "compat_mode")) g_settings.compat_mode = ival;
-        else if (!strcmp(key, "vignette_on")) g_settings.vignette_on = ival;
-        else if (!strcmp(key, "panel_w"))     g_settings.panel_w     = fval;
-        else if (!strcmp(key, "large_ui"))    g_settings.large_ui    = ival;
-    }
-    fclose(f);
-}
-
-// Larger-UI scale factor. Applied to fonts (io.FontGlobalScale) and widget metrics
-// (ImGuiStyle::ScaleAllSizes). 1.0 = normal.
-static constexpr float SCHOLION_UI_SCALE_LARGE = 1.4f;
-
-void apply_theme(bool dark) {
-    if (dark) {
-        ImGui::StyleColorsDark();
-    } else {
-        ImGui::StyleColorsLight();
-        ImGui::GetStyle().Colors[ImGuiCol_WindowBg] = ImVec4(0.94f, 0.93f, 0.91f, 0.96f);
-    }
-    ImGui::GetStyle().WindowRounding   = 6.0f;
-    ImGui::GetStyle().PopupRounding    = 5.0f;
-    ImGui::GetStyle().FrameRounding    = 4.0f;
-    ImGui::GetStyle().WindowBorderSize = 0.0f;
-}
-
-// Apply the theme AND the UI scale together. Use this everywhere theme or scale changes.
-//
-// ScaleAllSizes() *multiplies* the current style metrics, so it compounds if called on an
-// already-scaled style. StyleColorsDark/Light only reset colors — NOT the size fields — so they
-// do not undo a prior scale. Toggling "Larger UI" on/off therefore used to cascade the UI larger
-// each cycle. Fix: reset the ENTIRE style to ImGui defaults first, so every call scales from a
-// clean 1.0 baseline exactly once. apply_theme then re-establishes our colors + rounding.
-void apply_appearance() {
-    ImGui::GetStyle() = ImGuiStyle();   // clean default metrics + colors (no accumulated scale)
-    apply_theme(g_settings.dark_mode);
-    float s = g_settings.large_ui ? SCHOLION_UI_SCALE_LARGE : 1.0f;
-    ImGui::GetIO().FontGlobalScale = s;
-    if (s != 1.0f) ImGui::GetStyle().ScaleAllSizes(s);
-}
 
 // --- Window title ------------------------------------------------------------
 
@@ -248,7 +110,11 @@ static std::string build_project_json() {
     using picojson::value;
     using picojson::object;
     using picojson::array;
-    auto jd = [](double x){ return value(x); };          // number (double; %.17g round-trips)
+    // picojson::value(double) THROWS std::overflow_error on NaN/Inf, and nothing in this file
+    // catches it — a single non-finite coordinate would abort the app mid-save, including on
+    // autosave (so it would keep aborting, losing the session). Clamp instead: a corrupted
+    // in-memory value degrades to a recoverable file rather than taking the app down.
+    auto jd = [](double x){ return value(std::isfinite(x) ? x : 0.0); };  // number (%.17g round-trips)
     auto ji = [](int64_t x){ return value(x); };         // integer (int64)
     auto js = [](const std::string& s){ return value(s); };  // string (picojson escapes it)
 
@@ -601,10 +467,29 @@ void load_project_from_path(const std::string& path) {
     bool note_idx_loaded = false;
     picojson::value root_v;
     {
-        std::string perr = picojson::parse(root_v, content);
+        // picojson builds every number through value(double), which THROWS std::overflow_error on
+        // Inf/NaN — reachable from any file containing e.g. "1e999" (strtod overflows to inf). That
+        // throw escapes the error-string API entirely, so without this catch, opening a corrupt or
+        // hand-edited project would abort the app instead of reporting a bad file. Treat it as a
+        // parse failure: clear_documents() below is inside the success branch, so the currently
+        // open project survives untouched.
+        std::string perr;
+        try {
+            perr = picojson::parse(root_v, content);
+        } catch (const std::exception& e) {
+            const char* w = e.what();
+            perr   = (w && *w) ? w : "non-finite number (Inf/NaN) in file";
+            root_v = picojson::value();   // null -> the load block below is skipped
+        }
         if (!perr.empty() || !root_v.is<picojson::object>()) {
             g_load_ok = false;
             fprintf(stderr, "load: JSON parse error: %s\n", perr.empty() ? "root is not an object" : perr.c_str());
+            // Bail out BEFORE the clear/apply phase below. clear_documents() sits outside the
+            // parse-success branch, so falling through here would wipe the user's currently-open
+            // project and replace it with the nothing we just failed to parse. g_project_path is
+            // not updated until the very end of this function, so returning now leaves the open
+            // project — and its save path — exactly as they were.
+            return;
         }
     }
     if (root_v.is<picojson::object>()) {
@@ -843,13 +728,30 @@ void load_project_from_path(const std::string& path) {
         }
     }
 
-    // Normalize page ids: assign a fresh id to any page still unassigned (legacy files),
-    // and advance the counter past every id so future imports can't collide.
-    for (auto& doc : g_documents)
-        for (auto& pg : doc.pages) {
-            if (pg.id == 0) pg.id = g_next_page_id++;
-            if (pg.id >= g_next_page_id) g_next_page_id = pg.id + 1;
-        }
+    // Normalize page ids + geometry. Every page must end up with a UNIQUE non-zero id: pages with
+    // no saved id (legacy files) AND pages whose saved id collides with one already taken get a
+    // fresh one. Uniqueness matters because page_by_id() returns the FIRST match — a duplicate id
+    // would silently aim undo records, selection, and the renderer at the wrong page.
+    // Geometry is clamped in the same pass: a hand-edited or corrupted file can carry Inf/NaN
+    // coords (JSON "1e999" parses to inf), which would otherwise poison every bounds/zoom-to-fit
+    // computation downstream and make pages unreachable on the canvas.
+    {
+        std::unordered_set<uint64_t> seen_ids;
+        for (auto& doc : g_documents)
+            for (auto& pg : doc.pages) {
+                if (pg.id == 0 || seen_ids.count(pg.id)) {
+                    while (seen_ids.count(g_next_page_id)) ++g_next_page_id;   // skip taken ids
+                    pg.id = g_next_page_id++;
+                }
+                seen_ids.insert(pg.id);
+                if (pg.id >= g_next_page_id) g_next_page_id = pg.id + 1;
+
+                if (!std::isfinite(pg.world_pos.x) || !std::isfinite(pg.world_pos.y))
+                    pg.world_pos = {0.0f, 0.0f};
+                if (!std::isfinite(pg.world_w) || pg.world_w <= 0.0f) pg.world_w = PLACEHOLDER_PAGE_W;
+                if (!std::isfinite(pg.world_h) || pg.world_h <= 0.0f) pg.world_h = PLACEHOLDER_PAGE_H;
+            }
+    }
 
     // Rebuild the group table. Only keep groups that at least one loaded page
     // references, so a group whose pages all went missing doesn't linger.

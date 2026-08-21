@@ -5,7 +5,7 @@
 #include "references_panel.h" // draw_references_tab
 #include "search.h"           // SearchResult/SearchHighlight + g_search_*
 #include "undo.h"
-#include "project_io.h"       // save_prefs
+#include "prefs.h"       // save_prefs
 #include "imgui.h"
 #include <algorithm>
 #include <string>

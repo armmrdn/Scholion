@@ -168,6 +168,85 @@ static void test_undo() {
     g_input.set_documents(nullptr);
 }
 
+// --- Malformed / corrupt project-file hardening ------------------------------
+// Guards the failure modes a hand-edited, truncated, or corrupted .scholion can trigger:
+//   1. Duplicate page ids — page_by_id() returns the FIRST match, so a duplicate would silently
+//      aim undo records, selection, and the renderer at the wrong page. Load must make ids unique.
+//   2. Non-finite numbers — picojson's value(double) THROWS std::overflow_error on Inf/NaN, both
+//      when PARSING a file containing one (e.g. "1e999" overflows via strtod) and when
+//      SERIALIZING one out of memory. Neither may abort the app.
+//   3. A failed parse must not destroy the currently-open project.
+static void test_project_validation() {
+    printf("Scholion self-test — malformed project-file hardening\n");
+    namespace fs = std::filesystem;
+
+    auto write_tmp = [](const char* name, const std::string& json) {
+        std::string p = (fs::temp_directory_path() / name).string();
+        FILE* f = fopen(p.c_str(), "w");
+        if (f) { fwrite(json.data(), 1, json.size(), f); fclose(f); }
+        return p;
+    };
+
+    // ----- Duplicate page ids must be reassigned to unique ones -----
+    {
+        std::string json =
+            "{\n  \"format\": 1,\n"
+            "  \"viewport\": { \"x\": 0.0, \"y\": 0.0, \"zoom\": 0.6 },\n"
+            "  \"documents\": [\n"
+            "    { \"path\": \"/nonexistent/scholion_selftest_dup.pdf\", \"stack_origin\": [0.0, 0.0],\n"
+            "      \"pages\": [\n"
+            "        { \"index\": 0, \"x\": 0.0,  \"y\": 0.0, \"w\": 100.0, \"h\": 100.0, \"rot\": 0, \"grp\": 0, \"id\": 42 },\n"
+            "        { \"index\": 1, \"x\": 10.0, \"y\": 0.0, \"w\": 100.0, \"h\": 100.0, \"rot\": 0, \"grp\": 0, \"id\": 42 }\n"
+            "      ] }\n"
+            "  ],\n  \"text_boxes\": [\n  ],\n  \"annots\": [\n  ],\n  \"groups\": [\n  ]\n}\n";
+        std::string tmp = write_tmp("scholion_selftest_dupid.scholion", json);
+        load_project_from_path(tmp);
+        if (g_documents.size() == 1 && g_documents[0].pages.size() == 2) {
+            uint64_t a = g_documents[0].pages[0].id, b = g_documents[0].pages[1].id;
+            CHECK(a != b, "duplicate page ids not made unique (both %llu)", (unsigned long long)a);
+            CHECK(a != 0 && b != 0, "page id left as 0 after load");
+        } else {
+            CHECK(false, "dup-id: unexpected structure after load (%zu docs)", g_documents.size());
+        }
+        fs::remove(tmp);
+    }
+
+    // ----- A file containing Inf must be rejected, not abort — and must not wipe the open project -----
+    {
+        std::string json =
+            "{\n  \"format\": 1,\n"
+            "  \"viewport\": { \"x\": 0.0, \"y\": 0.0, \"zoom\": 0.6 },\n"
+            "  \"documents\": [\n"
+            "    { \"path\": \"/nonexistent/scholion_selftest_inf.pdf\", \"stack_origin\": [0.0, 0.0],\n"
+            "      \"pages\": [ { \"index\": 0, \"x\": 1e999, \"y\": 0.0, \"w\": 100.0, \"h\": 100.0, \"rot\": 0, \"grp\": 0 } ] }\n"
+            "  ],\n  \"text_boxes\": [\n  ],\n  \"annots\": [\n  ],\n  \"groups\": [\n  ]\n}\n";
+        std::string tmp = write_tmp("scholion_selftest_inf.scholion", json);
+        size_t docs_before = g_documents.size();
+        load_project_from_path(tmp);   // must not throw/abort
+        CHECK(g_documents.size() == docs_before,
+              "failed parse wiped the open project (%zu docs, expected %zu)",
+              g_documents.size(), docs_before);
+        fs::remove(tmp);
+    }
+
+    // ----- A non-finite value in memory must not abort the save -----
+    if (!g_documents.empty() && !g_documents[0].pages.empty()) {
+        g_documents[0].pages[0].world_pos.x = INFINITY;
+        g_documents[0].pages[0].world_pos.y = NAN;
+        std::string tmp = (fs::temp_directory_path() / "scholion_selftest_nonfinite.scholion").string();
+        CHECK(save_to_path(tmp), "save with non-finite coords failed");   // must not throw
+        load_project_from_path(tmp);
+        if (!g_documents.empty() && !g_documents[0].pages.empty()) {
+            const Page& p = g_documents[0].pages[0];
+            CHECK(std::isfinite(p.world_pos.x) && std::isfinite(p.world_pos.y),
+                  "non-finite coords survived the save/load clamp");
+            CHECK(std::isfinite(p.world_w) && p.world_w > 0.0f &&
+                  std::isfinite(p.world_h) && p.world_h > 0.0f, "page size not sane after load");
+        }
+        fs::remove(tmp);
+    }
+}
+
 int run_selftest() {
     printf("Scholion self-test — save/load round-trip\n");
     namespace fs = std::filesystem;
@@ -337,6 +416,9 @@ int run_selftest() {
         }
         fs::remove(tmp3);
     }
+
+    // ----- Malformed / corrupt project-file hardening -----
+    test_project_validation();
 
     // ----- Undo of data-model operations -----
     test_undo();
