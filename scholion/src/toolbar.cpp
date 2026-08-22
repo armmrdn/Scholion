@@ -5,6 +5,7 @@
 #include "actions.h"         // scholion_* pickers, load_pdfs_*, draw_url_modal
 #include "project_io.h"      // before_file_dialog / after_file_dialog
 #include "imgui.h"
+#include "tinyfiledialogs.h"   // non-Apple file pickers (tinyfd_*)
 
 // --- Toolbar UI -------------------------------------------------------------
 

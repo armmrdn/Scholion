@@ -12,9 +12,14 @@
 #include "dialogs.h"
 #include "imgui.h"
 #include <GLFW/glfw3.h>
-#include <string>
-#include <filesystem>
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 // ===== Module state (g_clip_valid is extern in input_glue.h; new_project clears it) =====
 static Page*         g_nav_focus  = nullptr; // focused page for arrow navigation (panel closed)

@@ -5,7 +5,7 @@
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
-#include <windows.h>
+#include <windows.h>   // must precede shlobj.h
 #include <shlobj.h>
 #endif
 
@@ -15,6 +15,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <system_error>
 #include <vector>
 
 std::vector<std::string> g_recents;

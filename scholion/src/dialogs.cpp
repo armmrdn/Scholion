@@ -4,6 +4,7 @@
 #include "project_io.h"     // before/after_file_dialog, load_project, save_project_current
 #include "version.h"        // SCHOLION_VERSION
 #include "imgui.h"
+#include "tinyfiledialogs.h"   // non-Apple file pickers (tinyfd_*)
 #include <algorithm>
 
 // ===== Shared control flags (extern in dialogs.h; main raises/reads them) =====

@@ -8,8 +8,9 @@
 #include "prefs.h"       // save_prefs
 #include "imgui.h"
 #include <algorithm>
-#include <string>
+#include <cstdint>
 #include <filesystem>
+#include <string>
 
 // ===== Panel state (g_* pair is extern in side_panel.h; main touches them) =====
 int  g_panel_nav_page    = 0;      // current page index in open panel (0-based)

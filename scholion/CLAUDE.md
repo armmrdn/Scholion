@@ -22,8 +22,10 @@ pages max on canvas simultaneously). Solo-use, local-first, project-file based.
 ```
 ~/Desktop/Scholion/
   ├── scholion/              — macOS build + all shared cross-platform source
-  │   ├── include/           — public headers
-  │   ├── src/               — implementation files (main.cpp, renderer.cpp, …)
+  │   ├── include/           — public headers (one per module, + shared state//data headers)
+  │   ├── src/               — implementation files (see "Source Layout" below)
+  │   ├── cmake/sources.cmake — THE shared source list; add a new .cpp here ONCE
+  │   ├── docs/              — REFACTOR-1.5.md, SMOKE-TEST.md, TODO.md
   │   ├── resources/         — AppIcon.icns, Info.plist
   │   ├── third_party/       — imgui, mupdf, tinyfiledialogs
   │   ├── scripts/           — make_icon.py
@@ -37,6 +39,46 @@ pages max on canvas simultaneously). Solo-use, local-first, project-file based.
 1. **Canvas Engine** — pan/zoom/culling, GPU texture management, input handling
 2. **Document Model** — stacks, loose pages, positions, parent relationships, annotations
 3. **Renderers** — PDF rasterizer, annotation overlay, threads (node-editor Bezier wires)
+
+## Source Layout (post-1.5)
+
+`main.cpp` used to be a ~4,900-line monolith. The 1.5 refactor carved it into focused translation
+units (it is now ~2,280 lines: platform/GL/GLFW init, the frame loop, `new_project`,
+`app_wants_animation`, canvas-stroke drawing, drag glue, and the search + URL-download subsystems).
+
+| TU | Header | Owns |
+|---|---|---|
+| `input_glue.cpp` | `input_glue.h` | GLFW mouse/cursor/scroll/key/focus/drop callbacks (registered from `main()`) |
+| `side_panel.cpp` | `side_panel.h` | Sidebar: Viewer page render + LOD, in-panel annotation, chrome, resize + edge tabs |
+| `references_panel.cpp` | `references_panel.h` | References tab: captured quotes, per-ref notes, HTML export |
+| `text_boxes.cpp` | `text_boxes.h` | Canvas text boxes: render, hit-test, create, edit, unified page+box drag |
+| `groups.cpp` | `groups.h` | Page groups: boundary rings, label tab, drag-to-add, remove-flash |
+| `toolbar.cpp` | `toolbar.h` | Floating toolbar + the active tool's property strip |
+| `settings.cpp` | `settings.h` | Settings modal |
+| `dialogs.cpp` | `dialogs.h` | Startup chooser + quit confirmation (`QuitState`) |
+| `prefs.cpp` | `prefs.h` | Per-**user** state: preferences file, recent projects, theme/UI-scale application |
+| `undo.cpp` | `undo.h` | The undo stack (`push_undo` / `undo_last` / `clear_undo_stack`) |
+| `project_io.cpp` | `project_io.h` | Per-**project** state: `.scholion` save/load, PicoJSON serialize + parse, integrity hash |
+
+Shared, implementation-free headers: `app_state.h` (globals), `app_settings.h`, `document.h`,
+`canvas_annot.h`, `canvas_text_box.h`, `actions.h` (cross-cutting actions + platform pickers),
+`search.h`, `save_feedback.h`, `version.h`, `picojson.h` (vendored, BSD-2).
+
+### Module conventions (follow these when adding/extracting a module)
+- **Add a new `.cpp` to `cmake/sources.cmake` ONLY** — all three build trees include that list.
+  Do **not** edit the three CMakeLists individually.
+- **Classify every file-static before moving it.** *Shared config* read by 2+ TUs → a header-visible
+  `extern` (e.g. tool state in `canvas_annot.h`). *Transient interaction state* owned by one
+  subsystem → keep it `static` in that module and expose small accessors instead.
+- **Lifecycle hooks, not leaked globals.** A module with transient state exposes `x_reset()` (called
+  from `new_project`) and, if it animates, `x_animating()` (called from `app_wants_animation`).
+  See `groups_reset()` / `groups_animating()` and `textboxes_reset()`.
+- **Split logic belongs to the module.** If a `draw_x()` and the frame loop both touch the state, the
+  module exports an `update_x()` / `begin_x()` and the loop stops poking its statics
+  (e.g. `textboxes_begin_page_initiated_drag()`).
+- **Read a candidate function fully before extracting it.** Two "obvious" carves turned out to be
+  fused mega-functions (`draw_canvas_text_boxes` hid the global delete-selection + document removal;
+  `draw_panel_ui` hid LOD streaming + annotation input). Both had to be decomposed *in place* first.
 
 ## Key UX Behaviors (PureRef-inspired)
 - Minimal chrome, canvas is the entire window
@@ -154,6 +196,23 @@ Recent projects persisted to `~/.scholion_recents` (10 entries).
     source generated, AppIcon.ico converted (6 sizes), DPI-awareness manifest, Windows resource
     file, `setup_windows.ps1` one-script environment bootstrap. CI builds MuPDF from source
     (cached). `Scholion-Windows.zip` ships with all MinGW DLLs bundled.
+29. ◑ **1.5 — internal refactor (behavior-preserving; on `refactor/1.5`).** Full plan +
+    per-step record in `docs/REFACTOR-1.5.md`.
+    **Phase 0** — headless regression net: `src/selftest.cpp` (`Scholion --selftest`, runs in CI,
+    non-zero exit fails the build) + the manual `docs/SMOKE-TEST.md` checklist.
+    **Phase 1 — stable page IDs:** `uint64_t Page::id` resolved via `page_by_id()` *at point of use*,
+    so selection / undo records / the renderer no longer store raw `Page*` into a `std::vector` that
+    reallocates. Killed the whole dangling-pointer bug class and the defensive undo-scrub.
+    **Phase 2 — real JSON:** vendored PicoJSON; both the parser *and* the serializer now go through
+    it (retired the substring-section + `sscanf` scanner and the `snprintf` writer). On-disk layout is
+    unchanged, so v1.0–v1.4 files still load; new files are pretty-printed with alphabetical keys.
+    **Phase 3 — decompose `main.cpp`:** 4,840 → ~2,280 lines across 9 new TUs (see Source Layout).
+    **Hardening:** malformed `.scholion` files can no longer crash or destroy work — non-finite
+    values are clamped on save (picojson's `value(double)` *throws* on Inf/NaN), the same throw is
+    caught during parse, a failed parse now returns early instead of falling through to
+    `clear_documents()` (which used to wipe the open project), and duplicate page ids are made unique
+    on load. Covered by `test_project_validation()`.
+    **Deferred to a licensing-gated 2.0:** PDF backend swap (MuPDF AGPL → pdfium) + distribution rework.
 
 ## History
 

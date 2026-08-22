@@ -80,8 +80,10 @@ cmake --build scholion-lnx/build -j$(nproc)
 When modifying the application:
 1. **Bug fixes / new features** → edit `../scholion/src/*.cpp` or `../scholion/include/*.h`.
    The Linux build picks them up automatically (it compiles from that path).
-2. **New source file** → add it to `../scholion/CMakeLists.txt` (macOS),
-   `scholion-win/CMakeLists.txt` (Windows), AND `scholion-lnx/CMakeLists.txt` (Linux).
+2. **New source file** → add its bare filename to `../scholion/cmake/sources.cmake` **only**.
+   All three build trees `include()` that one list and prepend their own path prefix, so a new
+   shared `.cpp` is a ONE-LINE change in ONE file. Do **not** edit the three CMakeLists separately
+   (that was the pre-1.5 workflow).
 3. **Linux-specific code** → use `#else` in the shared source file (after the
    `__APPLE__` and `_WIN32` guards), or add to `src/platform_linux.cpp` if large.
 4. **macOS-specific code** → use `#ifdef __APPLE__`.

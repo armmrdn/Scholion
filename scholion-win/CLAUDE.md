@@ -107,8 +107,10 @@ The output is `build/Release/Scholion.exe` (MSVC) or `build/Scholion.exe` (MinGW
 When modifying the application:
 1. **Bug fixes / new features** → edit `../scholion/src/*.cpp` or `../scholion/include/*.h`.
    The Windows build picks them up automatically (it compiles from that path).
-2. **New source file** → add it to `../scholion/CMakeLists.txt` (macOS),
-   `scholion-win/CMakeLists.txt` (Windows), AND `../scholion-lnx/CMakeLists.txt` (Linux).
+2. **New source file** → add its bare filename to `../scholion/cmake/sources.cmake` **only**.
+   All three build trees `include()` that one list and prepend their own path prefix, so a new
+   shared `.cpp` is a ONE-LINE change in ONE file. Do **not** edit the three CMakeLists separately
+   (that was the pre-1.5 workflow).
 3. **Windows-specific code** → use `#ifdef _WIN32` in the shared source file, or
    add to `src/platform_win.cpp` if it's large enough to warrant separation.
 4. **macOS-specific code** → use `#ifdef __APPLE__`.

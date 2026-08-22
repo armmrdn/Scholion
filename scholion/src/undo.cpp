@@ -7,6 +7,7 @@
 #include "canvas_annot.h"  // g_next_note_idx
 
 #include <algorithm>
+#include <cstring>
 #include <utility>
 #include <vector>
 

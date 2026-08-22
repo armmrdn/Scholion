@@ -4,12 +4,14 @@
 #include "actions.h"
 #include "project_io.h"   // before_file_dialog / after_file_dialog
 #include "imgui.h"
+#include "tinyfiledialogs.h"   // non-Apple file pickers (tinyfd_*)
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
-#include <string>
-#include <vector>
-#include <unordered_set>
 #include <filesystem>
+#include <string>
+#include <unordered_set>
+#include <vector>
 
 // ===== Note-edit state (private; reached from main via the hooks at the bottom) =====
 // The highlight whose research note is being edited in the panel (nullptr = none). A stable

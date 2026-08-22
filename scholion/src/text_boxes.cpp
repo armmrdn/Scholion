@@ -5,8 +5,11 @@
 #include "undo.h"
 #include "imgui.h"
 #include <algorithm>
-#include <cstring>
+#include <cfloat>
+#include <cmath>
 #include <cstdio>
+#include <cstring>
+#include <unordered_set>
 #include <vector>
 
 // ===== Transient module state (see DEVLOG 2026-07-30; persistent boxes live in app_state.h) =====
